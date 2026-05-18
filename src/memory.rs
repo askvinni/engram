@@ -68,7 +68,7 @@ pub fn write_claude_md_section(repo_root: &Path) -> Result<()> {
 
     let new_content = if let (Some(start), Some(end_idx)) = (
         existing.find(ENGRAM_START),
-        existing.find(ENGRAM_END),
+        existing.rfind(ENGRAM_END),  // rfind: memory content may contain the marker string
     ) {
         let end = end_idx + ENGRAM_END.len();
         format!("{}{}{}", &existing[..start], section, &existing[end..])

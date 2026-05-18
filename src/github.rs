@@ -66,16 +66,66 @@ pub fn get_issue(repo: &str, number: u64) -> Result<Issue> {
 }
 
 pub fn find_linked_pr(repo: &str, issue_number: u64) -> Result<Option<PullRequest>> {
-    let query = format!("closes #{issue_number} is:merged is:pr");
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("repo must be owner/name, got: {repo}"))?;
+
+    let query = r#"
+        query($owner: String!, $repo: String!, $number: Int!) {
+          repository(owner: $owner, name: $repo) {
+            issue(number: $number) {
+              timelineItems(itemTypes: [CLOSED_EVENT], last: 1) {
+                nodes {
+                  ... on ClosedEvent {
+                    closer {
+                      ... on PullRequest {
+                        number
+                        title
+                        body
+                        state
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+    "#;
+
     let out = gh(&[
-        "pr", "list",
-        "--repo", repo,
-        "--search", &query,
-        "--json", "number,title,body",
-        "--limit", "5",
+        "api", "graphql",
+        "-f", &format!("query={query}"),
+        "-f", &format!("owner={owner}"),
+        "-f", &format!("repo={name}"),
+        "-F", &format!("number={issue_number}"),
     ])?;
-    let prs: Vec<PullRequest> = serde_json::from_str(&out).context("parsing PR list JSON")?;
-    Ok(prs.into_iter().next())
+
+    #[derive(Deserialize)]
+    struct Response { data: Data }
+    #[derive(Deserialize)]
+    struct Data { repository: Repo }
+    #[derive(Deserialize)]
+    struct Repo { issue: GhIssue }
+    #[derive(Deserialize)]
+    struct GhIssue {
+        #[serde(rename = "timelineItems")]
+        timeline_items: TimelineItems,
+    }
+    #[derive(Deserialize)]
+    struct TimelineItems { nodes: Vec<ClosedEventNode> }
+    #[derive(Deserialize)]
+    struct ClosedEventNode { closer: Option<PrFields> }
+    #[derive(Deserialize)]
+    struct PrFields { number: u64, title: String, body: Option<String>, state: String }
+
+    let resp: Response = serde_json::from_str(&out).context("parsing GraphQL response")?;
+    let closer = resp.data.repository.issue.timeline_items.nodes
+        .into_iter().next()
+        .and_then(|n| n.closer)
+        .filter(|pr| pr.state == "MERGED");
+
+    Ok(closer.map(|pr| PullRequest { number: pr.number, title: pr.title, body: pr.body }))
 }
 
 pub fn get_pr_diff(repo: &str, pr_number: u64) -> Result<String> {
