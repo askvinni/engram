@@ -4,3 +4,4 @@
 - The canonical engram prerequisite set is: git repo present, gh installed, gh authenticated, claude installed, .engram/config.toml exists, github repo configured — doctor validates all six. _(from #9)
 - Resolve the GitHub repo in every command by checking config first then falling back to `infer_repo()` — never assume the repo is available without this two-step lookup. _(from #10)
 - Multi-step workflow commands (land = learn → close issue → delete branch) should print a status line after each step so partial completion is visible if a later step fails. _(from #11)
+- Inject project-specific rules into the Claude prompt as a dedicated named section (`## Project-Specific Rules`) rather than appending raw text — keeps customization visible, auditable, and easy to strip in tests. _(from #13)_ _(from #13)
