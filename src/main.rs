@@ -377,3 +377,50 @@ fn infer_repo(repo_root: &std::path::Path) -> Option<String> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn days_from_ymd_epoch() {
+        assert_eq!(days_from_ymd(1970, 1, 1), 0);
+    }
+
+    #[test]
+    fn days_from_ymd_next_day() {
+        assert_eq!(days_from_ymd(1970, 1, 2), 1);
+    }
+
+    #[test]
+    fn days_from_ymd_y2k() {
+        // 30 years × 365 + 7 leap days (1972,76,80,84,88,92,96) = 10957
+        assert_eq!(days_from_ymd(2000, 1, 1), 10957);
+    }
+
+    #[test]
+    fn days_from_ymd_leap_day() {
+        // 2000-01-01 = 10957, +31 (Jan) +28 (Feb 1-28) = 11016
+        assert_eq!(days_from_ymd(2000, 2, 29), 11016);
+    }
+
+    #[test]
+    fn days_from_ymd_end_of_year() {
+        // 1970-12-31 = day 364
+        assert_eq!(days_from_ymd(1970, 12, 31), 364);
+    }
+
+    #[test]
+    fn days_ago_malformed_returns_input() {
+        assert_eq!(days_ago("not-a-date"), "not-a-date");
+    }
+
+    #[test]
+    fn days_ago_epoch_is_many_days() {
+        let result = days_ago("1970-01-01T00:00:00Z");
+        assert!(
+            result.ends_with("days ago"),
+            "expected 'N days ago', got {result}"
+        );
+    }
+}
