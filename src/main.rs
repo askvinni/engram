@@ -18,6 +18,7 @@ fn main() -> Result<()> {
         Commands::Learn { issue } => cmd_learn(issue),
         Commands::Doctor => cmd_doctor(),
         Commands::List => cmd_list(),
+        Commands::Land { issue } => cmd_land(issue),
     }
 }
 
@@ -65,6 +66,55 @@ fn cmd_learn(issue: u64) -> Result<()> {
     let repo_root = config::find_repo_root()?;
     let cfg = config::Config::load(&repo_root)?;
     learn::run(&repo_root, &cfg, issue)
+}
+
+fn cmd_land(issue: u64) -> Result<()> {
+    let repo_root = config::find_repo_root()?;
+    let cfg = config::Config::load(&repo_root)?;
+    let repo = cfg
+        .repo()
+        .map(|s| s.to_string())
+        .or_else(|| infer_repo(&repo_root))
+        .ok_or_else(|| anyhow::anyhow!("GitHub repo not configured — run `engram init`"))?;
+
+    // Synthesize learnings and open learn PR
+    learn::run(&repo_root, &cfg, issue)?;
+
+    // Close the issue if it's still open (GitHub may have auto-closed it via PR)
+    let gh_issue = github::get_issue(&repo, issue)?;
+    if gh_issue.state != "CLOSED" {
+        Command::new("gh")
+            .args(["issue", "close", &issue.to_string(), "--repo", &repo])
+            .status()?;
+        println!("Closed issue #{issue}.");
+    } else {
+        println!("Issue #{issue} already closed.");
+    }
+
+    // Delete local branch matching common naming patterns if it exists
+    let candidates = [
+        format!("fix/issue-{issue}"),
+        format!("feat/issue-{issue}"),
+        format!("issue-{issue}"),
+    ];
+    for branch in &candidates {
+        let exists = Command::new("git")
+            .args(["branch", "--list", branch])
+            .current_dir(&repo_root)
+            .output()
+            .map(|o| !o.stdout.is_empty())
+            .unwrap_or(false);
+        if exists {
+            Command::new("git")
+                .args(["branch", "-d", branch])
+                .current_dir(&repo_root)
+                .status()?;
+            println!("Deleted local branch {branch}.");
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 fn cmd_list() -> Result<()> {

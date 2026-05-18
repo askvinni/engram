@@ -28,4 +28,9 @@ pub enum Commands {
     Doctor,
     /// List open engram-plan issues
     List,
+    /// Learn from a closed issue+PR and close the issue
+    Land {
+        /// GitHub issue number
+        issue: u64,
+    },
 }
