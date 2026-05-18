@@ -91,6 +91,8 @@ pub fn run(repo_root: &Path, config: &Config, issue_number: u64) -> Result<()> {
         "engram-learned",
     )?;
 
+    github::add_label_to_issue(&repo, issue_number, "engram-learned")?;
+
     println!("PR created: {}", pr_url.trim());
     Ok(())
 }

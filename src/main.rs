@@ -19,7 +19,15 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Init => cmd_init(),
         Commands::Plan { title, body } => cmd_plan(title, body.as_deref()),
-        Commands::Learn { issue } => cmd_learn(issue),
+        Commands::Learn { issue, all } => {
+            if all {
+                cmd_learn_all()
+            } else if let Some(n) = issue {
+                cmd_learn(n)
+            } else {
+                anyhow::bail!("specify an issue number or pass --all")
+            }
+        }
         Commands::Doctor => cmd_doctor(),
         Commands::List => cmd_list(),
         Commands::Land { issue } => cmd_land(issue),
@@ -98,6 +106,46 @@ fn cmd_learn(issue: u64) -> Result<()> {
     let repo_root = config::find_repo_root()?;
     let cfg = config::Config::load(&repo_root)?;
     learn::run(&repo_root, &cfg, issue)
+}
+
+fn cmd_learn_all() -> Result<()> {
+    let repo_root = config::find_repo_root()?;
+    let cfg = config::Config::load(&repo_root)?;
+    let repo = cfg
+        .repo()
+        .map(|s| s.to_string())
+        .or_else(|| infer_repo(&repo_root))
+        .ok_or_else(|| anyhow::anyhow!("GitHub repo not configured — run `engram init`"))?;
+
+    let issues = github::list_unlearned_plans(&repo)?;
+    if issues.is_empty() {
+        println!("No closed plan issues without the engram-learned label.");
+        return Ok(());
+    }
+
+    // Capture the current branch so each engram/learn-N branch starts from the same base.
+    let base_branch = {
+        let out = Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&repo_root)
+            .output()?;
+        String::from_utf8(out.stdout)?.trim().to_string()
+    };
+    if base_branch.is_empty() {
+        anyhow::bail!("not on a branch — check out a branch before running --all");
+    }
+
+    println!("Found {} unlearned issue(s).", issues.len());
+    for issue in &issues {
+        println!("\nLearning from issue #{}: {}", issue.number, issue.title);
+        learn::run(&repo_root, &cfg, issue.number)?;
+        Command::new("git")
+            .args(["checkout", &base_branch])
+            .current_dir(&repo_root)
+            .status()
+            .context("returning to base branch")?;
+    }
+    Ok(())
 }
 
 fn cmd_compact() -> Result<()> {

@@ -219,3 +219,57 @@ pub fn create_pr(repo: &str, title: &str, body: &str, label: &str) -> Result<Str
         "pr", "create", "--repo", repo, "--title", title, "--body", body, "--label", label,
     ])
 }
+
+pub fn add_label_to_issue(repo: &str, issue_number: u64, label: &str) -> Result<()> {
+    gh(&[
+        "issue",
+        "edit",
+        &issue_number.to_string(),
+        "--repo",
+        repo,
+        "--add-label",
+        label,
+    ])?;
+    Ok(())
+}
+
+pub fn list_unlearned_plans(repo: &str) -> Result<Vec<PlanIssue>> {
+    #[derive(Deserialize)]
+    struct LabelEntry {
+        name: String,
+    }
+    #[derive(Deserialize)]
+    struct IssueWithLabels {
+        number: u64,
+        title: String,
+        #[serde(rename = "createdAt")]
+        created_at: String,
+        labels: Vec<LabelEntry>,
+    }
+
+    let out = gh(&[
+        "issue",
+        "list",
+        "--repo",
+        repo,
+        "--label",
+        "engram-plan",
+        "--state",
+        "closed",
+        "--json",
+        "number,title,createdAt,labels",
+        "--limit",
+        "100",
+    ])?;
+    let all: Vec<IssueWithLabels> =
+        serde_json::from_str(&out).context("parsing issue list JSON")?;
+    Ok(all
+        .into_iter()
+        .filter(|i| !i.labels.iter().any(|l| l.name == "engram-learned"))
+        .map(|i| PlanIssue {
+            number: i.number,
+            title: i.title,
+            created_at: i.created_at,
+        })
+        .collect())
+}
