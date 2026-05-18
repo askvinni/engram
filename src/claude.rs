@@ -2,6 +2,12 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::process::Command;
 
+// Skill reference files are included here so the same quality rules that guide
+// interactive Claude Code sessions also govern the claude -p synthesis calls.
+const LEARN_QUALITY_GUIDE: &str =
+    include_str!("../.claude/skills/engram-learn/references/memory-quality.md");
+const COMPACT_QUALITY_GUIDE: &str = include_str!("../.claude/skills/engram-memory/SKILL.md");
+
 #[derive(Debug, Deserialize)]
 pub struct Tripwire {
     pub action: String,
@@ -91,6 +97,11 @@ pub fn synthesize_learnings(
     let prompt = format!(
         r#"You are analyzing a completed GitHub issue and its associated pull request to extract learnings for an AI agent memory system.
 
+## Quality Guide
+{LEARN_QUALITY_GUIDE}
+
+---
+
 ## Closed Issue: {issue_title}
 
 {issue_body}
@@ -107,29 +118,7 @@ pub fn synthesize_learnings(
 {hooks_section}
 ---
 
-## Knowledge placement hierarchy (use the LOWEST level that fits)
-1. Type artifacts (constants, enums) — put it there
-2. Code comments — put it there
-3. Docstrings — put it there
-4. Learned docs — ONLY for cross-cutting insight spanning multiple files
-
-Never extract: import paths, function signatures, single-file knowledge, symbol catalogs.
-
-## Content rules
-- Write for AI agents, not humans
-- Capture WHY, not WHAT (agents can read source for WHAT)
-- Never reproduce source code except: data formats, third-party API quirks, anti-patterns clearly labelled WRONG, CLI examples
-- Use source pointers (e.g. "see src/github.rs:find_linked_pr") over code blocks
-
-## Categories
-- patterns: successful approaches worth repeating across multiple files/features
-- tripwires: things to avoid; past failures or gotchas that span multiple callsites
-- architecture: structural or design decisions affecting multiple modules
-- testing: testing strategies applicable across the codebase
-
-Extract 1–4 learnings. Only include a learning if it is cross-cutting (would be useful in at least 2 different future situations). Skip trivial or single-file insights.
-
-For tripwire-category items, populate the tripwires array with structured action/warning pairs. The action must start with a gerund (e.g. "Calling", "Invoking", "Using") or "Before". The warning must be imperative (tell the agent what to do instead).
+Extract 1–4 learnings. Only include a learning if it passes the extraction bar in the quality guide above.
 
 Return ONLY a JSON array, no other text:
 [
@@ -205,6 +194,11 @@ pub fn compact_learnings(topics: &[crate::memory::TopicFile]) -> Result<Vec<Comp
 
     let prompt = format!(
         r#"You are aggressively pruning an AI agent memory system. The default action is DELETE. Only keep a file if it clears a high bar.
+
+## Memory system reference
+{COMPACT_QUALITY_GUIDE}
+
+---
 
 ## The only reasons to KEEP a file
 
