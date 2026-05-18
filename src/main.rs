@@ -123,27 +123,96 @@ fn cmd_learn_all() -> Result<()> {
         return Ok(());
     }
 
-    // Capture the current branch so each engram/learn-N branch starts from the same base.
-    let base_branch = {
-        let out = Command::new("git")
-            .args(["branch", "--show-current"])
-            .current_dir(&repo_root)
-            .output()?;
-        String::from_utf8(out.stdout)?.trim().to_string()
-    };
-    if base_branch.is_empty() {
-        anyhow::bail!("not on a branch — check out a branch before running --all");
-    }
-
     println!("Found {} unlearned issue(s).", issues.len());
+    let mut learned: Vec<u64> = vec![];
+    let mut failed = 0usize;
     for issue in &issues {
         println!("\nLearning from issue #{}: {}", issue.number, issue.title);
-        learn::run(&repo_root, &cfg, issue.number)?;
-        Command::new("git")
-            .args(["checkout", &base_branch])
-            .current_dir(&repo_root)
-            .status()
-            .context("returning to base branch")?;
+        match learn::write_memory(&repo_root, issue.number, &repo) {
+            Ok(true) => learned.push(issue.number),
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("  skipping #{}: {e:#}", issue.number);
+                failed += 1;
+            }
+        }
+    }
+
+    if learned.is_empty() {
+        println!("\nNo learnings extracted from any issue.");
+        if failed > 0 {
+            anyhow::bail!("{failed} issue(s) failed — see errors above");
+        }
+        return Ok(());
+    }
+
+    let branch = "engram/learn-all".to_string();
+    let status = Command::new("git")
+        .args(["checkout", "-b", &branch])
+        .current_dir(&repo_root)
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("git checkout -b {branch} failed");
+    }
+
+    let status = Command::new("git")
+        .args(["add", ".engram/memory", "CLAUDE.md"])
+        .current_dir(&repo_root)
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("git add failed");
+    }
+
+    let nothing_staged = Command::new("git")
+        .args(["diff", "--cached", "--quiet"])
+        .current_dir(&repo_root)
+        .status()?
+        .success();
+    if nothing_staged {
+        println!("Nothing to commit — memory unchanged.");
+        if failed > 0 {
+            anyhow::bail!("{failed} issue(s) failed — see errors above");
+        }
+        return Ok(());
+    }
+
+    let issue_list = learned
+        .iter()
+        .map(|n| format!("#{n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let status = Command::new("git")
+        .args(["commit", "-m", &format!("engram: learn from {issue_list}")])
+        .current_dir(&repo_root)
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("git commit failed");
+    }
+
+    let status = Command::new("git")
+        .args(["push", "-u", "origin", &branch])
+        .current_dir(&repo_root)
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("git push failed");
+    }
+
+    let pr_body = format!("Learnings extracted from: {issue_list}.\n\n---\n*Created by engram*");
+    let pr_url = github::create_pr(
+        &repo,
+        &format!("engram: learn from {issue_list}"),
+        &pr_body,
+        "engram-learned",
+    )?;
+
+    for n in &learned {
+        github::add_label_to_issue(&repo, *n, "engram-learned")?;
+    }
+
+    println!("\nPR created: {}", pr_url.trim());
+
+    if failed > 0 {
+        anyhow::bail!("{failed} issue(s) failed — see errors above");
     }
     Ok(())
 }

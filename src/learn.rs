@@ -4,11 +4,11 @@ use std::process::Command;
 
 use crate::{claude, config::Config, github, memory};
 
-pub fn run(repo_root: &Path, config: &Config, issue_number: u64) -> Result<()> {
-    let repo = resolve_repo(config, repo_root)?;
-
+/// Validates the issue, synthesizes learnings, and writes them to memory on disk.
+/// Returns true if any learnings were written, false if none were found.
+pub fn write_memory(repo_root: &Path, issue_number: u64, repo: &str) -> Result<bool> {
     println!("Fetching issue #{issue_number}...");
-    let issue = github::get_issue(&repo, issue_number)?;
+    let issue = github::get_issue(repo, issue_number)?;
     if issue.state != "CLOSED" {
         anyhow::bail!(
             "issue #{issue_number} is not closed (state: {})",
@@ -17,11 +17,11 @@ pub fn run(repo_root: &Path, config: &Config, issue_number: u64) -> Result<()> {
     }
 
     println!("Finding linked PR...");
-    let pr = github::find_linked_pr(&repo, issue_number)?
+    let pr = github::find_linked_pr(repo, issue_number)?
         .with_context(|| format!("no merged PR found that closes #{issue_number}"))?;
 
     println!("Fetching diff for PR #{}...", pr.number);
-    let diff = github::get_pr_diff(&repo, pr.number)?;
+    let diff = github::get_pr_diff(repo, pr.number)?;
 
     println!("Reading existing memory...");
     let current_memory = memory::read_all(repo_root)?;
@@ -41,7 +41,7 @@ pub fn run(repo_root: &Path, config: &Config, issue_number: u64) -> Result<()> {
 
     if items.is_empty() {
         println!("No learnings extracted.");
-        return Ok(());
+        return Ok(false);
     }
 
     println!("Writing {} learning(s)...", items.len());
@@ -55,6 +55,16 @@ pub fn run(repo_root: &Path, config: &Config, issue_number: u64) -> Result<()> {
 
     println!("Updating CLAUDE.md...");
     memory::write_claude_md_section(repo_root)?;
+
+    Ok(true)
+}
+
+pub fn run(repo_root: &Path, config: &Config, issue_number: u64) -> Result<()> {
+    let repo = resolve_repo(config, repo_root)?;
+
+    if !write_memory(repo_root, issue_number, &repo)? {
+        return Ok(());
+    }
 
     let branch = format!("engram/learn-{issue_number}");
     git(repo_root, &["checkout", "-b", &branch])?;
@@ -80,10 +90,8 @@ pub fn run(repo_root: &Path, config: &Config, issue_number: u64) -> Result<()> {
     )?;
     git(repo_root, &["push", "-u", "origin", &branch])?;
 
-    let pr_body = format!(
-        "Learnings extracted from issue #{issue_number} and PR #{}.\n\n---\n*Created by engram*",
-        pr.number
-    );
+    let pr_body =
+        format!("Learnings extracted from issue #{issue_number}.\n\n---\n*Created by engram*");
     let pr_url = github::create_pr(
         &repo,
         &format!("engram: learn from #{issue_number}"),
