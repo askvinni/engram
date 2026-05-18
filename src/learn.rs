@@ -41,11 +41,23 @@ pub fn run(repo_root: &Path, config: &Config, issue_number: u64) -> Result<()> {
         return Ok(());
     }
 
-    println!("Merging {} learning(s)...", items.len());
+    println!("Writing {} learning(s)...", items.len());
     for item in &items {
-        memory::merge_item(repo_root, &item.category, &item.content, issue_number)?;
-        println!("  [{}] {}", item.category, item.content);
+        memory::write_topic_file(
+            repo_root,
+            &item.category,
+            &item.slug,
+            &item.title,
+            &item.read_when,
+            &item.tripwires,
+            &item.body,
+            issue_number,
+        )?;
+        println!("  [{}] {} — {}", item.category, item.slug, item.title);
     }
+
+    println!("Rebuilding memory index...");
+    memory::rebuild_index(repo_root)?;
 
     println!("Updating CLAUDE.md...");
     memory::write_claude_md_section(repo_root)?;
