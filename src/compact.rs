@@ -17,7 +17,10 @@ pub fn run(repo_root: &Path) -> Result<()> {
     let actions = claude::compact_learnings(&topics)?;
 
     let deletes: Vec<_> = actions.iter().filter(|a| a.action == "delete").collect();
-    let merges: Vec<_> = actions.iter().filter(|a| a.action == "merge_into").collect();
+    let merges: Vec<_> = actions
+        .iter()
+        .filter(|a| a.action == "merge_into")
+        .collect();
     let keeps: Vec<_> = actions.iter().filter(|a| a.action == "keep").collect();
 
     println!(
@@ -81,7 +84,11 @@ pub fn run(repo_root: &Path) -> Result<()> {
 
     git(
         repo_root,
-        &["commit", "-m", &format!("engram: compact memory ({deleted} deleted, {merged} merged)")],
+        &[
+            "commit",
+            "-m",
+            &format!("engram: compact memory ({deleted} deleted, {merged} merged)"),
+        ],
     )?;
     git(repo_root, &["push", "-u", "origin", &branch])?;
 
@@ -116,7 +123,14 @@ fn resolve_repo(repo_root: &Path) -> Result<String> {
         return Ok(repo.to_string());
     }
     let output = Command::new("gh")
-        .args(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"])
+        .args([
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "-q",
+            ".nameWithOwner",
+        ])
         .current_dir(repo_root)
         .output()?;
     if output.status.success() {

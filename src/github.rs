@@ -39,10 +39,15 @@ fn gh(args: &[&str]) -> Result<String> {
 pub fn ensure_label(repo: &str, name: &str, color: &str, description: &str) -> Result<()> {
     let output = Command::new("gh")
         .args([
-            "label", "create", name,
-            "--repo", repo,
-            "--color", color,
-            "--description", description,
+            "label",
+            "create",
+            name,
+            "--repo",
+            repo,
+            "--color",
+            color,
+            "--description",
+            description,
         ])
         .output()?;
     if !output.status.success() {
@@ -56,19 +61,19 @@ pub fn ensure_label(repo: &str, name: &str, color: &str, description: &str) -> R
 
 pub fn create_issue(repo: &str, title: &str, body: &str, label: &str) -> Result<String> {
     gh(&[
-        "issue", "create",
-        "--repo", repo,
-        "--title", title,
-        "--body", body,
-        "--label", label,
+        "issue", "create", "--repo", repo, "--title", title, "--body", body, "--label", label,
     ])
 }
 
 pub fn get_issue(repo: &str, number: u64) -> Result<Issue> {
     let out = gh(&[
-        "issue", "view", &number.to_string(),
-        "--repo", repo,
-        "--json", "title,body,state",
+        "issue",
+        "view",
+        &number.to_string(),
+        "--repo",
+        repo,
+        "--json",
+        "title,body,state",
     ])?;
     serde_json::from_str(&out).context("parsing issue JSON")
 }
@@ -102,38 +107,68 @@ pub fn find_linked_pr(repo: &str, issue_number: u64) -> Result<Option<PullReques
     "#;
 
     let out = gh(&[
-        "api", "graphql",
-        "-f", &format!("query={query}"),
-        "-f", &format!("owner={owner}"),
-        "-f", &format!("repo={name}"),
-        "-F", &format!("number={issue_number}"),
+        "api",
+        "graphql",
+        "-f",
+        &format!("query={query}"),
+        "-f",
+        &format!("owner={owner}"),
+        "-f",
+        &format!("repo={name}"),
+        "-F",
+        &format!("number={issue_number}"),
     ])?;
 
     #[derive(Deserialize)]
-    struct Response { data: Data }
+    struct Response {
+        data: Data,
+    }
     #[derive(Deserialize)]
-    struct Data { repository: Repo }
+    struct Data {
+        repository: Repo,
+    }
     #[derive(Deserialize)]
-    struct Repo { issue: GhIssue }
+    struct Repo {
+        issue: GhIssue,
+    }
     #[derive(Deserialize)]
     struct GhIssue {
         #[serde(rename = "timelineItems")]
         timeline_items: TimelineItems,
     }
     #[derive(Deserialize)]
-    struct TimelineItems { nodes: Vec<ClosedEventNode> }
+    struct TimelineItems {
+        nodes: Vec<ClosedEventNode>,
+    }
     #[derive(Deserialize)]
-    struct ClosedEventNode { closer: Option<PrFields> }
+    struct ClosedEventNode {
+        closer: Option<PrFields>,
+    }
     #[derive(Deserialize)]
-    struct PrFields { number: u64, title: String, body: Option<String>, state: String }
+    struct PrFields {
+        number: u64,
+        title: String,
+        body: Option<String>,
+        state: String,
+    }
 
     let resp: Response = serde_json::from_str(&out).context("parsing GraphQL response")?;
-    let closer = resp.data.repository.issue.timeline_items.nodes
-        .into_iter().next()
+    let closer = resp
+        .data
+        .repository
+        .issue
+        .timeline_items
+        .nodes
+        .into_iter()
+        .next()
         .and_then(|n| n.closer)
         .filter(|pr| pr.state == "MERGED");
 
-    Ok(closer.map(|pr| PullRequest { number: pr.number, title: pr.title, body: pr.body }))
+    Ok(closer.map(|pr| PullRequest {
+        number: pr.number,
+        title: pr.title,
+        body: pr.body,
+    }))
 }
 
 pub fn get_pr_diff(repo: &str, pr_number: u64) -> Result<String> {
@@ -142,34 +177,45 @@ pub fn get_pr_diff(repo: &str, pr_number: u64) -> Result<String> {
 
 pub fn find_pr_for_branch(repo: &str, branch: &str) -> Result<Option<PullRequest>> {
     let out = gh(&[
-        "pr", "list",
-        "--repo", repo,
-        "--head", branch,
-        "--json", "number,title,body,state",
-        "--limit", "1",
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--head",
+        branch,
+        "--json",
+        "number,title,body,state",
+        "--limit",
+        "1",
     ])?;
     let mut prs: Vec<PullRequest> = serde_json::from_str(&out).context("parsing PR list JSON")?;
-    Ok(if prs.is_empty() { None } else { Some(prs.remove(0)) })
+    Ok(if prs.is_empty() {
+        None
+    } else {
+        Some(prs.remove(0))
+    })
 }
 
 pub fn list_open_plans(repo: &str) -> Result<Vec<PlanIssue>> {
     let out = gh(&[
-        "issue", "list",
-        "--repo", repo,
-        "--label", "engram-plan",
-        "--state", "open",
-        "--json", "number,title,createdAt",
-        "--limit", "50",
+        "issue",
+        "list",
+        "--repo",
+        repo,
+        "--label",
+        "engram-plan",
+        "--state",
+        "open",
+        "--json",
+        "number,title,createdAt",
+        "--limit",
+        "50",
     ])?;
     serde_json::from_str(&out).context("parsing issue list JSON")
 }
 
 pub fn create_pr(repo: &str, title: &str, body: &str, label: &str) -> Result<String> {
     gh(&[
-        "pr", "create",
-        "--repo", repo,
-        "--title", title,
-        "--body", body,
-        "--label", label,
+        "pr", "create", "--repo", repo, "--title", title, "--body", body, "--label", label,
     ])
 }
