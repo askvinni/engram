@@ -13,6 +13,7 @@ use include_dir::{include_dir, Dir};
 use std::process::Command;
 
 static SKILLS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/.claude/skills");
+static ISSUE_TEMPLATES_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/.github/ISSUE_TEMPLATE");
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -67,6 +68,7 @@ fn cmd_init() -> Result<()> {
     println!("Updated CLAUDE.md");
 
     install_skills(&repo_root)?;
+    install_issue_templates(&repo_root)?;
 
     if let Some(repo) = cfg.repo() {
         github::ensure_label(
@@ -97,7 +99,16 @@ fn cmd_plan(title: String, body: Option<&str>) -> Result<()> {
         .or_else(|| infer_repo(&repo_root))
         .ok_or_else(|| anyhow::anyhow!("GitHub repo not configured — run `engram init`"))?;
 
-    let url = github::create_issue(&repo, &title, body.unwrap_or(""), "engram-plan")?;
+    let body = body.unwrap_or("");
+    let missing = missing_plan_sections(body);
+    if !missing.is_empty() {
+        eprintln!(
+            "warning: plan body is missing sections: {}",
+            missing.join(", ")
+        );
+    }
+
+    let url = github::create_issue(&repo, &title, body, "engram-plan")?;
     println!("{}", url.trim());
     Ok(())
 }
@@ -485,6 +496,34 @@ fn cmd_doctor() -> Result<()> {
     Ok(())
 }
 
+fn missing_plan_sections(body: &str) -> Vec<&'static str> {
+    // Prefix-only matches so both `**Why**` and `**Why:**` forms are accepted.
+    const SECTIONS: &[(&str, &[&str])] = &[
+        ("Why", &["**Why"]),
+        ("Background", &["**Background"]),
+        ("Approach", &["**Approach"]),
+        ("Acceptance criteria", &["**Acceptance criteria", "**What"]),
+        ("Scope", &["**Scope"]),
+        ("Edge cases and risks", &["**Edge cases", "**Risks"]),
+        ("Key files", &["**Key files"]),
+    ];
+    SECTIONS
+        .iter()
+        .filter(|(_, headers)| !headers.iter().any(|h| body.contains(h)))
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+fn install_issue_templates(repo_root: &std::path::Path) -> Result<()> {
+    let dest = repo_root.join(".github/ISSUE_TEMPLATE");
+    std::fs::create_dir_all(&dest).context("creating .github/ISSUE_TEMPLATE")?;
+    ISSUE_TEMPLATES_DIR
+        .extract(&dest)
+        .context("installing GitHub issue templates")?;
+    println!("Installed GitHub issue template: engram-plan");
+    Ok(())
+}
+
 fn install_skills(repo_root: &std::path::Path) -> Result<()> {
     SKILLS_DIR
         .extract(repo_root.join(".claude/skills"))
@@ -577,6 +616,53 @@ mod tests {
             result.ends_with("days ago"),
             "expected 'N days ago', got {result}"
         );
+    }
+
+    #[test]
+    fn missing_plan_sections_empty_body() {
+        let missing = missing_plan_sections("");
+        assert_eq!(
+            missing,
+            vec![
+                "Why",
+                "Background",
+                "Approach",
+                "Acceptance criteria",
+                "Scope",
+                "Edge cases and risks",
+                "Key files"
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_plan_sections_complete_body() {
+        let body = "**Why** x\n**Background** x\n**Approach** x\n**Acceptance criteria** x\n**Scope** x\n**Edge cases and risks** x\n**Key files** x";
+        assert!(missing_plan_sections(body).is_empty());
+    }
+
+    #[test]
+    fn missing_plan_sections_accepts_old_what_name() {
+        let body = "**Why** x\n**Background** x\n**Approach** x\n**What** x\n**Scope** x\n**Edge cases** x\n**Key files** x";
+        assert!(missing_plan_sections(body).is_empty());
+    }
+
+    #[test]
+    fn missing_plan_sections_partial() {
+        let body = "**Why** x\n**Scope** x";
+        let missing = missing_plan_sections(body);
+        assert!(missing.contains(&"Background"));
+        assert!(missing.contains(&"Approach"));
+        assert!(!missing.contains(&"Why"));
+        assert!(!missing.contains(&"Scope"));
+    }
+
+    #[test]
+    fn install_issue_template_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        install_issue_templates(root).unwrap();
+        assert!(root.join(".github/ISSUE_TEMPLATE/engram-plan.md").exists());
     }
 
     #[test]
