@@ -16,6 +16,14 @@ pub struct PullRequest {
     pub body: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PlanIssue {
+    pub number: u64,
+    pub title: String,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+}
+
 fn gh(args: &[&str]) -> Result<String> {
     let output = Command::new("gh")
         .args(args)
@@ -130,6 +138,18 @@ pub fn find_linked_pr(repo: &str, issue_number: u64) -> Result<Option<PullReques
 
 pub fn get_pr_diff(repo: &str, pr_number: u64) -> Result<String> {
     gh(&["pr", "diff", &pr_number.to_string(), "--repo", repo])
+}
+
+pub fn list_open_plans(repo: &str) -> Result<Vec<PlanIssue>> {
+    let out = gh(&[
+        "issue", "list",
+        "--repo", repo,
+        "--label", "engram-plan",
+        "--state", "open",
+        "--json", "number,title,createdAt",
+        "--limit", "50",
+    ])?;
+    serde_json::from_str(&out).context("parsing issue list JSON")
 }
 
 pub fn create_pr(repo: &str, title: &str, body: &str, label: &str) -> Result<String> {
