@@ -16,6 +16,7 @@ fn main() -> Result<()> {
         Commands::Init => cmd_init(),
         Commands::Plan { title, body } => cmd_plan(title, body.as_deref()),
         Commands::Learn { issue } => cmd_learn(issue),
+        Commands::Doctor => cmd_doctor(),
     }
 }
 
@@ -63,6 +64,45 @@ fn cmd_learn(issue: u64) -> Result<()> {
     let repo_root = config::find_repo_root()?;
     let cfg = config::Config::load(&repo_root)?;
     learn::run(&repo_root, &cfg, issue)
+}
+
+fn cmd_doctor() -> Result<()> {
+    let mut all_ok = true;
+
+    let checks: &[(&str, Box<dyn Fn() -> bool>)] = &[
+        ("git repo", Box::new(|| config::find_repo_root().is_ok())),
+        ("gh installed", Box::new(|| {
+            Command::new("gh").arg("--version").output().map_or(false, |o| o.status.success())
+        })),
+        ("gh authenticated", Box::new(|| {
+            Command::new("gh").args(["auth", "status"]).output().map_or(false, |o| o.status.success())
+        })),
+        ("claude installed", Box::new(|| {
+            Command::new("claude").arg("--version").output().map_or(false, |o| o.status.success())
+        })),
+        (".engram/config.toml exists", Box::new(|| {
+            config::find_repo_root()
+                .map(|r| r.join(".engram/config.toml").exists())
+                .unwrap_or(false)
+        })),
+        ("github repo configured", Box::new(|| {
+            config::find_repo_root()
+                .and_then(|r| config::Config::load(&r))
+                .map(|c| c.repo().is_some())
+                .unwrap_or(false)
+        })),
+    ];
+
+    for (label, check) in checks {
+        let ok = check();
+        println!("{} {}", if ok { "✓" } else { "✗" }, label);
+        if !ok { all_ok = false; }
+    }
+
+    if !all_ok {
+        anyhow::bail!("one or more checks failed");
+    }
+    Ok(())
 }
 
 fn infer_repo(repo_root: &std::path::Path) -> Option<String> {

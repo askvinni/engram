@@ -24,4 +24,6 @@ pub enum Commands {
         /// GitHub issue number
         issue: u64,
     },
+    /// Check that all engram dependencies are installed and configured
+    Doctor,
 }
