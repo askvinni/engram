@@ -47,8 +47,8 @@ fn cmd_init() -> Result<()> {
     let migrated = memory::migrate_flat_files(&repo_root)?;
     if migrated > 0 {
         println!("Migrated {migrated} legacy memory item(s) to topic-file structure.");
-        memory::rebuild_index(&repo_root)?;
     }
+    memory::rebuild_index(&repo_root)?;
 
     memory::write_claude_md_section(&repo_root)?;
     println!("Updated CLAUDE.md");

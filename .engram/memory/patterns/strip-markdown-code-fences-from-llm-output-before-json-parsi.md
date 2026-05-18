@@ -1,10 +1,12 @@
 ---
-title: "Strip markdown code fences from LLM output before JSON pars…"
+title: "Strip markdown code fences from LLM output before JSON parsing"
 read_when:
-  - "(migrated — add read_when conditions)"
+  - "parsing structured output from claude -p"
+  - "adding a new synthesis function in claude.rs that expects JSON back"
+  - "debugging JSON parse errors from claude output"
 tripwires: []
 last_updated: "2026-05-18"
 source_issues: [26]
 ---
 
-Strip markdown code fences from LLM output before JSON parsing — use a `strip_code_fence()` step that checks for a ` ``` ` first line and extracts only the inner lines, because Claude may wrap responses in ` ```json ... ``` ` blocks even when instructed not to.
+Even when a prompt instructs Claude to return only JSON, it often wraps the response in a ` ```json ... ``` ` block. Always apply a strip_code_fence() step before JSON parsing: check if the first line starts with ` ``` `, and if so, extract only the inner lines up to the closing fence. Without this, `serde_json::from_str` will fail on otherwise valid JSON. Apply the strip before the `find('[')` / `rfind(']')` extraction step. See src/claude.rs:strip_code_fence for the implementation.
