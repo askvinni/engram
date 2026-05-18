@@ -23,6 +23,8 @@ pub fn run(repo_root: &Path, config: &Config, issue_number: u64) -> Result<()> {
     println!("Reading existing memory...");
     let current_memory = memory::read_all(repo_root)?;
 
+    let prompt_hooks = claude::load_prompt_hooks(repo_root);
+
     println!("Synthesizing learnings with Claude...");
     let items = claude::synthesize_learnings(
         &issue.title,
@@ -31,6 +33,7 @@ pub fn run(repo_root: &Path, config: &Config, issue_number: u64) -> Result<()> {
         pr.body.as_deref().unwrap_or(""),
         &diff,
         &current_memory,
+        &prompt_hooks,
     )?;
 
     if items.is_empty() {
