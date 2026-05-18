@@ -3,9 +3,20 @@ use serde::Deserialize;
 use std::process::Command;
 
 #[derive(Debug, Deserialize)]
+pub struct Tripwire {
+    pub action: String,
+    pub warning: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct LearningItem {
     pub category: String,
-    pub content: String,
+    pub slug: String,
+    pub title: String,
+    pub read_when: Vec<String>,
+    #[serde(default)]
+    pub tripwires: Vec<Tripwire>,
+    pub body: String,
 }
 
 fn strip_code_fence(s: &str) -> String {
@@ -67,7 +78,7 @@ pub fn synthesize_learnings(
     };
 
     let prompt = format!(
-        r#"You are analyzing a completed GitHub issue and its associated pull request to extract learnings.
+        r#"You are analyzing a completed GitHub issue and its associated pull request to extract learnings for an AI agent memory system.
 
 ## Closed Issue: {issue_title}
 
@@ -85,18 +96,59 @@ pub fn synthesize_learnings(
 {hooks_section}
 ---
 
-Extract 1–5 concise learnings from this issue+PR. Use existing categories from current memory when applicable.
+## Knowledge placement hierarchy (use the LOWEST level that fits)
+1. Type artifacts (constants, enums) — put it there
+2. Code comments — put it there
+3. Docstrings — put it there
+4. Learned docs — ONLY for cross-cutting insight spanning multiple files
 
-Preferred categories: patterns, tripwires, architecture, testing
-- patterns: successful approaches worth repeating
-- tripwires: things to avoid; past failures or gotchas
-- architecture: structural or design decisions
-- testing: testing strategies
+Never extract: import paths, function signatures, single-file knowledge, symbol catalogs.
+
+## Content rules
+- Write for AI agents, not humans
+- Capture WHY, not WHAT (agents can read source for WHAT)
+- Never reproduce source code except: data formats, third-party API quirks, anti-patterns clearly labelled WRONG, CLI examples
+- Use source pointers (e.g. "see src/github.rs:find_linked_pr") over code blocks
+
+## Categories
+- patterns: successful approaches worth repeating across multiple files/features
+- tripwires: things to avoid; past failures or gotchas that span multiple callsites
+- architecture: structural or design decisions affecting multiple modules
+- testing: testing strategies applicable across the codebase
+
+Extract 1–4 learnings. Only include a learning if it is cross-cutting (would be useful in at least 2 different future situations). Skip trivial or single-file insights.
+
+For tripwire-category items, populate the tripwires array with structured action/warning pairs. The action must start with a gerund (e.g. "Calling", "Invoking", "Using") or "Before". The warning must be imperative (tell the agent what to do instead).
 
 Return ONLY a JSON array, no other text:
 [
-  {{"category": "patterns", "content": "one concise actionable sentence"}},
-  {{"category": "tripwires", "content": "one concise actionable sentence"}}
+  {{
+    "category": "tripwires",
+    "slug": "claude-repo-context",
+    "title": "Run claude -p from temp_dir to avoid repo CLAUDE.md",
+    "read_when": [
+      "about to invoke claude -p programmatically",
+      "building a tool that shells out to Claude Code"
+    ],
+    "tripwires": [
+      {{
+        "action": "Invoking claude -p from inside a repo directory",
+        "warning": "CLAUDE.md gets loaded as context; always use current_dir(temp_dir()) for non-interactive calls"
+      }}
+    ],
+    "body": "One paragraph explaining WHY this matters and the cross-cutting context. No code blocks."
+  }},
+  {{
+    "category": "patterns",
+    "slug": "graphql-closed-event",
+    "title": "Use GraphQL CLOSED_EVENT to find the PR that closed an issue",
+    "read_when": [
+      "implementing GitHub API integration",
+      "looking up which PR closed a given issue"
+    ],
+    "tripwires": [],
+    "body": "One paragraph explaining WHY this approach is better than alternatives."
+  }}
 ]"#
     );
 
