@@ -19,6 +19,7 @@ fn main() -> Result<()> {
         Commands::Doctor => cmd_doctor(),
         Commands::List => cmd_list(),
         Commands::Land { issue } => cmd_land(issue),
+        Commands::Status => cmd_status(),
     }
 }
 
@@ -66,6 +67,62 @@ fn cmd_learn(issue: u64) -> Result<()> {
     let repo_root = config::find_repo_root()?;
     let cfg = config::Config::load(&repo_root)?;
     learn::run(&repo_root, &cfg, issue)
+}
+
+fn cmd_status() -> Result<()> {
+    let repo_root = config::find_repo_root()?;
+    let cfg = config::Config::load(&repo_root)?;
+    let repo = cfg
+        .repo()
+        .map(|s| s.to_string())
+        .or_else(|| infer_repo(&repo_root))
+        .ok_or_else(|| anyhow::anyhow!("GitHub repo not configured — run `engram init`"))?;
+
+    let branch = Command::new("git")
+        .args(["branch", "--show-current"])
+        .current_dir(&repo_root)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    if branch.is_empty() {
+        println!("Not on a branch.");
+        return Ok(());
+    }
+    println!("Branch: {branch}");
+
+    // Look for a PR on this branch
+    if let Some(pr) = github::find_pr_for_branch(&repo, &branch)? {
+        println!("PR:     #{} {} [{}]", pr.number, pr.title, pr.body.as_deref().unwrap_or("").lines().next().unwrap_or(""));
+    } else {
+        println!("PR:     none");
+    }
+
+    // Find open engram-plan issues referencing this branch by number
+    let issue_num = branch
+        .split(|c: char| !c.is_ascii_digit())
+        .find_map(|s| s.parse::<u64>().ok());
+
+    if let Some(n) = issue_num {
+        if let Ok(issue) = github::get_issue(&repo, n) {
+            if issue.state != "CLOSED" {
+                println!("Issue:  #{n} {} [{}]", issue.title, issue.state);
+                return Ok(());
+            }
+        }
+    }
+
+    // Fall back: show all open plans for context
+    let plans = github::list_open_plans(&repo)?;
+    if plans.is_empty() {
+        println!("Issue:  no open engram-plan issues");
+    } else {
+        println!("Open plans:");
+        for p in &plans {
+            println!("  #{} {}", p.number, p.title);
+        }
+    }
+    Ok(())
 }
 
 fn cmd_land(issue: u64) -> Result<()> {
