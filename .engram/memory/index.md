@@ -4,6 +4,7 @@ Agents: read this index to find relevant learned docs. Load individual files onl
 
 | File | Title | Read when |
 |------|-------|-----------|
+| @.engram/memory/patterns/auto-migrate-on-init.md | Trigger storage format migrations automatically in the init command | evolving the on-disk format of a CLI tool's stored state; adding a new directory layout that supersedes a flat file structure; deciding where to place a one-time migration for existing users |
 | @.engram/memory/patterns/check-resource-state-before-mutating-it-e-g-check-issue-stat.md | Check resource state before mutating it (e.g., check issue … | (migrated — add read_when conditions) |
 | @.engram/memory/patterns/compose-higher-level-workflow-commands-by-calling-existing-c.md | Compose higher-level workflow commands by calling existing … | (migrated — add read_when conditions) |
 | @.engram/memory/patterns/compute-human-readable-issue-age-today-1-day-ago-n-days-ago-.md | Compute human-readable issue age ("today", "1 day ago", "N … | (migrated — add read_when conditions) |
@@ -14,6 +15,7 @@ Agents: read this index to find relevant learned docs. Load individual files onl
 | @.engram/memory/patterns/in-a-status-command-cascade-from-specific-to-general-branch-.md | In a status command, cascade from specific to general: bran… | (migrated — add read_when conditions) |
 | @.engram/memory/patterns/in-doctor-style-commands-collect-all-check-results-before-ba.md | In doctor-style commands, collect all check results before … | (migrated — add read_when conditions) |
 | @.engram/memory/patterns/look-up-the-pr-associated-with-a-branch-with-gh-pr-list-head.md | Look up the PR associated with a branch with `gh pr list --… | (migrated — add read_when conditions) |
+| @.engram/memory/patterns/self-routing-memory-index.md | Build a routing index so agents load only relevant memory files | designing a memory or knowledge system for AI agents; deciding how CLAUDE.md or a context entry-point should reference stored knowledge; memory files are growing and loading all of them on every invocation is wasteful |
 | @.engram/memory/patterns/store-repo-specific-prompt-customization-as-committed-md-fil.md | Store repo-specific prompt customization as committed `.md`… | (migrated — add read_when conditions) |
 | @.engram/memory/patterns/strip-markdown-code-fences-from-llm-output-before-json-parsi.md | Strip markdown code fences from LLM output before JSON pars… | (migrated — add read_when conditions) |
 | @.engram/memory/patterns/use-path-imports-in-claude-md-to-reference-engram-memory-md-.md | Use @path imports in CLAUDE.md to reference .engram/memory/… | (migrated — add read_when conditions) |
@@ -28,3 +30,4 @@ Agents: read this index to find relevant learned docs. Load individual files onl
 | @.engram/memory/architecture/multi-step-workflow-commands-land-learn-close-issue-delete-b.md | Multi-step workflow commands (land = learn → close issue → … | (migrated — add read_when conditions) |
 | @.engram/memory/architecture/resolve-the-github-repo-in-every-command-by-checking-config-.md | Resolve the GitHub repo in every command by checking config… | (migrated — add read_when conditions) |
 | @.engram/memory/architecture/the-canonical-engram-prerequisite-set-is-git-repo-present-gh.md | The canonical engram prerequisite set is: git repo present,… | (migrated — add read_when conditions) |
+| @.engram/memory/architecture/yaml-frontmatter-for-ai-navigable-docs.md | Use YAML frontmatter to make knowledge files machine-navigable | designing a file format for storing learned knowledge that agents will read; adding metadata (routing conditions, structured warnings, provenance) to markdown docs; building a system where both humans and agents consume the same knowledge files |
