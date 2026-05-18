@@ -460,7 +460,7 @@ pub fn write_claude_md_section(repo_root: &Path) -> Result<()> {
 
 // --- helpers ---
 
-fn today_iso() -> String {
+pub fn today_iso() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

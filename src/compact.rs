@@ -66,8 +66,8 @@ pub fn run(repo_root: &Path) -> Result<()> {
     println!("Updating CLAUDE.md...");
     memory::write_claude_md_section(repo_root)?;
 
-    let branch = "engram/compact";
-    git(repo_root, &["checkout", "-B", branch])?;
+    let branch = format!("engram/compact-{}", memory::today_iso());
+    git(repo_root, &["checkout", "-b", &branch])?;
     git(repo_root, &["add", ".engram/memory", "CLAUDE.md"])?;
 
     let staged = Command::new("git")
@@ -83,7 +83,7 @@ pub fn run(repo_root: &Path) -> Result<()> {
         repo_root,
         &["commit", "-m", &format!("engram: compact memory ({deleted} deleted, {merged} merged)")],
     )?;
-    git(repo_root, &["push", "--force-with-lease", "-u", "origin", branch])?;
+    git(repo_root, &["push", "-u", "origin", &branch])?;
 
     let pr_body = format!(
         "Compacted memory: {deleted} files deleted, {merged} files merged.\n\n---\n*Created by engram compact*"
