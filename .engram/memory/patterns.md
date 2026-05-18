@@ -9,3 +9,6 @@
 - Compose higher-level workflow commands by calling existing command functions internally (e.g., `land` calls `learn::run()`) rather than duplicating logic across subcommands. _(from #11)
 - When cleaning up branches by issue number, probe a list of candidate name patterns (`fix/issue-{N}`, `feat/issue-{N}`, `issue-{N}`) and break on first match — accommodates real-world naming variance without requiring a strict convention. _(from #11)
 - Check resource state before mutating it (e.g., check issue state before closing) since external systems like GitHub may auto-close issues when a linked PR merges — skip redundant operations and report the observed state instead. _(from #11)
+- Extract the linked issue number from a branch name by splitting on non-digit characters (`split(|c: char| !c.is_ascii_digit())`) and finding the first parseable integer — works for common patterns like `feat/issue-12`, `fix/12-foo`, etc. _(from #12)
+- Look up the PR associated with a branch with `gh pr list --head <branch> --limit 1 --json ...` — returns an empty array when no PR exists, making it natural to model as `Option<PullRequest>`. _(from #12)
+- In a status command, cascade from specific to general: branch → linked PR → linked issue → all open plans, so users always see useful context even when on an untracked or unrelated branch. _(from #12)
