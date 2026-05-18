@@ -200,24 +200,28 @@ pub fn compact_learnings(topics: &[crate::memory::TopicFile]) -> Result<Vec<Comp
         .join("\n");
 
     let prompt = format!(
-        r#"You are auditing an AI agent memory system. Each file is a "learned doc" — knowledge stored to help future agents make better decisions.
+        r#"You are aggressively pruning an AI agent memory system. The default action is DELETE. Only keep a file if it clears a high bar.
 
-## Keep standard
-Keep a file ONLY if it would prevent a future agent from making a mistake or wrong design decision that is NOT obvious from reading the source code. Good candidates:
-- Tripwires: non-obvious gotchas with a clear "do this instead"
-- Architectural WHY that can't be inferred from a single file
-- Patterns that save real investigation time across multiple future tasks
+## The only reasons to KEEP a file
 
-## Delete if
-- The insight is self-evident from the existing code structure
-- It documents an implementation choice already visible to any reader of the source
-- It's a task log ("we did X for issue N") rather than future guidance
-- An agent starting a new feature would naturally arrive at this approach without the hint
+1. **It records a failure that already happened** — a bug, a wrong approach, a gotcha that was discovered the hard way. The file exists so the same mistake is not repeated.
+2. **It captures non-obvious external behaviour** — something about a third-party tool, API, or environment that a developer could not infer from reading the source code (e.g. a CLI flag that silently does the wrong thing, an API with surprising semantics).
+3. **It explains WHY an architectural decision was made** when the alternative was plausible and the reason is not in any source file or commit message — and getting it wrong would cause a real problem.
 
-## Merge if
-Two files cover the same core insight from different angles. Provide a combined body paragraph that synthesises both; the target file survives, the source is deleted.
+## DELETE everything else, including
 
-Note: merge targets must NOT themselves be merge_into sources in the same response.
+- Any file that describes HOW the code works (a developer can read the code)
+- Any file that documents the current design or current command behaviour
+- Any pattern that is the obvious/natural approach in Rust or in this codebase
+- Any file whose insight is "use X" where X is already used everywhere in the code
+- Any file that amounts to a reminder or note-to-self about a decision that is already baked in
+- Any file describing a single-command or single-function implementation detail
+- Any UX or output-formatting decision already visible in the code
+- Anything where a competent developer reading the source for 10 minutes would say "yes, obviously"
+
+## MERGE only when two files that both pass the KEEP bar cover the same root insight
+
+Provide a `target_updated_body` paragraph that synthesises both. Merge targets must not themselves be merge_into sources.
 
 ## Files to audit
 
@@ -225,14 +229,15 @@ Note: merge targets must NOT themselves be merge_into sources in the same respon
 
 ---
 
-Return ONLY a JSON array where every file appears exactly once:
+Return ONLY a JSON array. Every file must appear exactly once. Be aggressive — when in doubt, delete.
+
 [
   {{"action": "keep", "category": "tripwires", "slug": "invoking-claude-p-from-within-a-repo-directory-causes-claude"}},
-  {{"action": "delete", "category": "patterns", "slug": "compute-human-readable-issue-age-today-1-day-ago-n-days-ago-", "reason": "Self-evident from src/main.rs; no cross-cutting guidance"}},
-  {{"action": "merge_into", "category": "patterns", "slug": "use-path-imports-in-claude-md-to-reference-engram-memory-md-",
-    "target_category": "architecture", "target_slug": "claude-md-should-hold-only-structural-pointers-path-refs-all",
-    "target_updated_body": "Single paragraph synthesising both insights.",
-    "reason": "Same core insight about CLAUDE.md referencing vs inlining"}}
+  {{"action": "delete", "category": "patterns", "slug": "compute-human-readable-issue-age-today-1-day-ago-n-days-ago-", "reason": "Describes a done implementation; self-evident from src/main.rs"}},
+  {{"action": "merge_into", "category": "patterns", "slug": "source-slug",
+    "target_category": "architecture", "target_slug": "target-slug",
+    "target_updated_body": "Synthesised paragraph.",
+    "reason": "Same root insight"}}
 ]"#
     );
 
