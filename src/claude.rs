@@ -8,6 +8,17 @@ pub struct LearningItem {
     pub content: String,
 }
 
+fn strip_code_fence(s: &str) -> String {
+    let mut lines = s.lines();
+    if let Some(first) = lines.next() {
+        if first.starts_with("```") {
+            let inner: Vec<&str> = lines.take_while(|l| !l.starts_with("```")).collect();
+            return inner.join("\n");
+        }
+    }
+    s.to_string()
+}
+
 pub fn load_prompt_hooks(repo_root: &std::path::Path) -> String {
     let hooks_dir = repo_root.join(".engram/prompt-hooks");
     if !hooks_dir.exists() {
@@ -22,6 +33,7 @@ pub fn load_prompt_hooks(repo_root: &std::path::Path) -> String {
     entries.sort_by_key(|e| e.path());
     entries
         .iter()
+        .filter(|e| e.file_name() != "README.md")
         .filter_map(|e| std::fs::read_to_string(e.path()).ok())
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -88,8 +100,11 @@ Return ONLY a JSON array, no other text:
 ]"#
     );
 
+    // Run from a temp dir so Claude Code doesn't pick up the repo's CLAUDE.md
+    // and try to act on it rather than just synthesizing JSON.
     let output = Command::new("claude")
         .args(["-p", &prompt, "--output-format", "text"])
+        .current_dir(std::env::temp_dir())
         .output()
         .context("running claude CLI (is Claude Code installed and authenticated?)")?;
 
@@ -99,9 +114,13 @@ Return ONLY a JSON array, no other text:
     }
 
     let text = String::from_utf8(output.stdout)?;
-    let json_start = text.find('[').context("claude output contained no JSON array")?;
-    let json_end = text.rfind(']').context("claude output had no closing ]")?;
-    let json = &text[json_start..=json_end];
+
+    // Strip markdown code fences (```json ... ``` or ``` ... ```) if present
+    let stripped = strip_code_fence(text.trim());
+
+    let json_start = stripped.find('[').context("claude output contained no JSON array")?;
+    let json_end = stripped.rfind(']').context("claude output had no closing ]")?;
+    let json = &stripped[json_start..=json_end];
 
     serde_json::from_str(json).context("parsing learning items from claude output")
 }
