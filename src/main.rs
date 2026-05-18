@@ -17,6 +17,7 @@ fn main() -> Result<()> {
         Commands::Plan { title, body } => cmd_plan(title, body.as_deref()),
         Commands::Learn { issue } => cmd_learn(issue),
         Commands::Doctor => cmd_doctor(),
+        Commands::List => cmd_list(),
     }
 }
 
@@ -64,6 +65,61 @@ fn cmd_learn(issue: u64) -> Result<()> {
     let repo_root = config::find_repo_root()?;
     let cfg = config::Config::load(&repo_root)?;
     learn::run(&repo_root, &cfg, issue)
+}
+
+fn cmd_list() -> Result<()> {
+    let repo_root = config::find_repo_root()?;
+    let cfg = config::Config::load(&repo_root)?;
+    let repo = cfg
+        .repo()
+        .map(|s| s.to_string())
+        .or_else(|| infer_repo(&repo_root))
+        .ok_or_else(|| anyhow::anyhow!("GitHub repo not configured — run `engram init`"))?;
+
+    let plans = github::list_open_plans(&repo)?;
+    if plans.is_empty() {
+        println!("No open plans.");
+        return Ok(());
+    }
+
+    for p in &plans {
+        let age = days_ago(&p.created_at);
+        println!("#{:<4} {} ({})", p.number, p.title, age);
+    }
+    Ok(())
+}
+
+fn days_ago(iso: &str) -> String {
+    // Parse YYYY-MM-DDTHH:MM:SSZ and compute days since then
+    let date_part = iso.split('T').next().unwrap_or(iso);
+    let parts: Vec<u32> = date_part.split('-').filter_map(|s| s.parse().ok()).collect();
+    if parts.len() != 3 {
+        return iso.to_string();
+    }
+    // Use a simple days-since-epoch comparison
+    let created_days = days_from_ymd(parts[0] as i32, parts[1], parts[2]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 86400) as i32)
+        .unwrap_or(0);
+    let diff = now - created_days;
+    match diff {
+        0 => "today".to_string(),
+        1 => "1 day ago".to_string(),
+        d => format!("{d} days ago"),
+    }
+}
+
+fn days_from_ymd(y: i32, m: u32, d: u32) -> i32 {
+    // Days since Unix epoch (1970-01-01) for a given date — Gregorian proleptic
+    let m = m as i32;
+    let d = d as i32;
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
 }
 
 fn cmd_doctor() -> Result<()> {

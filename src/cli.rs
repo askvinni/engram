@@ -26,4 +26,6 @@ pub enum Commands {
     },
     /// Check that all engram dependencies are installed and configured
     Doctor,
+    /// List open engram-plan issues
+    List,
 }
