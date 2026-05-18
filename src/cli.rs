@@ -22,7 +22,10 @@ pub enum Commands {
     /// Synthesize learnings from a closed issue+PR into memory
     Learn {
         /// GitHub issue number
-        issue: u64,
+        issue: Option<u64>,
+        /// Process all closed plan issues that have not yet been learned
+        #[arg(long, conflicts_with = "issue")]
+        all: bool,
     },
     /// Check that all engram dependencies are installed and configured
     Doctor,
