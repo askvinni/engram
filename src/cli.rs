@@ -33,4 +33,6 @@ pub enum Commands {
         /// GitHub issue number
         issue: u64,
     },
+    /// Show the linked engram issue and PR for the current branch
+    Status,
 }

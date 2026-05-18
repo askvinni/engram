@@ -140,6 +140,18 @@ pub fn get_pr_diff(repo: &str, pr_number: u64) -> Result<String> {
     gh(&["pr", "diff", &pr_number.to_string(), "--repo", repo])
 }
 
+pub fn find_pr_for_branch(repo: &str, branch: &str) -> Result<Option<PullRequest>> {
+    let out = gh(&[
+        "pr", "list",
+        "--repo", repo,
+        "--head", branch,
+        "--json", "number,title,body,state",
+        "--limit", "1",
+    ])?;
+    let mut prs: Vec<PullRequest> = serde_json::from_str(&out).context("parsing PR list JSON")?;
+    Ok(if prs.is_empty() { None } else { Some(prs.remove(0)) })
+}
+
 pub fn list_open_plans(repo: &str) -> Result<Vec<PlanIssue>> {
     let out = gh(&[
         "issue", "list",
