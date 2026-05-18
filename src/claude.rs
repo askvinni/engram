@@ -8,6 +8,25 @@ pub struct LearningItem {
     pub content: String,
 }
 
+pub fn load_prompt_hooks(repo_root: &std::path::Path) -> String {
+    let hooks_dir = repo_root.join(".engram/prompt-hooks");
+    if !hooks_dir.exists() {
+        return String::new();
+    }
+    let mut entries: Vec<_> = std::fs::read_dir(&hooks_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
+        .collect();
+    entries.sort_by_key(|e| e.path());
+    entries
+        .iter()
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 pub fn synthesize_learnings(
     issue_title: &str,
     issue_body: &str,
@@ -15,6 +34,7 @@ pub fn synthesize_learnings(
     pr_body: &str,
     pr_diff: &str,
     current_memory: &str,
+    prompt_hooks: &str,
 ) -> Result<Vec<LearningItem>> {
     let diff = if pr_diff.len() > 8000 {
         &pr_diff[..8000]
@@ -26,6 +46,12 @@ pub fn synthesize_learnings(
         "_none yet_".to_string()
     } else {
         current_memory.to_string()
+    };
+
+    let hooks_section = if prompt_hooks.is_empty() {
+        String::new()
+    } else {
+        format!("\n## Project-Specific Rules\n{prompt_hooks}\n")
     };
 
     let prompt = format!(
@@ -44,7 +70,7 @@ pub fn synthesize_learnings(
 
 ## Current Memory
 {memory_section}
-
+{hooks_section}
 ---
 
 Extract 1–5 concise learnings from this issue+PR. Use existing categories from current memory when applicable.
