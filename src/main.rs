@@ -1,5 +1,6 @@
 mod cli;
 mod claude;
+mod compact;
 mod config;
 mod github;
 mod learn;
@@ -20,6 +21,7 @@ fn main() -> Result<()> {
         Commands::List => cmd_list(),
         Commands::Land { issue } => cmd_land(issue),
         Commands::Status => cmd_status(),
+        Commands::Compact => cmd_compact(),
     }
 }
 
@@ -81,6 +83,11 @@ fn cmd_learn(issue: u64) -> Result<()> {
     let repo_root = config::find_repo_root()?;
     let cfg = config::Config::load(&repo_root)?;
     learn::run(&repo_root, &cfg, issue)
+}
+
+fn cmd_compact() -> Result<()> {
+    let repo_root = config::find_repo_root()?;
+    compact::run(&repo_root)
 }
 
 const PROMPT_HOOKS_README: &str = r#"# Prompt Hooks

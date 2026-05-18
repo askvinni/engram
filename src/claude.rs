@@ -19,6 +19,17 @@ pub struct LearningItem {
     pub body: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CompactAction {
+    pub action: String, // "delete", "keep", "merge_into"
+    pub category: String,
+    pub slug: String,
+    pub reason: Option<String>,
+    pub target_category: Option<String>,
+    pub target_slug: Option<String>,
+    pub target_updated_body: Option<String>,
+}
+
 fn strip_code_fence(s: &str) -> String {
     let mut lines = s.lines();
     if let Some(first) = lines.next() {
@@ -175,4 +186,72 @@ Return ONLY a JSON array, no other text:
     let json = &stripped[json_start..=json_end];
 
     serde_json::from_str(json).context("parsing learning items from claude output")
+}
+
+pub fn compact_learnings(topics: &[crate::memory::TopicFile]) -> Result<Vec<CompactAction>> {
+    if topics.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let files_section: String = topics
+        .iter()
+        .map(|t| format!("### {}/{}\n{}\n", t.category, t.slug, t.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let prompt = format!(
+        r#"You are auditing an AI agent memory system. Each file is a "learned doc" — knowledge stored to help future agents make better decisions.
+
+## Keep standard
+Keep a file ONLY if it would prevent a future agent from making a mistake or wrong design decision that is NOT obvious from reading the source code. Good candidates:
+- Tripwires: non-obvious gotchas with a clear "do this instead"
+- Architectural WHY that can't be inferred from a single file
+- Patterns that save real investigation time across multiple future tasks
+
+## Delete if
+- The insight is self-evident from the existing code structure
+- It documents an implementation choice already visible to any reader of the source
+- It's a task log ("we did X for issue N") rather than future guidance
+- An agent starting a new feature would naturally arrive at this approach without the hint
+
+## Merge if
+Two files cover the same core insight from different angles. Provide a combined body paragraph that synthesises both; the target file survives, the source is deleted.
+
+Note: merge targets must NOT themselves be merge_into sources in the same response.
+
+## Files to audit
+
+{files_section}
+
+---
+
+Return ONLY a JSON array where every file appears exactly once:
+[
+  {{"action": "keep", "category": "tripwires", "slug": "invoking-claude-p-from-within-a-repo-directory-causes-claude"}},
+  {{"action": "delete", "category": "patterns", "slug": "compute-human-readable-issue-age-today-1-day-ago-n-days-ago-", "reason": "Self-evident from src/main.rs; no cross-cutting guidance"}},
+  {{"action": "merge_into", "category": "patterns", "slug": "use-path-imports-in-claude-md-to-reference-engram-memory-md-",
+    "target_category": "architecture", "target_slug": "claude-md-should-hold-only-structural-pointers-path-refs-all",
+    "target_updated_body": "Single paragraph synthesising both insights.",
+    "reason": "Same core insight about CLAUDE.md referencing vs inlining"}}
+]"#
+    );
+
+    let output = Command::new("claude")
+        .args(["-p", &prompt, "--output-format", "text"])
+        .current_dir(std::env::temp_dir())
+        .output()
+        .context("running claude CLI")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("claude -p failed: {}", stderr.trim());
+    }
+
+    let text = String::from_utf8(output.stdout)?;
+    let stripped = strip_code_fence(text.trim());
+    let json_start = stripped.find('[').context("claude output contained no JSON array")?;
+    let json_end = stripped.rfind(']').context("claude output had no closing ]")?;
+    let json = &stripped[json_start..=json_end];
+
+    serde_json::from_str(json).context("parsing compact actions from claude output")
 }

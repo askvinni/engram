@@ -35,4 +35,6 @@ pub enum Commands {
     },
     /// Show the linked engram issue and PR for the current branch
     Status,
+    /// Prune and merge memory files that don't meet the future-looking standard
+    Compact,
 }

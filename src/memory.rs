@@ -4,6 +4,192 @@ use std::path::Path;
 const ENGRAM_START: &str = "<!-- engram:start -->";
 const ENGRAM_END: &str = "<!-- engram:end -->";
 
+pub struct TopicFile {
+    pub category: String,
+    pub slug: String,
+    pub content: String,
+}
+
+pub fn list_all_topics(repo_root: &Path) -> Result<Vec<TopicFile>> {
+    let memory_dir = repo_root.join(".engram/memory");
+    let mut topics = Vec::new();
+    for category in &["patterns", "tripwires", "architecture", "testing"] {
+        let cat_dir = memory_dir.join(category);
+        if !cat_dir.exists() {
+            continue;
+        }
+        let mut files: Vec<_> = std::fs::read_dir(&cat_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
+            .collect();
+        files.sort_by_key(|e| e.path());
+        for entry in files {
+            let path = entry.path();
+            let content = std::fs::read_to_string(&path)?;
+            let slug = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            topics.push(TopicFile {
+                category: category.to_string(),
+                slug,
+                content,
+            });
+        }
+    }
+    Ok(topics)
+}
+
+pub fn apply_compact_actions(
+    repo_root: &Path,
+    actions: &[crate::claude::CompactAction],
+    topics: &[TopicFile],
+) -> Result<(usize, usize)> {
+    let memory_dir = repo_root.join(".engram/memory");
+    let mut deleted = 0;
+    let mut merged = 0;
+
+    // First pass: update merge targets before deleting sources
+    for action in actions {
+        if action.action != "merge_into" {
+            continue;
+        }
+        let (target_cat, target_slug) = match (&action.target_category, &action.target_slug) {
+            (Some(c), Some(s)) => (c, s),
+            _ => continue,
+        };
+
+        let source_issues: Vec<u64> = topics
+            .iter()
+            .find(|t| t.category == action.category && t.slug == action.slug)
+            .map(|f| parse_source_issues(&f.content))
+            .unwrap_or_default();
+
+        let target_path = memory_dir.join(target_cat).join(format!("{target_slug}.md"));
+        if !target_path.exists() {
+            continue;
+        }
+
+        let existing = std::fs::read_to_string(&target_path)?;
+        let updated = if let Some(new_body) = &action.target_updated_body {
+            update_topic_body_and_issues(&existing, new_body, &source_issues)
+        } else {
+            update_topic_issues_only(&existing, &source_issues)
+        };
+        std::fs::write(&target_path, updated)?;
+    }
+
+    // Second pass: delete files (deletes and merge sources)
+    for action in actions {
+        if action.action == "delete" || action.action == "merge_into" {
+            let path = memory_dir
+                .join(&action.category)
+                .join(format!("{}.md", action.slug));
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+                if action.action == "delete" {
+                    deleted += 1;
+                } else {
+                    merged += 1;
+                }
+            }
+        }
+    }
+
+    Ok((deleted, merged))
+}
+
+fn update_topic_body_and_issues(content: &str, new_body: &str, extra_issues: &[u64]) -> String {
+    let today = today_iso();
+    let mut existing_issues = parse_source_issues(content);
+    for n in extra_issues {
+        if !existing_issues.contains(n) {
+            existing_issues.push(*n);
+        }
+    }
+    existing_issues.sort();
+    let issues_yaml = format!(
+        "[{}]",
+        existing_issues
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    // Rebuild file: preserve frontmatter fields except body, last_updated, source_issues
+    let fm_end = find_frontmatter_end(content);
+    let frontmatter = &content[..fm_end];
+
+    // Replace last_updated and source_issues in frontmatter
+    let frontmatter = replace_frontmatter_field(frontmatter, "last_updated", &format!("\"{today}\""));
+    let frontmatter = replace_frontmatter_field(&frontmatter, "source_issues", &issues_yaml);
+
+    format!("{frontmatter}\n{new_body}\n")
+}
+
+fn update_topic_issues_only(content: &str, extra_issues: &[u64]) -> String {
+    let today = today_iso();
+    let mut existing_issues = parse_source_issues(content);
+    for n in extra_issues {
+        if !existing_issues.contains(n) {
+            existing_issues.push(*n);
+        }
+    }
+    existing_issues.sort();
+    let issues_yaml = format!(
+        "[{}]",
+        existing_issues
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let fm_end = find_frontmatter_end(content);
+    let frontmatter = &content[..fm_end];
+    let body = content[fm_end..].trim_start_matches('\n');
+
+    let frontmatter = replace_frontmatter_field(frontmatter, "last_updated", &format!("\"{today}\""));
+    let frontmatter = replace_frontmatter_field(&frontmatter, "source_issues", &issues_yaml);
+
+    format!("{frontmatter}\n{body}\n")
+}
+
+fn find_frontmatter_end(content: &str) -> usize {
+    // Find the closing --- of YAML frontmatter
+    let mut in_fm = false;
+    let mut line_start = 0;
+    for (i, c) in content.char_indices() {
+        if c == '\n' || i == content.len() - 1 {
+            let line = &content[line_start..if c == '\n' { i } else { i + 1 }];
+            if line_start == 0 && line.trim() == "---" {
+                in_fm = true;
+            } else if in_fm && line.trim() == "---" {
+                return i + 1; // include the closing ---\n
+            }
+            line_start = i + 1;
+        }
+    }
+    // fallback: whole content is frontmatter
+    content.len()
+}
+
+fn replace_frontmatter_field(frontmatter: &str, field: &str, value: &str) -> String {
+    let prefix = format!("{field}:");
+    let lines: Vec<&str> = frontmatter.lines().collect();
+    let mut result = Vec::new();
+    for line in &lines {
+        if line.trim_start().starts_with(&prefix) {
+            result.push(format!("{field}: {value}"));
+        } else {
+            result.push(line.to_string());
+        }
+    }
+    result.join("\n") + if frontmatter.ends_with('\n') { "\n" } else { "" }
+}
+
 /// Read all memory files for injection into the synthesis prompt.
 /// Returns a compact summary of existing topics so Claude avoids duplicates.
 pub fn read_all(repo_root: &Path) -> Result<String> {
