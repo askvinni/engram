@@ -1,5 +1,5 @@
-mod cli;
 mod claude;
+mod cli;
 mod compact;
 mod config;
 mod github;
@@ -56,8 +56,18 @@ fn cmd_init() -> Result<()> {
     println!("Updated CLAUDE.md");
 
     if let Some(repo) = cfg.repo() {
-        github::ensure_label(repo, "engram-plan", "0075ca", "Plan issue created by engram")?;
-        github::ensure_label(repo, "engram-learned", "e4e669", "Learning PR created by engram")?;
+        github::ensure_label(
+            repo,
+            "engram-plan",
+            "0075ca",
+            "Plan issue created by engram",
+        )?;
+        github::ensure_label(
+            repo,
+            "engram-learned",
+            "e4e669",
+            "Learning PR created by engram",
+        )?;
         println!("GitHub labels ensured: engram-plan, engram-learned");
     }
 
@@ -129,7 +139,17 @@ fn cmd_status() -> Result<()> {
 
     // Look for a PR on this branch
     if let Some(pr) = github::find_pr_for_branch(&repo, &branch)? {
-        println!("PR:     #{} {} [{}]", pr.number, pr.title, pr.body.as_deref().unwrap_or("").lines().next().unwrap_or(""));
+        println!(
+            "PR:     #{} {} [{}]",
+            pr.number,
+            pr.title,
+            pr.body
+                .as_deref()
+                .unwrap_or("")
+                .lines()
+                .next()
+                .unwrap_or("")
+        );
     } else {
         println!("PR:     none");
     }
@@ -235,7 +255,10 @@ fn cmd_list() -> Result<()> {
 fn days_ago(iso: &str) -> String {
     // Parse YYYY-MM-DDTHH:MM:SSZ and compute days since then
     let date_part = iso.split('T').next().unwrap_or(iso);
-    let parts: Vec<u32> = date_part.split('-').filter_map(|s| s.parse().ok()).collect();
+    let parts: Vec<u32> = date_part
+        .split('-')
+        .filter_map(|s| s.parse().ok())
+        .collect();
     if parts.len() != 3 {
         return iso.to_string();
     }
@@ -265,37 +288,65 @@ fn days_from_ymd(y: i32, m: u32, d: u32) -> i32 {
     era * 146097 + doe - 719468
 }
 
+type Check = (&'static str, Box<dyn Fn() -> bool>);
+
 fn cmd_doctor() -> Result<()> {
     let mut all_ok = true;
 
-    let checks: &[(&str, Box<dyn Fn() -> bool>)] = &[
+    let checks: &[Check] = &[
         ("git repo", Box::new(|| config::find_repo_root().is_ok())),
-        ("gh installed", Box::new(|| {
-            Command::new("gh").arg("--version").output().map_or(false, |o| o.status.success())
-        })),
-        ("gh authenticated", Box::new(|| {
-            Command::new("gh").args(["auth", "status"]).output().map_or(false, |o| o.status.success())
-        })),
-        ("claude installed", Box::new(|| {
-            Command::new("claude").arg("--version").output().map_or(false, |o| o.status.success())
-        })),
-        (".engram/config.toml exists", Box::new(|| {
-            config::find_repo_root()
-                .map(|r| r.join(".engram/config.toml").exists())
-                .unwrap_or(false)
-        })),
-        ("github repo configured", Box::new(|| {
-            config::find_repo_root()
-                .and_then(|r| config::Config::load(&r))
-                .map(|c| c.repo().is_some())
-                .unwrap_or(false)
-        })),
+        (
+            "gh installed",
+            Box::new(|| {
+                Command::new("gh")
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|o| o.status.success())
+            }),
+        ),
+        (
+            "gh authenticated",
+            Box::new(|| {
+                Command::new("gh")
+                    .args(["auth", "status"])
+                    .output()
+                    .is_ok_and(|o| o.status.success())
+            }),
+        ),
+        (
+            "claude installed",
+            Box::new(|| {
+                Command::new("claude")
+                    .arg("--version")
+                    .output()
+                    .is_ok_and(|o| o.status.success())
+            }),
+        ),
+        (
+            ".engram/config.toml exists",
+            Box::new(|| {
+                config::find_repo_root()
+                    .map(|r| r.join(".engram/config.toml").exists())
+                    .unwrap_or(false)
+            }),
+        ),
+        (
+            "github repo configured",
+            Box::new(|| {
+                config::find_repo_root()
+                    .and_then(|r| config::Config::load(&r))
+                    .map(|c| c.repo().is_some())
+                    .unwrap_or(false)
+            }),
+        ),
     ];
 
     for (label, check) in checks {
         let ok = check();
         println!("{} {}", if ok { "✓" } else { "✗" }, label);
-        if !ok { all_ok = false; }
+        if !ok {
+            all_ok = false;
+        }
     }
 
     if !all_ok {
@@ -306,7 +357,14 @@ fn cmd_doctor() -> Result<()> {
 
 fn infer_repo(repo_root: &std::path::Path) -> Option<String> {
     let output = Command::new("gh")
-        .args(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"])
+        .args([
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "-q",
+            ".nameWithOwner",
+        ])
         .current_dir(repo_root)
         .output()
         .ok()?;

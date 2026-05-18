@@ -10,7 +10,10 @@ pub fn run(repo_root: &Path, config: &Config, issue_number: u64) -> Result<()> {
     println!("Fetching issue #{issue_number}...");
     let issue = github::get_issue(&repo, issue_number)?;
     if issue.state != "CLOSED" {
-        anyhow::bail!("issue #{issue_number} is not closed (state: {})", issue.state);
+        anyhow::bail!(
+            "issue #{issue_number} is not closed (state: {})",
+            issue.state
+        );
     }
 
     println!("Finding linked PR...");
@@ -43,16 +46,7 @@ pub fn run(repo_root: &Path, config: &Config, issue_number: u64) -> Result<()> {
 
     println!("Writing {} learning(s)...", items.len());
     for item in &items {
-        memory::write_topic_file(
-            repo_root,
-            &item.category,
-            &item.slug,
-            &item.title,
-            &item.read_when,
-            &item.tripwires,
-            &item.body,
-            issue_number,
-        )?;
+        memory::write_topic_file(repo_root, item, issue_number)?;
         println!("  [{}] {} — {}", item.category, item.slug, item.title);
     }
 
@@ -78,7 +72,11 @@ pub fn run(repo_root: &Path, config: &Config, issue_number: u64) -> Result<()> {
 
     git(
         repo_root,
-        &["commit", "-m", &format!("engram: learn from issue #{issue_number}")],
+        &[
+            "commit",
+            "-m",
+            &format!("engram: learn from issue #{issue_number}"),
+        ],
     )?;
     git(repo_root, &["push", "-u", "origin", &branch])?;
 
@@ -113,7 +111,14 @@ fn resolve_repo(config: &Config, repo_root: &Path) -> Result<String> {
         return Ok(repo.to_string());
     }
     let output = Command::new("gh")
-        .args(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"])
+        .args([
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "-q",
+            ".nameWithOwner",
+        ])
         .current_dir(repo_root)
         .output()?;
     if output.status.success() {

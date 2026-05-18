@@ -50,7 +50,7 @@ pub fn load_prompt_hooks(repo_root: &std::path::Path) -> String {
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
         .collect();
     entries.sort_by_key(|e| e.path());
     entries
@@ -181,8 +181,12 @@ Return ONLY a JSON array, no other text:
     // Strip markdown code fences (```json ... ``` or ``` ... ```) if present
     let stripped = strip_code_fence(text.trim());
 
-    let json_start = stripped.find('[').context("claude output contained no JSON array")?;
-    let json_end = stripped.rfind(']').context("claude output had no closing ]")?;
+    let json_start = stripped
+        .find('[')
+        .context("claude output contained no JSON array")?;
+    let json_end = stripped
+        .rfind(']')
+        .context("claude output had no closing ]")?;
     let json = &stripped[json_start..=json_end];
 
     serde_json::from_str(json).context("parsing learning items from claude output")
@@ -254,8 +258,12 @@ Return ONLY a JSON array. Every file must appear exactly once. Be aggressive —
 
     let text = String::from_utf8(output.stdout)?;
     let stripped = strip_code_fence(text.trim());
-    let json_start = stripped.find('[').context("claude output contained no JSON array")?;
-    let json_end = stripped.rfind(']').context("claude output had no closing ]")?;
+    let json_start = stripped
+        .find('[')
+        .context("claude output contained no JSON array")?;
+    let json_end = stripped
+        .rfind(']')
+        .context("claude output had no closing ]")?;
     let json = &stripped[json_start..=json_end];
 
     serde_json::from_str(json).context("parsing compact actions from claude output")

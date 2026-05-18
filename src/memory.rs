@@ -20,7 +20,7 @@ pub fn list_all_topics(repo_root: &Path) -> Result<Vec<TopicFile>> {
         }
         let mut files: Vec<_> = std::fs::read_dir(&cat_dir)?
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
             .collect();
         files.sort_by_key(|e| e.path());
         for entry in files {
@@ -66,7 +66,9 @@ pub fn apply_compact_actions(
             .map(|f| parse_source_issues(&f.content))
             .unwrap_or_default();
 
-        let target_path = memory_dir.join(target_cat).join(format!("{target_slug}.md"));
+        let target_path = memory_dir
+            .join(target_cat)
+            .join(format!("{target_slug}.md"));
         if !target_path.exists() {
             continue;
         }
@@ -123,7 +125,8 @@ fn update_topic_body_and_issues(content: &str, new_body: &str, extra_issues: &[u
     let frontmatter = &content[..fm_end];
 
     // Replace last_updated and source_issues in frontmatter
-    let frontmatter = replace_frontmatter_field(frontmatter, "last_updated", &format!("\"{today}\""));
+    let frontmatter =
+        replace_frontmatter_field(frontmatter, "last_updated", &format!("\"{today}\""));
     let frontmatter = replace_frontmatter_field(&frontmatter, "source_issues", &issues_yaml);
 
     format!("{frontmatter}\n{new_body}\n")
@@ -151,7 +154,8 @@ fn update_topic_issues_only(content: &str, extra_issues: &[u64]) -> String {
     let frontmatter = &content[..fm_end];
     let body = content[fm_end..].trim_start_matches('\n');
 
-    let frontmatter = replace_frontmatter_field(frontmatter, "last_updated", &format!("\"{today}\""));
+    let frontmatter =
+        replace_frontmatter_field(frontmatter, "last_updated", &format!("\"{today}\""));
     let frontmatter = replace_frontmatter_field(&frontmatter, "source_issues", &issues_yaml);
 
     format!("{frontmatter}\n{body}\n")
@@ -187,7 +191,12 @@ fn replace_frontmatter_field(frontmatter: &str, field: &str, value: &str) -> Str
             result.push(line.to_string());
         }
     }
-    result.join("\n") + if frontmatter.ends_with('\n') { "\n" } else { "" }
+    result.join("\n")
+        + if frontmatter.ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        }
 }
 
 /// Read all memory files for injection into the synthesis prompt.
@@ -206,7 +215,7 @@ pub fn read_all(repo_root: &Path) -> Result<String> {
         }
         let mut files: Vec<_> = std::fs::read_dir(&cat_dir)?
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
             .collect();
         files.sort_by_key(|e| e.path());
 
@@ -228,14 +237,15 @@ pub fn read_all(repo_root: &Path) -> Result<String> {
 /// Write a single learning item to .engram/memory/<category>/<slug>.md
 pub fn write_topic_file(
     repo_root: &Path,
-    category: &str,
-    slug: &str,
-    title: &str,
-    read_when: &[String],
-    tripwires: &[crate::claude::Tripwire],
-    body: &str,
+    item: &crate::claude::LearningItem,
     issue_number: u64,
 ) -> Result<()> {
+    let category = &item.category;
+    let slug = &item.slug;
+    let title = &item.title;
+    let read_when = item.read_when.as_slice();
+    let tripwires = item.tripwires.as_slice();
+    let body = &item.body;
     let cat_dir = repo_root.join(format!(".engram/memory/{category}"));
     std::fs::create_dir_all(&cat_dir)?;
 
@@ -256,17 +266,19 @@ pub fn write_topic_file(
 
     let today = today_iso();
 
-    let read_when_yaml: String = read_when
-        .iter()
-        .map(|s| format!("  - \"{s}\"\n"))
-        .collect();
+    let read_when_yaml: String = read_when.iter().map(|s| format!("  - \"{s}\"\n")).collect();
 
     let tripwires_yaml: String = if tripwires.is_empty() {
         "tripwires: []\n".to_string()
     } else {
         let items: String = tripwires
             .iter()
-            .map(|t| format!("  - action: \"{}\"\n    warning: \"{}\"\n", t.action, t.warning))
+            .map(|t| {
+                format!(
+                    "  - action: \"{}\"\n    warning: \"{}\"\n",
+                    t.action, t.warning
+                )
+            })
             .collect();
         format!("tripwires:\n{items}")
     };
@@ -304,7 +316,7 @@ pub fn rebuild_index(repo_root: &Path) -> Result<()> {
         }
         let mut files: Vec<_> = std::fs::read_dir(&cat_dir)?
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
             .collect();
         files.sort_by_key(|e| e.path());
 
@@ -316,7 +328,8 @@ pub fn rebuild_index(repo_root: &Path) -> Result<()> {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            let title = extract_frontmatter_field(&content, "title").unwrap_or_else(|| slug.clone());
+            let title =
+                extract_frontmatter_field(&content, "title").unwrap_or_else(|| slug.clone());
             let read_when = extract_frontmatter_list(&content, "read_when");
             let read_when_str = if read_when.is_empty() {
                 "—".to_string()
@@ -356,7 +369,7 @@ pub fn migrate_flat_files(repo_root: &Path) -> Result<usize> {
     let flat_files: Vec<_> = std::fs::read_dir(&memory_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.path().extension().map_or(false, |ext| ext == "md")
+            e.path().extension().is_some_and(|ext| ext == "md")
                 && e.path().file_name() != Some(std::ffi::OsStr::new("index.md"))
                 // Only top-level files (not inside subdirs)
                 && e.path().parent() == Some(&memory_dir)
@@ -442,10 +455,9 @@ pub fn write_claude_md_section(repo_root: &Path) -> Result<()> {
 
     let section = format!("{ENGRAM_START}\n## Engram Memory\n\n{body}\n{ENGRAM_END}");
 
-    let new_content = if let (Some(start), Some(end_idx)) = (
-        existing.find(ENGRAM_START),
-        existing.rfind(ENGRAM_END),
-    ) {
+    let new_content = if let (Some(start), Some(end_idx)) =
+        (existing.find(ENGRAM_START), existing.rfind(ENGRAM_END))
+    {
         let end = end_idx + ENGRAM_END.len();
         format!("{}{}{}", &existing[..start], section, &existing[end..])
     } else if existing.is_empty() {
@@ -488,7 +500,13 @@ fn days_to_ymd(z: i64) -> (i32, u32, u32) {
 fn slugify(s: &str) -> String {
     let s: String = s
         .chars()
-        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
     let s = s.trim_matches('-').to_string();
     // Collapse multiple dashes
