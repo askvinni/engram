@@ -1,0 +1,108 @@
+use anyhow::{Context, Result};
+use std::path::Path;
+use std::process::Command;
+
+use crate::{claude, config::Config, github, memory};
+
+pub fn run(repo_root: &Path, config: &Config, issue_number: u64) -> Result<()> {
+    let repo = resolve_repo(config, repo_root)?;
+
+    println!("Fetching issue #{issue_number}...");
+    let issue = github::get_issue(&repo, issue_number)?;
+    if issue.state != "CLOSED" {
+        anyhow::bail!("issue #{issue_number} is not closed (state: {})", issue.state);
+    }
+
+    println!("Finding linked PR...");
+    let pr = github::find_linked_pr(&repo, issue_number)?
+        .with_context(|| format!("no merged PR found that closes #{issue_number}"))?;
+
+    println!("Fetching diff for PR #{}...", pr.number);
+    let diff = github::get_pr_diff(&repo, pr.number)?;
+
+    println!("Reading existing memory...");
+    let current_memory = memory::read_all(repo_root)?;
+
+    println!("Synthesizing learnings with Claude...");
+    let items = claude::synthesize_learnings(
+        &issue.title,
+        issue.body.as_deref().unwrap_or(""),
+        &pr.title,
+        pr.body.as_deref().unwrap_or(""),
+        &diff,
+        &current_memory,
+    )?;
+
+    if items.is_empty() {
+        println!("No learnings extracted.");
+        return Ok(());
+    }
+
+    println!("Merging {} learning(s)...", items.len());
+    for item in &items {
+        memory::merge_item(repo_root, &item.category, &item.content, issue_number)?;
+        println!("  [{}] {}", item.category, item.content);
+    }
+
+    println!("Updating CLAUDE.md...");
+    memory::write_claude_md_section(repo_root)?;
+
+    let branch = format!("engram/learn-{issue_number}");
+    git(repo_root, &["checkout", "-b", &branch])?;
+    git(repo_root, &["add", ".engram/memory", "CLAUDE.md"])?;
+
+    // Skip commit if nothing was staged
+    let staged = Command::new("git")
+        .args(["diff", "--cached", "--quiet"])
+        .current_dir(repo_root)
+        .status()?;
+    if staged.success() {
+        println!("Nothing to commit — memory unchanged.");
+        return Ok(());
+    }
+
+    git(
+        repo_root,
+        &["commit", "-m", &format!("engram: learn from issue #{issue_number}")],
+    )?;
+    git(repo_root, &["push", "-u", "origin", &branch])?;
+
+    let pr_body = format!(
+        "Learnings extracted from issue #{issue_number} and PR #{}.\n\n---\n*Created by engram*",
+        pr.number
+    );
+    let pr_url = github::create_pr(
+        &repo,
+        &format!("engram: learn from #{issue_number}"),
+        &pr_body,
+        "engram-learned",
+    )?;
+
+    println!("PR created: {}", pr_url.trim());
+    Ok(())
+}
+
+fn git(repo_root: &Path, args: &[&str]) -> Result<()> {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(repo_root)
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("git {} failed", args.join(" "));
+    }
+    Ok(())
+}
+
+fn resolve_repo(config: &Config, repo_root: &Path) -> Result<String> {
+    if let Some(repo) = config.repo() {
+        return Ok(repo.to_string());
+    }
+    let output = Command::new("gh")
+        .args(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"])
+        .current_dir(repo_root)
+        .output()?;
+    if output.status.success() {
+        return Ok(String::from_utf8(output.stdout)?.trim().to_string());
+    }
+    anyhow::bail!("could not determine GitHub repo — set [github] repo in .engram/config.toml")
+}
