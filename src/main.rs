@@ -6,10 +6,13 @@ mod github;
 mod learn;
 mod memory;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Commands};
+use include_dir::{include_dir, Dir};
 use std::process::Command;
+
+static SKILLS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/.claude/skills");
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -54,6 +57,8 @@ fn cmd_init() -> Result<()> {
 
     memory::write_claude_md_section(&repo_root)?;
     println!("Updated CLAUDE.md");
+
+    install_skills(&repo_root)?;
 
     if let Some(repo) = cfg.repo() {
         github::ensure_label(
@@ -339,6 +344,14 @@ fn cmd_doctor() -> Result<()> {
                     .unwrap_or(false)
             }),
         ),
+        (
+            "claude skills current",
+            Box::new(|| {
+                config::find_repo_root()
+                    .map(|r| skills_current(&r))
+                    .unwrap_or(false)
+            }),
+        ),
     ];
 
     for (label, check) in checks {
@@ -353,6 +366,31 @@ fn cmd_doctor() -> Result<()> {
         anyhow::bail!("one or more checks failed");
     }
     Ok(())
+}
+
+fn install_skills(repo_root: &std::path::Path) -> Result<()> {
+    SKILLS_DIR
+        .extract(repo_root.join(".claude/skills"))
+        .context("installing Claude skills")?;
+    let skill_names: Vec<&str> = SKILLS_DIR
+        .dirs()
+        .map(|d| d.path().file_name().and_then(|n| n.to_str()).unwrap_or("?"))
+        .collect();
+    println!("Installed Claude skills: {}", skill_names.join(", "));
+    Ok(())
+}
+
+fn skills_current(repo_root: &std::path::Path) -> bool {
+    SKILLS_DIR
+        .find("**/*")
+        .expect("valid glob")
+        .filter_map(|e| e.as_file())
+        .all(|embedded| {
+            let dest = repo_root.join(".claude/skills").join(embedded.path());
+            std::fs::read(dest)
+                .map(|bytes| bytes == embedded.contents())
+                .unwrap_or(false)
+        })
 }
 
 fn infer_repo(repo_root: &std::path::Path) -> Option<String> {
@@ -422,5 +460,46 @@ mod tests {
             result.ends_with("days ago"),
             "expected 'N days ago', got {result}"
         );
+    }
+
+    #[test]
+    fn install_skills_writes_all_four_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        install_skills(root).unwrap();
+        assert!(root.join(".claude/skills/engram-plan/SKILL.md").exists());
+        assert!(root.join(".claude/skills/engram-learn/SKILL.md").exists());
+        assert!(root
+            .join(".claude/skills/engram-learn/references/memory-quality.md")
+            .exists());
+        assert!(root.join(".claude/skills/engram-memory/SKILL.md").exists());
+    }
+
+    #[test]
+    fn skills_current_true_after_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        install_skills(root).unwrap();
+        assert!(skills_current(root));
+    }
+
+    #[test]
+    fn skills_current_false_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!skills_current(dir.path()));
+    }
+
+    #[test]
+    fn skills_current_false_when_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        install_skills(root).unwrap();
+        // Overwrite one skill with stale content
+        std::fs::write(
+            root.join(".claude/skills/engram-plan/SKILL.md"),
+            b"outdated",
+        )
+        .unwrap();
+        assert!(!skills_current(root));
     }
 }
