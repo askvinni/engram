@@ -358,84 +358,6 @@ pub fn rebuild_index(repo_root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Migrate existing flat .engram/memory/<category>.md files to the new topic-file structure.
-/// Each bullet item becomes its own file under .engram/memory/<category>/<slug>.md.
-pub fn migrate_flat_files(repo_root: &Path) -> Result<usize> {
-    let memory_dir = repo_root.join(".engram/memory");
-    if !memory_dir.exists() {
-        return Ok(0);
-    }
-
-    let flat_files: Vec<_> = std::fs::read_dir(&memory_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path().extension().is_some_and(|ext| ext == "md")
-                && e.path().file_name() != Some(std::ffi::OsStr::new("index.md"))
-                // Only top-level files (not inside subdirs)
-                && e.path().parent() == Some(&memory_dir)
-        })
-        .collect();
-
-    if flat_files.is_empty() {
-        return Ok(0);
-    }
-
-    let mut migrated = 0;
-
-    for entry in &flat_files {
-        let path = entry.path();
-        let category = path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-
-        let content = std::fs::read_to_string(&path)?;
-
-        for line in content.lines() {
-            let line = line.trim();
-            if !line.starts_with("- ") {
-                continue;
-            }
-            let text = line.trim_start_matches("- ");
-
-            // Extract issue number from _(from #N)_ suffix
-            let (body_text, issue_num) = extract_issue_ref(text);
-            if body_text.is_empty() {
-                continue;
-            }
-
-            let slug = slugify(&body_text);
-            let cat_dir = memory_dir.join(&category);
-            std::fs::create_dir_all(&cat_dir)?;
-            let dest = cat_dir.join(format!("{slug}.md"));
-
-            // Skip if already migrated
-            if dest.exists() {
-                continue;
-            }
-
-            let today = today_iso();
-            let issues_yaml = issue_num
-                .map(|n| format!("[{n}]"))
-                .unwrap_or_else(|| "[]".to_string());
-
-            let file_content = format!(
-                "---\ntitle: \"{}\"\nread_when:\n  - \"(migrated — add read_when conditions)\"\ntripwires: []\nlast_updated: \"{today}\"\nsource_issues: {issues_yaml}\n---\n\n{body_text}\n",
-                truncate_title(&body_text, 60)
-            );
-
-            std::fs::write(&dest, file_content)?;
-            migrated += 1;
-        }
-
-        // Remove the flat file after migration
-        std::fs::remove_file(&path)?;
-    }
-
-    Ok(migrated)
-}
-
 pub fn write_claude_md_section(repo_root: &Path) -> Result<()> {
     let claude_md_path = repo_root.join("CLAUDE.md");
     let memory_dir = repo_root.join(".engram/memory");
@@ -495,60 +417,6 @@ fn days_to_ymd(z: i64) -> (i32, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
-}
-
-fn slugify(s: &str) -> String {
-    let s: String = s
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    let s = s.trim_matches('-').to_string();
-    // Collapse multiple dashes
-    let mut slug = String::new();
-    let mut prev_dash = false;
-    for c in s.chars() {
-        if c == '-' {
-            if !prev_dash {
-                slug.push(c);
-            }
-            prev_dash = true;
-        } else {
-            slug.push(c);
-            prev_dash = false;
-        }
-    }
-    // Truncate to 60 chars
-    slug.chars().take(60).collect()
-}
-
-fn truncate_title(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let truncated: String = s.chars().take(max - 1).collect();
-        format!("{truncated}…")
-    }
-}
-
-fn extract_issue_ref(s: &str) -> (String, Option<u64>) {
-    // Strip _(from #N)_ or _(from #N)_ _(from #M)_ suffixes
-    let re_suffix = " _(from #";
-    if let Some(pos) = s.rfind(re_suffix) {
-        let body = s[..pos].trim().to_string();
-        let rest = &s[pos + re_suffix.len()..];
-        let num: Option<u64> = rest
-            .split(|c: char| !c.is_ascii_digit())
-            .next()
-            .and_then(|n| n.parse().ok());
-        return (body, num);
-    }
-    (s.to_string(), None)
 }
 
 fn parse_source_issues(content: &str) -> Vec<u64> {
@@ -707,29 +575,6 @@ mod tests {
         let fm = "---\ntitle: \"keep\"\nlast_updated: \"old\"\n---\n";
         let result = replace_frontmatter_field(fm, "last_updated", "\"new\"");
         assert!(result.contains("title: \"keep\""));
-    }
-
-    // --- slugify ---
-
-    #[test]
-    fn slugify_lowercases_and_replaces_spaces() {
-        assert_eq!(slugify("Hello World"), "hello-world");
-    }
-
-    #[test]
-    fn slugify_collapses_consecutive_dashes() {
-        assert_eq!(slugify("foo  bar"), "foo-bar");
-    }
-
-    #[test]
-    fn slugify_strips_leading_trailing_dashes() {
-        assert_eq!(slugify("  foo  "), "foo");
-    }
-
-    #[test]
-    fn slugify_truncates_at_60_chars() {
-        let long = "a".repeat(80);
-        assert_eq!(slugify(&long).len(), 60);
     }
 
     // --- today_iso ---

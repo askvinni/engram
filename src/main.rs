@@ -57,11 +57,6 @@ fn cmd_init() -> Result<()> {
         println!("Created .engram/prompt-hooks/");
     }
 
-    // Migrate legacy flat memory files if present
-    let migrated = memory::migrate_flat_files(&repo_root)?;
-    if migrated > 0 {
-        println!("Migrated {migrated} legacy memory item(s) to topic-file structure.");
-    }
     memory::rebuild_index(&repo_root)?;
 
     memory::write_claude_md_section(&repo_root)?;
@@ -502,9 +497,9 @@ fn missing_plan_sections(body: &str) -> Vec<&'static str> {
         ("Why", &["**Why"]),
         ("Background", &["**Background"]),
         ("Approach", &["**Approach"]),
-        ("Acceptance criteria", &["**Acceptance criteria", "**What"]),
+        ("Acceptance criteria", &["**Acceptance criteria"]),
         ("Scope", &["**Scope"]),
-        ("Edge cases and risks", &["**Edge cases", "**Risks"]),
+        ("Edge cases and risks", &["**Edge cases"]),
         ("Key files", &["**Key files"]),
     ];
     SECTIONS
@@ -638,12 +633,6 @@ mod tests {
     #[test]
     fn missing_plan_sections_complete_body() {
         let body = "**Why** x\n**Background** x\n**Approach** x\n**Acceptance criteria** x\n**Scope** x\n**Edge cases and risks** x\n**Key files** x";
-        assert!(missing_plan_sections(body).is_empty());
-    }
-
-    #[test]
-    fn missing_plan_sections_accepts_old_what_name() {
-        let body = "**Why** x\n**Background** x\n**Approach** x\n**What** x\n**Scope** x\n**Edge cases** x\n**Key files** x";
         assert!(missing_plan_sections(body).is_empty());
     }
 
