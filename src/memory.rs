@@ -603,3 +603,233 @@ fn extract_frontmatter_list(content: &str, field: &str) -> Vec<String> {
     }
     items
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claude::{LearningItem, Tripwire};
+
+    // --- parse_source_issues ---
+
+    #[test]
+    fn parse_source_issues_single() {
+        assert_eq!(
+            parse_source_issues("---\nsource_issues: [42]\n---\n"),
+            vec![42]
+        );
+    }
+
+    #[test]
+    fn parse_source_issues_multiple() {
+        assert_eq!(
+            parse_source_issues("---\nsource_issues: [1, 5, 10]\n---\n"),
+            vec![1, 5, 10]
+        );
+    }
+
+    #[test]
+    fn parse_source_issues_empty_brackets() {
+        assert_eq!(
+            parse_source_issues("---\nsource_issues: []\n---\n"),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    fn parse_source_issues_missing_field() {
+        assert_eq!(
+            parse_source_issues("---\ntitle: \"foo\"\n---\n"),
+            Vec::<u64>::new()
+        );
+    }
+
+    // --- extract_frontmatter_field ---
+
+    #[test]
+    fn extract_frontmatter_field_found() {
+        let content = "---\ntitle: \"My Title\"\n---\n";
+        assert_eq!(
+            extract_frontmatter_field(content, "title"),
+            Some("My Title".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_frontmatter_field_missing() {
+        assert_eq!(
+            extract_frontmatter_field("---\ntitle: \"foo\"\n---\n", "body"),
+            None
+        );
+    }
+
+    // --- extract_frontmatter_list ---
+
+    #[test]
+    fn extract_frontmatter_list_populated() {
+        let content = "---\nread_when:\n  - \"condition one\"\n  - \"condition two\"\n---\n";
+        assert_eq!(
+            extract_frontmatter_list(content, "read_when"),
+            vec!["condition one", "condition two"]
+        );
+    }
+
+    #[test]
+    fn extract_frontmatter_list_empty() {
+        let content = "---\nread_when:\ntripwires: []\n---\n";
+        assert_eq!(
+            extract_frontmatter_list(content, "read_when"),
+            Vec::<String>::new()
+        );
+    }
+
+    // --- find_frontmatter_end ---
+
+    #[test]
+    fn find_frontmatter_end_splits_correctly() {
+        let content = "---\ntitle: \"foo\"\n---\n\nbody text\n";
+        let end = find_frontmatter_end(content);
+        assert!(content[end..].contains("body text"));
+        assert!(content[..end].trim_end().ends_with("---"));
+    }
+
+    // --- replace_frontmatter_field ---
+
+    #[test]
+    fn replace_frontmatter_field_updates_value() {
+        let fm = "---\ntitle: \"t\"\nlast_updated: \"2024-01-01\"\n---\n";
+        let result = replace_frontmatter_field(fm, "last_updated", "\"2025-06-01\"");
+        assert!(result.contains("last_updated: \"2025-06-01\""));
+        assert!(!result.contains("2024-01-01"));
+    }
+
+    #[test]
+    fn replace_frontmatter_field_preserves_others() {
+        let fm = "---\ntitle: \"keep\"\nlast_updated: \"old\"\n---\n";
+        let result = replace_frontmatter_field(fm, "last_updated", "\"new\"");
+        assert!(result.contains("title: \"keep\""));
+    }
+
+    // --- slugify ---
+
+    #[test]
+    fn slugify_lowercases_and_replaces_spaces() {
+        assert_eq!(slugify("Hello World"), "hello-world");
+    }
+
+    #[test]
+    fn slugify_collapses_consecutive_dashes() {
+        assert_eq!(slugify("foo  bar"), "foo-bar");
+    }
+
+    #[test]
+    fn slugify_strips_leading_trailing_dashes() {
+        assert_eq!(slugify("  foo  "), "foo");
+    }
+
+    #[test]
+    fn slugify_truncates_at_60_chars() {
+        let long = "a".repeat(80);
+        assert_eq!(slugify(&long).len(), 60);
+    }
+
+    // --- today_iso ---
+
+    #[test]
+    fn today_iso_format() {
+        let s = today_iso();
+        assert_eq!(s.len(), 10);
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[7..8], "-");
+        assert!(s[..4].parse::<u32>().is_ok());
+        assert!(s[5..7].parse::<u32>().is_ok());
+        assert!(s[8..10].parse::<u32>().is_ok());
+    }
+
+    // --- integration: write_topic_file + rebuild_index ---
+
+    fn make_item(category: &str, slug: &str, title: &str, read_when: &[&str]) -> LearningItem {
+        LearningItem {
+            category: category.to_string(),
+            slug: slug.to_string(),
+            title: title.to_string(),
+            read_when: read_when.iter().map(|s| s.to_string()).collect(),
+            tripwires: vec![],
+            body: "Body text.".to_string(),
+        }
+    }
+
+    #[test]
+    fn write_topic_file_creates_file_with_correct_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let item = make_item("patterns", "test-slug", "Test Title", &["when testing"]);
+
+        write_topic_file(root, &item, 42).unwrap();
+
+        let content =
+            std::fs::read_to_string(root.join(".engram/memory/patterns/test-slug.md")).unwrap();
+        assert!(content.contains("title: \"Test Title\""));
+        assert!(content.contains("source_issues: [42]"));
+        assert!(content.contains("when testing"));
+        assert!(content.contains("Body text."));
+    }
+
+    #[test]
+    fn write_topic_file_accumulates_source_issues() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let item = make_item("patterns", "my-slug", "My Title", &[]);
+
+        write_topic_file(root, &item, 1).unwrap();
+        write_topic_file(root, &item, 2).unwrap();
+
+        let content =
+            std::fs::read_to_string(root.join(".engram/memory/patterns/my-slug.md")).unwrap();
+        assert!(content.contains("source_issues: [1, 2]"));
+    }
+
+    #[test]
+    fn write_topic_file_with_tripwires() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut item = make_item("tripwires", "my-tripwire", "My Tripwire", &[]);
+        item.tripwires = vec![Tripwire {
+            action: "Calling foo()".to_string(),
+            warning: "Use bar() instead".to_string(),
+        }];
+
+        write_topic_file(root, &item, 7).unwrap();
+
+        let content =
+            std::fs::read_to_string(root.join(".engram/memory/tripwires/my-tripwire.md")).unwrap();
+        assert!(content.contains("Calling foo()"));
+        assert!(content.contains("Use bar() instead"));
+    }
+
+    #[test]
+    fn rebuild_index_produces_table_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let item = make_item("patterns", "my-pattern", "My Pattern", &["when doing X"]);
+
+        write_topic_file(root, &item, 1).unwrap();
+        rebuild_index(root).unwrap();
+
+        let index = std::fs::read_to_string(root.join(".engram/memory/index.md")).unwrap();
+        assert!(index.contains("My Pattern"));
+        assert!(index.contains("when doing X"));
+        assert!(index.contains("patterns/my-pattern.md"));
+    }
+
+    #[test]
+    fn rebuild_index_empty_memory_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".engram/memory")).unwrap();
+
+        rebuild_index(root).unwrap();
+
+        let index = std::fs::read_to_string(root.join(".engram/memory/index.md")).unwrap();
+        assert!(index.contains("No learnings yet"));
+    }
+}

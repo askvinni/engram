@@ -268,3 +268,37 @@ Return ONLY a JSON array. Every file must appear exactly once. Be aggressive —
 
     serde_json::from_str(json).context("parsing compact actions from claude output")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_code_fence_bare_json() {
+        assert_eq!(strip_code_fence("[1, 2]"), "[1, 2]");
+    }
+
+    #[test]
+    fn strip_code_fence_json_fenced() {
+        let input = "```json\n[1, 2]\n```";
+        assert_eq!(strip_code_fence(input), "[1, 2]");
+    }
+
+    #[test]
+    fn strip_code_fence_plain_fenced() {
+        let input = "```\n{\"key\": \"val\"}\n```";
+        assert_eq!(strip_code_fence(input), "{\"key\": \"val\"}");
+    }
+
+    #[test]
+    fn strip_code_fence_multiline() {
+        let input = "```json\nline1\nline2\n```";
+        assert_eq!(strip_code_fence(input), "line1\nline2");
+    }
+
+    #[test]
+    fn strip_code_fence_no_closing_fence() {
+        let input = "```json\n[1, 2]";
+        assert_eq!(strip_code_fence(input), "[1, 2]");
+    }
+}
