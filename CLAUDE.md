@@ -1,8 +1,10 @@
 <!-- engram:start -->
 ## Engram Memory
 
-Learnings from past development work:
+Categorized learnings from past development:
 
-_No learnings yet. Run `engram learn <issue>` after closing a plan._
+@.engram/memory/architecture.md
+@.engram/memory/patterns.md
+@.engram/memory/tripwires.md
 
 <!-- engram:end -->
