@@ -78,68 +78,7 @@ Check `output.status.success()` and surface stderr as the error message.
 Prefer file-level `const` over magic literals:
 
 ```rust
-const ENGRAM_START: &str = "<!-- engram:start -->";
-const MAX_DIFF_BYTES: usize = 8_000;
-```
-
-## Modules and visibility
-
-Keep everything `pub` only when another module needs it. Internal helpers stay private. There are no re-exports — callers use the full path (`memory::rebuild_index`, not a re-export).
-
-## Tests
-
-`#[cfg(test)] mod tests` goes at the **end of the file**, after all production code.
-
-Use `#[test]` for sync tests. Use `tempfile::tempdir()` for any test that touches the filesystem:
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn write_and_read_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        // ...
-    }
-}
-```
-
-Test helpers that are shared across modules go in a `fn make_*()` helper inside the test module that needs them — no shared test_helpers module (the codebase is small enough).
-
-Do not test functions that shell out to `gh`, `git`, or `claude` — those stay as manual/E2E.
-
-## Toolchain and CI
-
-The CI uses the **stable** Rust toolchain. Always format with `cargo +stable fmt`, not nightly. Nightly rustfmt wraps lines differently and will fail CI.
-
-CI runs three jobs in parallel:
-- `cargo test`
-- `cargo clippy -- -D warnings`
-- `cargo fmt --check`
-
-All three must pass before merging. Fix clippy warnings rather than suppressing them; `#[allow(...)]` is a last resort.
-
-## Comments
-
-Use `///` for public items. Skip comments that just restate the function name. Only explain non-obvious WHY:
-
-```rust
-// Run from a temp dir so Claude Code doesn't pick up the repo's CLAUDE.md
-// and try to act on it rather than just synthesizing JSON.
-let output = Command::new("claude")
-    .current_dir(std::env::temp_dir())
-    ...
-```
-
-No multi-line comment blocks. One sentence max per comment.
-
-## Engram workflow
-
-Plans are GitHub issues labelled `engram-plan`. After a plan's PR merges, run `engram learn <issue>` (or `engram land <issue>` to also close and clean up) to synthesize learnings into `.engram/memory/`. Run `engram compact` periodically to prune stale memory files.
-
-<!-- engram:start -->
+const ENGRAM_START: &str = "<!-- engram:start -->
 ## Engram Memory
 
 @.engram/memory/index.md
