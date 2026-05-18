@@ -1,0 +1,10 @@
+[github]
+repo = "askvinni/engram"
+
+[memory]
+default_categories = [
+    "patterns",
+    "tripwires",
+    "architecture",
+    "testing",
+]
