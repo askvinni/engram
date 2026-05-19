@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
 
-use crate::{claude, config::Config, github, memory};
+use crate::{claude, config, github, memory};
 
 /// Validates the issue, synthesizes learnings, and writes them to memory on disk.
 /// Returns true if any learnings were written, false if none were found.
@@ -59,8 +59,8 @@ pub fn write_memory(repo_root: &Path, issue_number: u64, repo: &str) -> Result<b
     Ok(true)
 }
 
-pub fn run(repo_root: &Path, config: &Config, issue_number: u64) -> Result<()> {
-    let repo = resolve_repo(config, repo_root)?;
+pub fn run(repo_root: &Path, cfg: &config::Config, issue_number: u64) -> Result<()> {
+    let repo = config::resolve_repo(cfg, repo_root)?;
 
     if !write_memory(repo_root, issue_number, &repo)? {
         return Ok(());
@@ -116,23 +116,50 @@ fn git(repo_root: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn resolve_repo(config: &Config, repo_root: &Path) -> Result<String> {
-    if let Some(repo) = config.repo() {
-        return Ok(repo.to_string());
-    }
-    let output = Command::new("gh")
-        .args([
-            "repo",
-            "view",
-            "--json",
-            "nameWithOwner",
-            "-q",
-            ".nameWithOwner",
-        ])
+/// Commit all memory changes to a new branch and open a PR labeled `engram-learned`.
+/// Returns the PR URL if a commit+PR was created, or None if nothing was staged.
+pub fn commit_memory_pr(
+    repo_root: &Path,
+    repo: &str,
+    branch: &str,
+    learned: &[u64],
+    pr_title: &str,
+    pr_body: &str,
+) -> Result<Option<String>> {
+    git(repo_root, &["checkout", "-b", branch])?;
+    git(repo_root, &["add", ".engram/memory", "CLAUDE.md"])?;
+
+    let nothing_staged = Command::new("git")
+        .args(["diff", "--cached", "--quiet"])
         .current_dir(repo_root)
-        .output()?;
-    if output.status.success() {
-        return Ok(String::from_utf8(output.stdout)?.trim().to_string());
+        .status()?
+        .success();
+
+    if nothing_staged {
+        println!("Nothing to commit — memory unchanged.");
+        return Ok(None);
     }
-    anyhow::bail!("could not determine GitHub repo — set [github] repo in .engram/config.toml")
+
+    let issue_list = learned
+        .iter()
+        .map(|n| format!("#{n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    git(
+        repo_root,
+        &["commit", "-m", &format!("engram: learn from {issue_list}")],
+    )?;
+    git(repo_root, &["push", "-u", "origin", branch])?;
+
+    let pr_url = github::create_pr(repo, pr_title, pr_body, "engram-learned")?;
+    let pr_url = pr_url.trim().to_string();
+
+    for &n in learned {
+        if let Err(e) = github::add_label_to_issue(repo, n, "engram-learned") {
+            eprintln!("warning: could not label #{n}: {e:#}");
+        }
+    }
+
+    Ok(Some(pr_url))
 }

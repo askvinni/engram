@@ -1,12 +1,12 @@
 ---
 name: engram-learn
 description: Use this skill when the user asks to "run engram learn", "synthesize learnings", "run engram land", "extract memory from issue", "what did we learn from #N", or is performing the post-PR memory workflow. Provides guidance on the learn/land workflow, what gets written to memory, and how to review synthesized learnings.
-version: 0.1.0
+version: 0.2.0
 ---
 
 # engram-learn skill
 
-`engram learn <N>` synthesizes cross-cutting learnings from a closed issue and its merged PR into `.engram/memory/`. `engram land <N>` does the same plus closes the issue and deletes the local branch.
+`engram plan learn <N>` synthesizes cross-cutting learnings from a closed issue and its merged PR into `.engram/memory/`. `engram plan land <N>` does the same plus closes the issue and deletes the local branch.
 
 ## Prerequisites
 
@@ -23,9 +23,9 @@ Before running, verify:
    gh pr list --search "closes #<N>" --state merged
    ```
 
-If either check fails, `engram learn` will exit with an error message. Fix the state before proceeding.
+If either check fails, `engram plan learn` will exit with an error message. Fix the state before proceeding.
 
-## What `engram learn` does
+## What `engram plan learn` does
 
 1. Fetches issue `#N` title and body
 2. Finds the merged PR via GitHub's `CLOSED_EVENT` GraphQL query (`src/github.rs:find_linked_pr`)
@@ -39,9 +39,9 @@ If either check fails, `engram learn` will exit with an error message. Fix the s
 10. Updates the `<!-- engram:start --> ... <!-- engram:end -->` section in CLAUDE.md
 11. Creates branch `engram/learn-<N>`, commits, pushes, opens a PR labeled `engram-learned`
 
-## `engram land` vs `engram learn`
+## `engram plan land` vs `engram plan learn`
 
-| | `engram learn <N>` | `engram land <N>` |
+| | `engram plan learn <N>` | `engram plan land <N>` |
 |---|---|---|
 | Synthesizes learnings | yes | yes |
 | Closes the GitHub issue | no | yes |
@@ -53,7 +53,7 @@ Use **`learn`** alone when you want to inspect the created memory files on the b
 
 ## Reviewing synthesized learnings
 
-After `engram learn` creates the branch, check each new file in `.engram/memory/`:
+After `engram plan learn` creates the branch, check each new file in `.engram/memory/`:
 
 **`read_when` conditions** — should be concrete task phrases an agent will recognise at decision time:
 - Good: `"calling claude -p programmatically from engram"`

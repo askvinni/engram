@@ -281,7 +281,16 @@ fn create_plan_for_node(
 
     let marker = format!("Objective: #{objective_number} (node {node_id})");
     let plan_body = match body {
-        Some(b) => format!("{marker}\n\n{b}"),
+        Some(b) => {
+            let missing = crate::plan::missing_plan_sections(b);
+            if !missing.is_empty() {
+                eprintln!(
+                    "warning: plan body is missing sections: {}",
+                    missing.join(", ")
+                );
+            }
+            format!("{marker}\n\n{b}")
+        }
         None => {
             let generated =
                 generate_plan_body_for_node(obj_title, obj_body, &node_id, &node_description)?;
@@ -510,52 +519,19 @@ pub fn land(repo_root: &std::path::Path, repo: &str, objective_number: u64) -> R
     // Commit all memory changes in one branch + PR
     if !learned.is_empty() {
         let branch = format!("engram/objective-land-{objective_number}");
-        let ok = Command::new("git")
-            .args(["checkout", "-b", &branch])
-            .current_dir(repo_root)
-            .status()?
-            .success();
-        if !ok {
-            anyhow::bail!("git checkout -b {branch} failed");
-        }
-        Command::new("git")
-            .args(["add", ".engram/memory", "CLAUDE.md"])
-            .current_dir(repo_root)
-            .status()?;
-        let nothing_staged = Command::new("git")
-            .args(["diff", "--cached", "--quiet"])
-            .current_dir(repo_root)
-            .status()?
-            .success();
-        if !nothing_staged {
-            let issue_list = learned
-                .iter()
-                .map(|n| format!("#{n}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            Command::new("git")
-                .args(["commit", "-m", &format!("engram: learn from {issue_list}")])
-                .current_dir(repo_root)
-                .status()?;
-            Command::new("git")
-                .args(["push", "-u", "origin", &branch])
-                .current_dir(repo_root)
-                .status()?;
-            let pr_body = format!(
-                "Learnings from objective #{objective_number}: {issue_list}.\n\n---\n*Created by engram*"
-            );
-            let pr_url = github::create_pr(
-                repo,
-                &format!("engram: objective #{objective_number} learnings"),
-                &pr_body,
-                "engram-learned",
-            )?;
-            println!("\nPR created: {}", pr_url.trim());
-            for n in &learned {
-                if let Err(e) = github::add_label_to_issue(repo, *n, "engram-learned") {
-                    eprintln!("warning: could not label #{n}: {e:#}");
-                }
-            }
+        let issue_list = learned
+            .iter()
+            .map(|n| format!("#{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let pr_title = format!("engram: objective #{objective_number} learnings");
+        let pr_body = format!(
+            "Learnings from objective #{objective_number}: {issue_list}.\n\n---\n*Created by engram*"
+        );
+        if let Some(pr_url) =
+            crate::learn::commit_memory_pr(repo_root, repo, &branch, &learned, &pr_title, &pr_body)?
+        {
+            println!("\nPR created: {pr_url}");
         }
     }
 

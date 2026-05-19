@@ -11,14 +11,34 @@ pub struct Cli {
 pub enum Commands {
     /// Initialize engram in this repository
     Init,
-    /// Create a GitHub issue as a plan
+    /// Plan subcommands (create, list, learn, land, status)
     Plan {
+        #[command(subcommand)]
+        subcommand: PlanCommands,
+    },
+    /// Check that all engram dependencies are installed and configured
+    Doctor,
+    /// Prune and merge memory files that don't meet the future-looking standard
+    Compact,
+    /// Coordinate multiple related plans toward a shared goal
+    Objective {
+        #[command(subcommand)]
+        subcommand: ObjectiveCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PlanCommands {
+    /// Create a GitHub issue as a plan
+    New {
         /// Issue title
         title: String,
         /// Issue body
         #[arg(long)]
         body: Option<String>,
     },
+    /// List open engram-plan issues
+    List,
     /// Synthesize learnings from a closed issue+PR into memory
     Learn {
         /// GitHub issue number
@@ -27,24 +47,13 @@ pub enum Commands {
         #[arg(long, conflicts_with = "issue")]
         all: bool,
     },
-    /// Check that all engram dependencies are installed and configured
-    Doctor,
-    /// List open engram-plan issues
-    List,
-    /// Learn from a closed issue+PR and close the issue
+    /// Learn from a closed issue+PR, close the issue, and delete the local branch
     Land {
         /// GitHub issue number
         issue: u64,
     },
     /// Show the linked engram issue and PR for the current branch
     Status,
-    /// Prune and merge memory files that don't meet the future-looking standard
-    Compact,
-    /// Coordinate multiple related plans toward a shared goal
-    Objective {
-        #[command(subcommand)]
-        subcommand: ObjectiveCommands,
-    },
 }
 
 #[derive(Subcommand)]

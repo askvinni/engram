@@ -5,10 +5,10 @@ Engram is a CLI that turns GitHub Issues into a structured learning loop for AI-
 ## How it works
 
 ```
-engram plan "Add rate limiting"   →  GitHub issue #42 (engram-plan label)
+engram plan new "Add rate limiting"   →  GitHub issue #42 (engram-plan label)
 git checkout -b feat/issue-42
 # ... implement, open PR with "closes #42" in the body, merge ...
-engram land 42                    →  memory files written, issue closed, branch deleted
+engram plan land 42                   →  memory files written, issue closed, branch deleted
 ```
 
 After `land`, the next Claude session in this repo reads `.engram/memory/` and already knows the patterns, gotchas, and architectural decisions from that work.
@@ -40,14 +40,14 @@ engram init
 ## Commands
 
 ```
-engram init                          Initialize in this repo; install Claude skills
-engram plan <title> [--body <body>]  Create a GitHub issue as a plan
-engram learn <issue> [--all]         Synthesize learnings from a closed issue+PR
-engram land <issue>                  learn + close issue + delete local branch
-engram list                          List open engram-plan issues
-engram status                        Show linked issue/PR for the current branch
-engram compact                       Prune and merge stale memory files
-engram doctor                        Verify all dependencies and configuration
+engram init                                Initialize in this repo; install Claude skills
+engram plan new <title> [--body <body>]    Create a GitHub issue as a plan
+engram plan learn <issue> [--all]          Synthesize learnings from a closed issue+PR
+engram plan land <issue>                   learn + close issue + delete local branch
+engram plan list                           List open engram-plan issues
+engram plan status                         Show linked issue/PR for the current branch
+engram compact                             Prune and merge stale memory files
+engram doctor                              Verify all dependencies and configuration
 
 engram objective new <title> --body <body>         Create a multi-plan objective
 engram objective plan <number> --node <id>         Create a plan for one node
@@ -62,16 +62,16 @@ engram objective list                              List open objectives
 ### 1. Create a plan
 
 ```
-engram plan "Add rate limiting to the API"
+engram plan new "Add rate limiting to the API"
 ```
 
 This opens a GitHub issue tagged `engram-plan`. The issue body should cover seven sections that determine the quality of the memory files produced when the work lands (see [Plan body format](#plan-body-format) below). If you're using Claude Code, the `/engram-plan` skill walks you through writing a thorough body.
 
 ### 2. Implement and ship
 
-Create a branch and open a PR. The PR body **must** include `closes #N` (or `fixes #N` / `resolves #N`) so GitHub links the PR to the issue — `engram learn` finds the PR via that close event.
+Create a branch and open a PR. The PR body **must** include `closes #N` (or `fixes #N` / `resolves #N`) so GitHub links the PR to the issue — `engram plan learn` finds the PR via that close event.
 
-Recommended branch naming so `engram land` can clean up automatically:
+Recommended branch naming so `engram plan land` can clean up automatically:
 - `feat/issue-42`
 - `fix/issue-42`
 - `issue-42`
@@ -81,7 +81,7 @@ Recommended branch naming so `engram land` can clean up automatically:
 After the PR merges:
 
 ```
-engram land 42
+engram plan land 42
 ```
 
 `land` does three things:
@@ -91,12 +91,12 @@ engram land 42
 
 It opens a PR tagged `engram-learned` with the new memory files. Review and merge that PR to commit the learnings to the repo.
 
-If you want to inspect the memory files before closing the issue, use `engram learn 42` first, then `engram land 42` after reviewing.
+If you want to inspect the memory files before closing the issue, use `engram plan learn 42` first, then `engram plan land 42` after reviewing.
 
 ### 4. Batch-process unlearned issues
 
 ```
-engram learn --all
+engram plan learn --all
 ```
 
 Processes all closed `engram-plan` issues that haven't been learned yet in a single branch and PR. Useful after a burst of shipping.
@@ -157,7 +157,7 @@ engram objective list
 
 ### Automatic status updates
 
-When you run `engram land <plan>` or `engram learn <plan>` on a plan that was created via `objective plan`, engram automatically marks the corresponding node as `done` in the objective issue. No manual update needed.
+When you run `engram plan land <plan>` or `engram plan learn <plan>` on a plan that was created via `objective plan`, engram automatically marks the corresponding node as `done` in the objective issue. No manual update needed.
 
 ---
 
@@ -197,7 +197,7 @@ The plan body has seven sections. All are required — missing sections produce 
 | **Edge cases and risks** | What can go wrong; what inputs need special handling; what's explicitly out of scope |
 | **Key files** | 3–6 `src/foo.rs:FunctionName` entry points for a cold reader to orient |
 
-The Approach section is what `engram learn` draws on most heavily when synthesizing pattern and architecture memory files. Vague bullets produce vague memory.
+The Approach section is what `engram plan learn` draws on most heavily when synthesizing pattern and architecture memory files. Vague bullets produce vague memory.
 
 ---
 
@@ -220,7 +220,7 @@ Memory files have a high quality bar — `engram compact` enforces it. A file ea
 
 ## Prompt hooks
 
-`.engram/prompt-hooks/` contains Markdown files injected into the Claude prompt during `engram learn`. Use them to customize how learnings are classified for your repo:
+`.engram/prompt-hooks/` contains Markdown files injected into the Claude prompt during `engram plan learn`. Use them to customize how learnings are classified for your repo:
 
 ```markdown
 <!-- .engram/prompt-hooks/classify.md -->
@@ -243,7 +243,7 @@ Files are loaded in alphabetical order. Only `.md` files are included. Commit th
     tripwires/             Gotchas and wrong approaches
     architecture/          Structural decisions and rationale
     testing/               Test strategies and constraints
-  prompt-hooks/            Per-repo rules injected into engram learn prompts
+  prompt-hooks/            Per-repo rules injected into engram plan learn prompts
 
 .claude/
   skills/
