@@ -48,6 +48,11 @@ engram list                          List open engram-plan issues
 engram status                        Show linked issue/PR for the current branch
 engram compact                       Prune and merge stale memory files
 engram doctor                        Verify all dependencies and configuration
+
+engram objective new <title> --body <body>         Create a multi-plan objective
+engram objective plan <number> --node <id>         Create a plan for one node
+engram objective view <number>                     Show objective and node statuses
+engram objective list                              List open objectives
 ```
 
 ---
@@ -103,6 +108,56 @@ engram compact
 ```
 
 Over time, memory accumulates files that describe *how the code works* rather than *what not to do* — these are better read directly from the source. `compact` calls Claude to audit every memory file and delete or merge ones that don't pass the quality bar. Run it after every few `learn` cycles.
+
+---
+
+## Objectives
+
+For work that spans multiple PRs — a migration, a multi-phase feature, a refactor — objectives let you group related plans under a shared goal and track progress as each piece lands.
+
+### Create an objective
+
+```
+engram objective new "Migrate auth layer" --body "## Goal
+Replace legacy session tokens with JWTs across all services.
+
+## Design Decisions
+- Keep auth middleware thin; push token logic into a dedicated module
+- Do not change the public API shape during migration
+
+## Roadmap
+- 1.1: Extract token validation into auth module
+- 1.2: Migrate session storage (depends: 1.1)
+- 1.3: Remove legacy token code (depends: 1.2)
+"
+```
+
+This creates a GitHub issue tagged `engram-objective` with a rendered roadmap table and a hidden machine-readable node graph. Nodes accept `(depends: 1.1, 1.2)` syntax for ordering.
+
+### Start work on a node
+
+```
+engram objective plan 42 --node 1.1
+```
+
+Creates an `engram-plan` issue for node 1.1 and marks it `in_progress` in the objective. If you omit `--body`, Claude generates the plan body from the node description and objective context. You can also provide one explicitly:
+
+```
+engram objective plan 42 --node 1.1 --body "**Why**\n..."
+```
+
+### Track progress
+
+```
+engram objective view 42
+engram objective list
+```
+
+`view` prints the goal, design decisions, and current roadmap table showing each node's status, linked plan issue, and which nodes are blocked by unfinished dependencies.
+
+### Automatic status updates
+
+When you run `engram land <plan>` or `engram learn <plan>` on a plan that was created via `objective plan`, engram automatically marks the corresponding node as `done` in the objective issue. No manual update needed.
 
 ---
 
