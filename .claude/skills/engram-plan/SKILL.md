@@ -1,10 +1,17 @@
 ---
 name: engram-plan
 description: Use this skill when the user asks to "create a plan", "open a plan issue", "write a plan for X", "use engram plan", "start a new feature", or is about to begin work that will be tracked as an engram-plan GitHub issue. Provides guidance on writing effective engram plan issues that produce useful learnings later.
-version: 0.2.0
+version: 0.3.0
+allowed-tools: Bash(engram plan*)
 ---
 
 # engram-plan skill
+
+## Input
+
+Title or description of the work: **$ARGUMENTS**
+
+If `$ARGUMENTS` is empty, ask the user what they want to plan before continuing.
 
 An **engram plan** is a GitHub issue labeled `engram-plan`. It represents exactly one unit of work — one PR from start to merge. After the PR merges, `engram learn <N>` (or `engram land <N>`) synthesizes cross-cutting learnings from the issue and PR into `.engram/memory/`.
 
