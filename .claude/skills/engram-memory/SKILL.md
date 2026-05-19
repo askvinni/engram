@@ -6,7 +6,7 @@ version: 0.1.0
 
 # engram-memory skill
 
-`.engram/memory/` is the repository's persistent knowledge base for AI agents. It accumulates cross-cutting learnings from closed issues via `engram learn`.
+`.engram/memory/` is the repository's persistent knowledge base for AI agents. It accumulates cross-cutting learnings from closed issues via `engram plan learn`.
 
 ## Layout
 
@@ -78,7 +78,7 @@ Run compact when:
 - Two or more files have overlapping `read_when` conditions
 - Source code has been refactored and old learnings now describe behavior that no longer exists
 
-Do not run compact immediately after `engram learn` — wait until several learn cycles have accumulated so compact has enough material to reason about relationships between files.
+Do not run compact immediately after `engram plan learn` — wait until several learn cycles have accumulated so compact has enough material to reason about relationships between files.
 
 ## Manual maintenance
 

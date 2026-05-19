@@ -1,7 +1,7 @@
 ---
 name: engram-objective
 description: Use this skill when the user asks to "create an objective", "open an objective issue", "write an objective for X", "use engram objective", "start a new multi-node goal", or is about to begin work that will be tracked as an engram-objective GitHub issue. Provides a guided six-step flow for creating well-formed objective issues that work with --all-unblocked dispatch and auto-close mechanics.
-version: 0.1.0
+version: 0.2.0
 allowed-tools: Bash(engram objective*)
 ---
 
@@ -99,7 +99,7 @@ Re-read Scope against what you found in Step 1. Surface mismatches:
 
 - If Scope names only one file but the node list spans five subsystems, flag it
 - If a node is so large it would require multiple PRs, flag it and suggest splitting
-- Confirm the overall goal fits the `engram objective` model — if all nodes are in a single file and could be done in one PR, a plain `engram plan` is better
+- Confirm the overall goal fits the `engram objective` model — if all nodes are in a single file and could be done in one PR, a plain `engram plan new` is better
 
 ### Step 6 — Create the issue
 
@@ -173,7 +173,7 @@ Use **engram plan** when:
 - The work fits in exactly one PR
 - There is no natural decomposition into independent sub-tasks
 
-If a stated "objective" turns out to have only one node, suggest using `engram plan` instead and do not create an objective.
+If a stated "objective" turns out to have only one node, suggest using `engram plan new` instead and do not create an objective.
 
 ---
 
@@ -188,7 +188,7 @@ engram objective plan <issue> --all-unblocked
 
 # 3. Work on each plan issue; open PRs with "closes #<plan-issue>" in the PR body
 
-# 4. After each PR merges, run engram land <plan-issue>
+# 4. After each PR merges, run engram plan land <plan-issue>
 #    The auto-close hook updates the objective node to done and closes the
 #    objective when all nodes are complete.
 ```

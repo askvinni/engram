@@ -6,8 +6,9 @@ mod github;
 mod learn;
 mod memory;
 mod objective;
+mod plan;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, Commands};
 use include_dir::{include_dir, Dir};
@@ -20,20 +21,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Init => cmd_init(),
-        Commands::Plan { title, body } => cmd_plan(title, body.as_deref()),
-        Commands::Learn { issue, all } => {
-            if all {
-                cmd_learn_all()
-            } else if let Some(n) = issue {
-                cmd_learn(n)
-            } else {
-                anyhow::bail!("specify an issue number or pass --all")
-            }
-        }
+        Commands::Plan { subcommand } => cmd_plan(subcommand),
         Commands::Doctor => cmd_doctor(),
-        Commands::List => cmd_list(),
-        Commands::Land { issue } => cmd_land(issue),
-        Commands::Status => cmd_status(),
         Commands::Compact => cmd_compact(),
         Commands::Objective { subcommand } => cmd_objective(subcommand),
     }
@@ -93,142 +82,23 @@ fn cmd_init() -> Result<()> {
     Ok(())
 }
 
-fn cmd_plan(title: String, body: Option<&str>) -> Result<()> {
+fn cmd_plan(subcmd: cli::PlanCommands) -> Result<()> {
     let repo_root = config::find_repo_root()?;
-    let cfg = config::Config::load(&repo_root)?;
-    let repo = cfg
-        .repo()
-        .map(|s| s.to_string())
-        .or_else(|| infer_repo(&repo_root))
-        .ok_or_else(|| anyhow::anyhow!("GitHub repo not configured — run `engram init`"))?;
-
-    let body = body.unwrap_or("");
-    let missing = missing_plan_sections(body);
-    if !missing.is_empty() {
-        eprintln!(
-            "warning: plan body is missing sections: {}",
-            missing.join(", ")
-        );
-    }
-
-    let url = github::create_issue(&repo, &title, body, "engram-plan")?;
-    println!("{}", url.trim());
-    Ok(())
-}
-
-fn cmd_learn(issue: u64) -> Result<()> {
-    let repo_root = config::find_repo_root()?;
-    let cfg = config::Config::load(&repo_root)?;
-    learn::run(&repo_root, &cfg, issue)
-}
-
-fn cmd_learn_all() -> Result<()> {
-    let repo_root = config::find_repo_root()?;
-    let cfg = config::Config::load(&repo_root)?;
-    let repo = cfg
-        .repo()
-        .map(|s| s.to_string())
-        .or_else(|| infer_repo(&repo_root))
-        .ok_or_else(|| anyhow::anyhow!("GitHub repo not configured — run `engram init`"))?;
-
-    let issues = github::list_unlearned_plans(&repo)?;
-    if issues.is_empty() {
-        println!("No closed plan issues without the engram-learned label.");
-        return Ok(());
-    }
-
-    println!("Found {} unlearned issue(s).", issues.len());
-    let mut learned: Vec<u64> = vec![];
-    let mut failed = 0usize;
-    for issue in &issues {
-        println!("\nLearning from issue #{}: {}", issue.number, issue.title);
-        match learn::write_memory(&repo_root, issue.number, &repo) {
-            Ok(true) => learned.push(issue.number),
-            Ok(false) => {}
-            Err(e) => {
-                eprintln!("  skipping #{}: {e:#}", issue.number);
-                failed += 1;
+    match subcmd {
+        cli::PlanCommands::New { title, body } => plan::new(&repo_root, &title, body.as_deref()),
+        cli::PlanCommands::List => plan::list(&repo_root),
+        cli::PlanCommands::Learn { issue, all } => {
+            if all {
+                plan::learn_all(&repo_root)
+            } else if let Some(n) = issue {
+                plan::learn_single(&repo_root, n)
+            } else {
+                anyhow::bail!("specify an issue number or pass --all")
             }
         }
+        cli::PlanCommands::Land { issue } => plan::land(&repo_root, issue),
+        cli::PlanCommands::Status => plan::status(&repo_root),
     }
-
-    if learned.is_empty() {
-        println!("\nNo learnings extracted from any issue.");
-        if failed > 0 {
-            anyhow::bail!("{failed} issue(s) failed — see errors above");
-        }
-        return Ok(());
-    }
-
-    let branch = "engram/learn-all".to_string();
-    let status = Command::new("git")
-        .args(["checkout", "-b", &branch])
-        .current_dir(&repo_root)
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("git checkout -b {branch} failed");
-    }
-
-    let status = Command::new("git")
-        .args(["add", ".engram/memory", "CLAUDE.md"])
-        .current_dir(&repo_root)
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("git add failed");
-    }
-
-    let nothing_staged = Command::new("git")
-        .args(["diff", "--cached", "--quiet"])
-        .current_dir(&repo_root)
-        .status()?
-        .success();
-    if nothing_staged {
-        println!("Nothing to commit — memory unchanged.");
-        if failed > 0 {
-            anyhow::bail!("{failed} issue(s) failed — see errors above");
-        }
-        return Ok(());
-    }
-
-    let issue_list = learned
-        .iter()
-        .map(|n| format!("#{n}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let status = Command::new("git")
-        .args(["commit", "-m", &format!("engram: learn from {issue_list}")])
-        .current_dir(&repo_root)
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("git commit failed");
-    }
-
-    let status = Command::new("git")
-        .args(["push", "-u", "origin", &branch])
-        .current_dir(&repo_root)
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("git push failed");
-    }
-
-    let pr_body = format!("Learnings extracted from: {issue_list}.\n\n---\n*Created by engram*");
-    let pr_url = github::create_pr(
-        &repo,
-        &format!("engram: learn from {issue_list}"),
-        &pr_body,
-        "engram-learned",
-    )?;
-
-    for n in &learned {
-        github::add_label_to_issue(&repo, *n, "engram-learned")?;
-    }
-
-    println!("\nPR created: {}", pr_url.trim());
-
-    if failed > 0 {
-        anyhow::bail!("{failed} issue(s) failed — see errors above");
-    }
-    Ok(())
 }
 
 fn cmd_compact() -> Result<()> {
@@ -239,7 +109,7 @@ fn cmd_compact() -> Result<()> {
 const PROMPT_HOOKS_README: &str = r#"# Prompt Hooks
 
 Markdown files in this directory are injected into the Claude prompt during
-`engram learn` under a "Project-Specific Rules" section.
+`engram plan learn` under a "Project-Specific Rules" section.
 
 Use hooks to customize how learnings are classified for this repo. Examples:
 
@@ -250,184 +120,6 @@ Use hooks to customize how learnings are classified for this repo. Examples:
 Files are loaded in alphabetical order. Only `.md` files are included.
 This directory is committed to the repo so rules are shared across the team.
 "#;
-
-fn cmd_status() -> Result<()> {
-    let repo_root = config::find_repo_root()?;
-    let cfg = config::Config::load(&repo_root)?;
-    let repo = cfg
-        .repo()
-        .map(|s| s.to_string())
-        .or_else(|| infer_repo(&repo_root))
-        .ok_or_else(|| anyhow::anyhow!("GitHub repo not configured — run `engram init`"))?;
-
-    let branch = Command::new("git")
-        .args(["branch", "--show-current"])
-        .current_dir(&repo_root)
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-
-    if branch.is_empty() {
-        println!("Not on a branch.");
-        return Ok(());
-    }
-    println!("Branch: {branch}");
-
-    // Look for a PR on this branch
-    if let Some(pr) = github::find_pr_for_branch(&repo, &branch)? {
-        println!(
-            "PR:     #{} {} [{}]",
-            pr.number,
-            pr.title,
-            pr.body
-                .as_deref()
-                .unwrap_or("")
-                .lines()
-                .next()
-                .unwrap_or("")
-        );
-    } else {
-        println!("PR:     none");
-    }
-
-    // Find open engram-plan issues referencing this branch by number
-    let issue_num = branch
-        .split(|c: char| !c.is_ascii_digit())
-        .find_map(|s| s.parse::<u64>().ok());
-
-    if let Some(n) = issue_num {
-        if let Ok(issue) = github::get_issue(&repo, n) {
-            if issue.state != "CLOSED" {
-                println!("Issue:  #{n} {} [{}]", issue.title, issue.state);
-                return Ok(());
-            }
-        }
-    }
-
-    // Fall back: show all open plans for context
-    let plans = github::list_open_plans(&repo)?;
-    if plans.is_empty() {
-        println!("Issue:  no open engram-plan issues");
-    } else {
-        println!("Open plans:");
-        for p in &plans {
-            println!("  #{} {}", p.number, p.title);
-        }
-    }
-    Ok(())
-}
-
-fn cmd_land(issue: u64) -> Result<()> {
-    let repo_root = config::find_repo_root()?;
-    let cfg = config::Config::load(&repo_root)?;
-    let repo = cfg
-        .repo()
-        .map(|s| s.to_string())
-        .or_else(|| infer_repo(&repo_root))
-        .ok_or_else(|| anyhow::anyhow!("GitHub repo not configured — run `engram init`"))?;
-
-    // Synthesize learnings and open learn PR
-    learn::run(&repo_root, &cfg, issue)?;
-
-    // Close the issue if it's still open (GitHub may have auto-closed it via PR)
-    let gh_issue = github::get_issue(&repo, issue)?;
-    if gh_issue.state != "CLOSED" {
-        Command::new("gh")
-            .args(["issue", "close", &issue.to_string(), "--repo", &repo])
-            .status()?;
-        println!("Closed issue #{issue}.");
-    } else {
-        println!("Issue #{issue} already closed.");
-    }
-
-    // Mark the linked objective node as done, if any (non-fatal)
-    if let Err(e) = objective::maybe_mark_node_done(&repo, gh_issue.body.as_deref().unwrap_or("")) {
-        eprintln!("warning: could not update objective node: {e:#}");
-    }
-
-    // Delete local branch matching common naming patterns if it exists
-    let candidates = [
-        format!("fix/issue-{issue}"),
-        format!("feat/issue-{issue}"),
-        format!("issue-{issue}"),
-    ];
-    for branch in &candidates {
-        let exists = Command::new("git")
-            .args(["branch", "--list", branch])
-            .current_dir(&repo_root)
-            .output()
-            .map(|o| !o.stdout.is_empty())
-            .unwrap_or(false);
-        if exists {
-            Command::new("git")
-                .args(["branch", "-d", branch])
-                .current_dir(&repo_root)
-                .status()?;
-            println!("Deleted local branch {branch}.");
-            break;
-        }
-    }
-
-    Ok(())
-}
-
-fn cmd_list() -> Result<()> {
-    let repo_root = config::find_repo_root()?;
-    let cfg = config::Config::load(&repo_root)?;
-    let repo = cfg
-        .repo()
-        .map(|s| s.to_string())
-        .or_else(|| infer_repo(&repo_root))
-        .ok_or_else(|| anyhow::anyhow!("GitHub repo not configured — run `engram init`"))?;
-
-    let plans = github::list_open_plans(&repo)?;
-    if plans.is_empty() {
-        println!("No open plans.");
-        return Ok(());
-    }
-
-    for p in &plans {
-        let age = days_ago(&p.created_at);
-        println!("#{:<4} {} ({})", p.number, p.title, age);
-    }
-    Ok(())
-}
-
-pub(crate) fn days_ago(iso: &str) -> String {
-    // Parse YYYY-MM-DDTHH:MM:SSZ and compute days since then
-    let date_part = iso.split('T').next().unwrap_or(iso);
-    let parts: Vec<u32> = date_part
-        .split('-')
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    if parts.len() != 3 {
-        return iso.to_string();
-    }
-    // Use a simple days-since-epoch comparison
-    let created_days = days_from_ymd(parts[0] as i32, parts[1], parts[2]);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.as_secs() / 86400) as i32)
-        .unwrap_or(0);
-    let diff = now - created_days;
-    match diff {
-        0 => "today".to_string(),
-        1 => "1 day ago".to_string(),
-        d => format!("{d} days ago"),
-    }
-}
-
-pub(crate) fn days_from_ymd(y: i32, m: u32, d: u32) -> i32 {
-    // Days since Unix epoch (1970-01-01) for a given date — Gregorian proleptic
-    let m = m as i32;
-    let d = d as i32;
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
 
 type Check = (&'static str, Box<dyn Fn() -> bool>);
 
@@ -507,11 +199,7 @@ fn cmd_doctor() -> Result<()> {
 fn cmd_objective(subcmd: cli::ObjectiveCommands) -> Result<()> {
     let repo_root = config::find_repo_root()?;
     let cfg = config::Config::load(&repo_root)?;
-    let repo = cfg
-        .repo()
-        .map(|s| s.to_string())
-        .or_else(|| infer_repo(&repo_root))
-        .ok_or_else(|| anyhow::anyhow!("GitHub repo not configured — run `engram init`"))?;
+    let repo = config::resolve_repo(&cfg, &repo_root)?;
 
     match subcmd {
         cli::ObjectiveCommands::New { title, body } => objective::new(&repo, &title, &body),
@@ -533,25 +221,8 @@ fn cmd_objective(subcmd: cli::ObjectiveCommands) -> Result<()> {
     }
 }
 
-fn missing_plan_sections(body: &str) -> Vec<&'static str> {
-    // Prefix-only matches so both `**Why**` and `**Why:**` forms are accepted.
-    const SECTIONS: &[(&str, &[&str])] = &[
-        ("Why", &["**Why"]),
-        ("Background", &["**Background"]),
-        ("Approach", &["**Approach"]),
-        ("Acceptance criteria", &["**Acceptance criteria"]),
-        ("Scope", &["**Scope"]),
-        ("Edge cases and risks", &["**Edge cases"]),
-        ("Key files", &["**Key files"]),
-    ];
-    SECTIONS
-        .iter()
-        .filter(|(_, headers)| !headers.iter().any(|h| body.contains(h)))
-        .map(|(name, _)| *name)
-        .collect()
-}
-
 fn install_issue_templates(repo_root: &std::path::Path) -> Result<()> {
+    use anyhow::Context;
     let dest = repo_root.join(".github/ISSUE_TEMPLATE");
     std::fs::create_dir_all(&dest).context("creating .github/ISSUE_TEMPLATE")?;
     ISSUE_TEMPLATES_DIR
@@ -562,6 +233,7 @@ fn install_issue_templates(repo_root: &std::path::Path) -> Result<()> {
 }
 
 fn install_skills(repo_root: &std::path::Path) -> Result<()> {
+    use anyhow::Context;
     SKILLS_DIR
         .extract(repo_root.join(".claude/skills"))
         .context("installing Claude skills")?;
@@ -609,6 +281,39 @@ fn infer_repo(repo_root: &std::path::Path) -> Option<String> {
     }
 }
 
+pub(crate) fn days_ago(iso: &str) -> String {
+    let date_part = iso.split('T').next().unwrap_or(iso);
+    let parts: Vec<u32> = date_part
+        .split('-')
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    if parts.len() != 3 {
+        return iso.to_string();
+    }
+    let created_days = days_from_ymd(parts[0] as i32, parts[1], parts[2]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 86400) as i32)
+        .unwrap_or(0);
+    let diff = now - created_days;
+    match diff {
+        0 => "today".to_string(),
+        1 => "1 day ago".to_string(),
+        d => format!("{d} days ago"),
+    }
+}
+
+pub(crate) fn days_from_ymd(y: i32, m: u32, d: u32) -> i32 {
+    let m = m as i32;
+    let d = d as i32;
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,19 +330,16 @@ mod tests {
 
     #[test]
     fn days_from_ymd_y2k() {
-        // 30 years × 365 + 7 leap days (1972,76,80,84,88,92,96) = 10957
         assert_eq!(days_from_ymd(2000, 1, 1), 10957);
     }
 
     #[test]
     fn days_from_ymd_leap_day() {
-        // 2000-01-01 = 10957, +31 (Jan) +28 (Feb 1-28) = 11016
         assert_eq!(days_from_ymd(2000, 2, 29), 11016);
     }
 
     #[test]
     fn days_from_ymd_end_of_year() {
-        // 1970-12-31 = day 364
         assert_eq!(days_from_ymd(1970, 12, 31), 364);
     }
 
@@ -653,39 +355,6 @@ mod tests {
             result.ends_with("days ago"),
             "expected 'N days ago', got {result}"
         );
-    }
-
-    #[test]
-    fn missing_plan_sections_empty_body() {
-        let missing = missing_plan_sections("");
-        assert_eq!(
-            missing,
-            vec![
-                "Why",
-                "Background",
-                "Approach",
-                "Acceptance criteria",
-                "Scope",
-                "Edge cases and risks",
-                "Key files"
-            ]
-        );
-    }
-
-    #[test]
-    fn missing_plan_sections_complete_body() {
-        let body = "**Why** x\n**Background** x\n**Approach** x\n**Acceptance criteria** x\n**Scope** x\n**Edge cases and risks** x\n**Key files** x";
-        assert!(missing_plan_sections(body).is_empty());
-    }
-
-    #[test]
-    fn missing_plan_sections_partial() {
-        let body = "**Why** x\n**Scope** x";
-        let missing = missing_plan_sections(body);
-        assert!(missing.contains(&"Background"));
-        assert!(missing.contains(&"Approach"));
-        assert!(!missing.contains(&"Why"));
-        assert!(!missing.contains(&"Scope"));
     }
 
     #[test]
@@ -728,7 +397,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         install_skills(root).unwrap();
-        // Overwrite one skill with stale content
         std::fs::write(
             root.join(".claude/skills/engram-plan/SKILL.md"),
             b"outdated",
