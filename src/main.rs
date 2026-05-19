@@ -5,6 +5,7 @@ mod config;
 mod github;
 mod learn;
 mod memory;
+mod objective;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -34,6 +35,7 @@ fn main() -> Result<()> {
         Commands::Land { issue } => cmd_land(issue),
         Commands::Status => cmd_status(),
         Commands::Compact => cmd_compact(),
+        Commands::Objective { subcommand } => cmd_objective(subcommand),
     }
 }
 
@@ -78,7 +80,13 @@ fn cmd_init() -> Result<()> {
             "e4e669",
             "Learning PR created by engram",
         )?;
-        println!("GitHub labels ensured: engram-plan, engram-learned");
+        github::ensure_label(
+            repo,
+            "engram-objective",
+            "5319e7",
+            "Objective issue created by engram",
+        )?;
+        println!("GitHub labels ensured: engram-plan, engram-learned, engram-objective");
     }
 
     println!("engram initialized.");
@@ -332,6 +340,11 @@ fn cmd_land(issue: u64) -> Result<()> {
         println!("Issue #{issue} already closed.");
     }
 
+    // Mark the linked objective node as done, if any (non-fatal)
+    if let Err(e) = objective::maybe_mark_node_done(&repo, gh_issue.body.as_deref().unwrap_or("")) {
+        eprintln!("warning: could not update objective node: {e:#}");
+    }
+
     // Delete local branch matching common naming patterns if it exists
     let candidates = [
         format!("fix/issue-{issue}"),
@@ -380,7 +393,7 @@ fn cmd_list() -> Result<()> {
     Ok(())
 }
 
-fn days_ago(iso: &str) -> String {
+pub(crate) fn days_ago(iso: &str) -> String {
     // Parse YYYY-MM-DDTHH:MM:SSZ and compute days since then
     let date_part = iso.split('T').next().unwrap_or(iso);
     let parts: Vec<u32> = date_part
@@ -404,7 +417,7 @@ fn days_ago(iso: &str) -> String {
     }
 }
 
-fn days_from_ymd(y: i32, m: u32, d: u32) -> i32 {
+pub(crate) fn days_from_ymd(y: i32, m: u32, d: u32) -> i32 {
     // Days since Unix epoch (1970-01-01) for a given date — Gregorian proleptic
     let m = m as i32;
     let d = d as i32;
@@ -489,6 +502,25 @@ fn cmd_doctor() -> Result<()> {
         anyhow::bail!("one or more checks failed");
     }
     Ok(())
+}
+
+fn cmd_objective(subcmd: cli::ObjectiveCommands) -> Result<()> {
+    let repo_root = config::find_repo_root()?;
+    let cfg = config::Config::load(&repo_root)?;
+    let repo = cfg
+        .repo()
+        .map(|s| s.to_string())
+        .or_else(|| infer_repo(&repo_root))
+        .ok_or_else(|| anyhow::anyhow!("GitHub repo not configured — run `engram init`"))?;
+
+    match subcmd {
+        cli::ObjectiveCommands::New { title, body } => objective::new(&repo, &title, &body),
+        cli::ObjectiveCommands::List => objective::list_open(&repo),
+        cli::ObjectiveCommands::View { number } => objective::view(&repo, number),
+        cli::ObjectiveCommands::Plan { number, node, body } => {
+            objective::plan(&repo, number, &node, body.as_deref())
+        }
+    }
 }
 
 fn missing_plan_sections(body: &str) -> Vec<&'static str> {

@@ -233,6 +233,37 @@ pub fn add_label_to_issue(repo: &str, issue_number: u64, label: &str) -> Result<
     Ok(())
 }
 
+pub fn update_issue_body(repo: &str, number: u64, body: &str) -> Result<()> {
+    gh(&[
+        "issue",
+        "edit",
+        &number.to_string(),
+        "--repo",
+        repo,
+        "--body",
+        body,
+    ])?;
+    Ok(())
+}
+
+pub fn list_open_objectives(repo: &str) -> Result<Vec<PlanIssue>> {
+    let out = gh(&[
+        "issue",
+        "list",
+        "--repo",
+        repo,
+        "--label",
+        "engram-objective",
+        "--state",
+        "open",
+        "--json",
+        "number,title,createdAt",
+        "--limit",
+        "50",
+    ])?;
+    serde_json::from_str(&out).context("parsing issue list JSON")
+}
+
 pub fn list_unlearned_plans(repo: &str) -> Result<Vec<PlanIssue>> {
     #[derive(Deserialize)]
     struct LabelEntry {
