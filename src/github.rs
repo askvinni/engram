@@ -264,6 +264,77 @@ pub fn list_open_objectives(repo: &str) -> Result<Vec<PlanIssue>> {
     serde_json::from_str(&out).context("parsing issue list JSON")
 }
 
+pub fn add_sub_issue(repo: &str, parent_number: u64, child_number: u64) -> Result<()> {
+    let (owner, name) = repo
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("repo must be owner/name, got: {repo}"))?;
+
+    let id_query = "query($owner: String!, $repo: String!, $parent: Int!, $child: Int!) { \
+        repository(owner: $owner, name: $repo) { \
+          parentIssue: issue(number: $parent) { id } \
+          childIssue: issue(number: $child) { id } \
+        } \
+    }";
+
+    let out = gh(&[
+        "api",
+        "graphql",
+        "-f",
+        &format!("query={id_query}"),
+        "-f",
+        &format!("owner={owner}"),
+        "-f",
+        &format!("repo={name}"),
+        "-F",
+        &format!("parent={parent_number}"),
+        "-F",
+        &format!("child={child_number}"),
+    ])?;
+
+    #[derive(Deserialize)]
+    struct IdResponse {
+        data: IdData,
+    }
+    #[derive(Deserialize)]
+    struct IdData {
+        repository: IdRepo,
+    }
+    #[derive(Deserialize)]
+    struct IdRepo {
+        #[serde(rename = "parentIssue")]
+        parent_issue: IdNode,
+        #[serde(rename = "childIssue")]
+        child_issue: IdNode,
+    }
+    #[derive(Deserialize)]
+    struct IdNode {
+        id: String,
+    }
+
+    let resp: IdResponse = serde_json::from_str(&out).context("parsing issue node IDs")?;
+    let parent_id = resp.data.repository.parent_issue.id;
+    let child_id = resp.data.repository.child_issue.id;
+
+    let mutation = "mutation($parentId: ID!, $childId: ID!) { \
+        addSubIssue(input: {issueId: $parentId, subIssueId: $childId}) { \
+          issue { id } \
+        } \
+    }";
+
+    gh(&[
+        "api",
+        "graphql",
+        "-f",
+        &format!("query={mutation}"),
+        "-f",
+        &format!("parentId={parent_id}"),
+        "-f",
+        &format!("childId={child_id}"),
+    ])?;
+
+    Ok(())
+}
+
 pub fn list_unlearned_plans(repo: &str) -> Result<Vec<PlanIssue>> {
     #[derive(Deserialize)]
     struct LabelEntry {

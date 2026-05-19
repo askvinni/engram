@@ -233,21 +233,31 @@ pub fn view(repo: &str, number: u64) -> Result<()> {
     Ok(())
 }
 
-pub fn plan(repo: &str, objective_number: u64, node_id: &str, body: Option<&str>) -> Result<()> {
-    let obj_issue =
-        github::get_issue(repo, objective_number).context("fetching objective issue")?;
-    let obj_body = obj_issue.body.as_deref().unwrap_or("");
+/// Returns indices of nodes that are Pending with all dependencies Done.
+/// Single-pass — safe against circular deps.
+pub fn unblocked_nodes(nodes: &[ObjectiveNode]) -> Vec<usize> {
+    nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.status == NodeStatus::Pending && blocked_by(n, nodes).is_empty())
+        .map(|(i, _)| i)
+        .collect()
+}
 
-    let mut nodes = parse_nodes_from_comment(obj_body).ok_or_else(|| {
-        anyhow::anyhow!(
-            "could not parse nodes from objective #{objective_number} — \
-             was it created with `engram objective new`?"
-        )
-    })?;
-
-    let node_idx = nodes.iter().position(|n| n.id == node_id).ok_or_else(|| {
-        anyhow::anyhow!("node {node_id} not found in objective #{objective_number}")
-    })?;
+/// Create a plan issue for the node at `node_idx`, mutate `nodes` to reflect
+/// InProgress status, and return the plan issue URL. Does not update the
+/// objective issue body — callers are responsible for that.
+fn create_plan_for_node(
+    repo: &str,
+    objective_number: u64,
+    obj_title: &str,
+    obj_body: &str,
+    nodes: &mut [ObjectiveNode],
+    node_idx: usize,
+    body: Option<&str>,
+) -> Result<String> {
+    let node_id = nodes[node_idx].id.clone();
+    let node_description = nodes[node_idx].description.clone();
 
     if let Some(existing) = nodes[node_idx].plan_issue {
         anyhow::bail!("node {node_id} already has plan issue #{existing} — cannot create another");
@@ -257,17 +267,13 @@ pub fn plan(repo: &str, objective_number: u64, node_id: &str, body: Option<&str>
     let plan_body = match body {
         Some(b) => format!("{marker}\n\n{b}"),
         None => {
-            let generated = generate_plan_body_for_node(
-                &obj_issue.title,
-                obj_body,
-                node_id,
-                &nodes[node_idx].description,
-            )?;
+            let generated =
+                generate_plan_body_for_node(obj_title, obj_body, &node_id, &node_description)?;
             format!("{marker}\n\n{generated}")
         }
     };
 
-    let plan_title = format!("[{node_id}] {}", nodes[node_idx].description);
+    let plan_title = format!("[{node_id}] {node_description}");
     let plan_url = github::create_issue(repo, &plan_title, &plan_body, "engram-plan")?;
     let plan_url = plan_url.trim().to_string();
 
@@ -280,12 +286,98 @@ pub fn plan(repo: &str, objective_number: u64, node_id: &str, body: Option<&str>
     nodes[node_idx].status = NodeStatus::InProgress;
     nodes[node_idx].plan_issue = Some(plan_issue_number);
 
-    let new_body = build_objective_body(obj_body, &nodes);
-    github::update_issue_body(repo, objective_number, &new_body)
-        .context("updating objective issue body")?;
+    if let Err(e) = github::add_sub_issue(repo, objective_number, plan_issue_number) {
+        eprintln!("warning: could not link #{plan_issue_number} as sub-issue: {e:#}");
+    }
 
-    println!("{plan_url}");
-    println!("Marked node {node_id} as in_progress in objective #{objective_number}.");
+    Ok(plan_url)
+}
+
+pub fn plan(
+    repo: &str,
+    objective_number: u64,
+    node_id: Option<&str>,
+    all_unblocked: bool,
+    body: Option<&str>,
+) -> Result<()> {
+    let obj_issue =
+        github::get_issue(repo, objective_number).context("fetching objective issue")?;
+    let obj_body = obj_issue.body.as_deref().unwrap_or("").to_string();
+
+    let mut nodes = parse_nodes_from_comment(&obj_body).ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not parse nodes from objective #{objective_number} — \
+             was it created with `engram objective new`?"
+        )
+    })?;
+
+    if all_unblocked {
+        let unblocked = unblocked_nodes(&nodes);
+        if unblocked.is_empty() {
+            println!("No unblocked pending nodes in objective #{objective_number}.");
+            return Ok(());
+        }
+
+        let mut any_failure = false;
+        let mut created_count = 0usize;
+        for &idx in &unblocked {
+            let nid = nodes[idx].id.clone();
+            match create_plan_for_node(
+                repo,
+                objective_number,
+                &obj_issue.title,
+                &obj_body,
+                &mut nodes,
+                idx,
+                None,
+            ) {
+                Ok(url) => {
+                    println!("{url} (node {nid})");
+                    created_count += 1;
+                }
+                Err(e) => {
+                    eprintln!("error: node {nid}: {e:#}");
+                    any_failure = true;
+                }
+            }
+        }
+
+        let new_body = build_objective_body(&obj_body, &nodes);
+        github::update_issue_body(repo, objective_number, &new_body)
+            .context("updating objective issue body")?;
+
+        if created_count > 0 {
+            println!("Created {created_count} plan issue(s) for objective #{objective_number}.");
+        }
+
+        if any_failure {
+            anyhow::bail!("one or more nodes failed — see errors above");
+        }
+    } else {
+        let nid = node_id.expect("node_id is Some when all_unblocked is false");
+
+        let node_idx = nodes.iter().position(|n| n.id == nid).ok_or_else(|| {
+            anyhow::anyhow!("node {nid} not found in objective #{objective_number}")
+        })?;
+
+        let plan_url = create_plan_for_node(
+            repo,
+            objective_number,
+            &obj_issue.title,
+            &obj_body,
+            &mut nodes,
+            node_idx,
+            body,
+        )?;
+
+        let new_body = build_objective_body(&obj_body, &nodes);
+        github::update_issue_body(repo, objective_number, &new_body)
+            .context("updating objective issue body")?;
+
+        println!("{plan_url}");
+        println!("Marked node {nid} as in_progress in objective #{objective_number}.");
+    }
+
     Ok(())
 }
 
@@ -559,5 +651,74 @@ mod tests {
     #[test]
     fn parse_objective_marker_absent() {
         assert!(parse_objective_marker("**Why**\nStuff").is_none());
+    }
+
+    fn node(id: &str, status: NodeStatus, deps: &[&str]) -> ObjectiveNode {
+        ObjectiveNode {
+            id: id.to_string(),
+            description: id.to_string(),
+            status,
+            plan_issue: None,
+            pr_url: None,
+            depends_on: deps.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn unblocked_nodes_no_deps() {
+        let nodes = vec![
+            node("1.1", NodeStatus::Pending, &[]),
+            node("1.2", NodeStatus::Pending, &[]),
+        ];
+        let unblocked = unblocked_nodes(&nodes);
+        assert_eq!(unblocked, vec![0, 1]);
+    }
+
+    #[test]
+    fn unblocked_nodes_skips_non_pending() {
+        let nodes = vec![
+            node("1.1", NodeStatus::Done, &[]),
+            node("1.2", NodeStatus::InProgress, &[]),
+            node("1.3", NodeStatus::Pending, &[]),
+        ];
+        let unblocked = unblocked_nodes(&nodes);
+        assert_eq!(unblocked, vec![2]);
+    }
+
+    #[test]
+    fn unblocked_nodes_blocked_by_pending_dep() {
+        let nodes = vec![
+            node("1.1", NodeStatus::Pending, &[]),
+            node("1.2", NodeStatus::Pending, &["1.1"]),
+        ];
+        let unblocked = unblocked_nodes(&nodes);
+        assert_eq!(unblocked, vec![0]);
+    }
+
+    #[test]
+    fn unblocked_nodes_unblocked_when_dep_done() {
+        let nodes = vec![
+            node("1.1", NodeStatus::Done, &[]),
+            node("1.2", NodeStatus::Pending, &["1.1"]),
+        ];
+        let unblocked = unblocked_nodes(&nodes);
+        assert_eq!(unblocked, vec![1]);
+    }
+
+    #[test]
+    fn unblocked_nodes_empty_when_all_blocked() {
+        let nodes = vec![
+            node("1.1", NodeStatus::Pending, &[]),
+            node("1.2", NodeStatus::Pending, &["1.1"]),
+            node("1.3", NodeStatus::Pending, &["1.2"]),
+        ];
+        // Only 1.1 is unblocked
+        let unblocked = unblocked_nodes(&nodes);
+        assert_eq!(unblocked, vec![0]);
+    }
+
+    #[test]
+    fn unblocked_nodes_empty_input() {
+        assert!(unblocked_nodes(&[]).is_empty());
     }
 }
