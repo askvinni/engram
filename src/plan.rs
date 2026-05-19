@@ -118,25 +118,32 @@ pub fn land(repo_root: &Path, issue: u64) -> Result<()> {
         eprintln!("warning: could not update objective node: {e:#}");
     }
 
-    let candidates = [
-        format!("fix/issue-{issue}"),
-        format!("feat/issue-{issue}"),
-        format!("issue-{issue}"),
-    ];
-    for branch in &candidates {
-        let exists = Command::new("git")
-            .args(["branch", "--list", branch])
-            .current_dir(repo_root)
-            .output()
-            .map(|o| !o.stdout.is_empty())
-            .unwrap_or(false);
-        if exists {
-            Command::new("git")
-                .args(["branch", "-d", branch])
-                .current_dir(repo_root)
-                .status()?;
-            println!("Deleted local branch {branch}.");
-            break;
+    match github::find_linked_pr(&repo, issue) {
+        Ok(Some(pr)) => {
+            if let Some(branch_name) = pr.head_ref_name {
+                let result = Command::new("git")
+                    .args(["branch", "-d", &branch_name])
+                    .current_dir(repo_root)
+                    .status();
+                match result {
+                    Ok(s) if s.success() => println!("Deleted local branch {branch_name}."),
+                    Ok(_) => eprintln!(
+                        "warning: could not delete branch {branch_name} (may have unmerged commits or not exist locally)"
+                    ),
+                    Err(e) => eprintln!("warning: could not delete branch {branch_name}: {e:#}"),
+                }
+            } else {
+                eprintln!(
+                    "warning: PR #{} has no branch name recorded; skipping branch cleanup",
+                    pr.number
+                );
+            }
+        }
+        Ok(None) => {
+            eprintln!("warning: no merged PR found for issue #{issue}; skipping branch cleanup");
+        }
+        Err(e) => {
+            eprintln!("warning: could not look up PR for issue #{issue}: {e:#}");
         }
     }
 
@@ -160,7 +167,8 @@ pub fn status(repo_root: &Path) -> Result<()> {
     }
     println!("Branch: {branch}");
 
-    if let Some(pr) = github::find_pr_for_branch(&repo, &branch)? {
+    let pr = github::find_pr_for_branch(&repo, &branch)?;
+    if let Some(ref pr) = pr {
         println!(
             "PR:     #{} {} [{}]",
             pr.number,
@@ -176,9 +184,14 @@ pub fn status(repo_root: &Path) -> Result<()> {
         println!("PR:     none");
     }
 
-    let issue_num = branch
-        .split(|c: char| !c.is_ascii_digit())
-        .find_map(|s| s.parse::<u64>().ok());
+    let issue_num = pr
+        .as_ref()
+        .and_then(|p| parse_closes_issue(p.body.as_deref().unwrap_or("")))
+        .or_else(|| {
+            branch
+                .split(|c: char| !c.is_ascii_digit())
+                .find_map(|s| s.parse::<u64>().ok())
+        });
 
     if let Some(n) = issue_num {
         if let Ok(issue) = github::get_issue(&repo, n) {
@@ -201,6 +214,20 @@ pub fn status(repo_root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn parse_closes_issue(body: &str) -> Option<u64> {
+    let lower = body.to_lowercase();
+    for keyword in ["closes #", "fixes #", "resolves #"] {
+        if let Some(pos) = lower.find(keyword) {
+            let rest = &body[pos + keyword.len()..];
+            let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = num_str.parse::<u64>() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
 pub fn missing_plan_sections(body: &str) -> Vec<&'static str> {
     const SECTIONS: &[(&str, &[&str])] = &[
         ("Why", &["**Why"]),
@@ -221,6 +248,32 @@ pub fn missing_plan_sections(body: &str) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_closes_issue_finds_closes() {
+        assert_eq!(parse_closes_issue("closes #42"), Some(42));
+    }
+
+    #[test]
+    fn parse_closes_issue_finds_fixes() {
+        assert_eq!(parse_closes_issue("Fixes #7"), Some(7));
+    }
+
+    #[test]
+    fn parse_closes_issue_finds_resolves() {
+        assert_eq!(parse_closes_issue("Resolves #100"), Some(100));
+    }
+
+    #[test]
+    fn parse_closes_issue_returns_none_for_no_match() {
+        assert_eq!(parse_closes_issue("no issue reference here"), None);
+    }
+
+    #[test]
+    fn parse_closes_issue_in_pr_body_multiline() {
+        let body = "## Summary\nDoes some stuff.\n\nCloses #55\n";
+        assert_eq!(parse_closes_issue(body), Some(55));
+    }
 
     #[test]
     fn missing_plan_sections_empty_body() {

@@ -139,17 +139,6 @@ The PR body must contain `closes #N` (or `fixes #N`, `resolves #N`). Without tha
 
 ---
 
-## Branch naming
-
-`engram plan land <N>` tries three branch name patterns in order:
-1. `fix/issue-N`
-2. `feat/issue-N`
-3. `issue-N`
-
-Name your working branch to match one of these so `land` can delete it automatically after close. Any other name requires manual branch cleanup.
-
----
-
 ## When NOT to create an engram plan
 
 Skip the plan if the work is:
@@ -167,8 +156,8 @@ Plans generate learnings. If the work won't teach Claude anything new about the 
 # 1. Create the plan issue (use this skill to draft the body)
 engram plan new "Verb-phrase title" --body "..."
 
-# 2. Create a branch
-git checkout -b feat/issue-<N>
+# 2. Create a branch (any name)
+git checkout -b my-feature
 
 # 3. Implement; open PR with "closes #N" in the PR body
 

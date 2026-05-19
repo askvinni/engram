@@ -6,7 +6,7 @@ Engram is a CLI that turns GitHub Issues into a structured learning loop for AI-
 
 ```
 engram plan new "Add rate limiting"   →  GitHub issue #42 (engram-plan label)
-git checkout -b feat/issue-42
+git checkout -b my-feature
 # ... implement, open PR with "closes #42" in the body, merge ...
 engram plan land 42                   →  memory files written, issue closed, branch deleted
 ```
@@ -69,12 +69,7 @@ This opens a GitHub issue tagged `engram-plan`. The issue body should cover seve
 
 ### 2. Implement and ship
 
-Create a branch and open a PR. The PR body **must** include `closes #N` (or `fixes #N` / `resolves #N`) so GitHub links the PR to the issue — `engram plan learn` finds the PR via that close event.
-
-Recommended branch naming so `engram plan land` can clean up automatically:
-- `feat/issue-42`
-- `fix/issue-42`
-- `issue-42`
+Create a branch and open a PR. The PR body **must** include `closes #N` (or `fixes #N` / `resolves #N`) so GitHub links the PR to the issue — `engram plan learn` finds the PR via that close event. The branch can be named anything.
 
 ### 3. Land the work
 
