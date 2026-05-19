@@ -529,6 +529,7 @@ fn cmd_objective(subcmd: cli::ObjectiveCommands) -> Result<()> {
             all_unblocked,
             body.as_deref(),
         ),
+        cli::ObjectiveCommands::Land { number } => objective::land(&repo_root, &repo, number),
     }
 }
 
