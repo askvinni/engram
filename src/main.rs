@@ -341,9 +341,7 @@ fn cmd_land(issue: u64) -> Result<()> {
     }
 
     // Mark the linked objective node as done, if any (non-fatal)
-    if let Err(e) =
-        objective::maybe_mark_node_done(&repo, gh_issue.body.as_deref().unwrap_or(""))
-    {
+    if let Err(e) = objective::maybe_mark_node_done(&repo, gh_issue.body.as_deref().unwrap_or("")) {
         eprintln!("warning: could not update objective node: {e:#}");
     }
 

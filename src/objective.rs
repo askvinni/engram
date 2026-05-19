@@ -179,7 +179,10 @@ fn extract_section<'a>(body: &'a str, heading: &str) -> Option<&'a str> {
     let after_heading = &body[pos + needle.len()..];
     let content_start = after_heading.find('\n').map(|i| i + 1).unwrap_or(0);
     let content = &after_heading[content_start..];
-    let section_end = content.find("\n## ").map(|i| i + 1).unwrap_or(content.len());
+    let section_end = content
+        .find("\n## ")
+        .map(|i| i + 1)
+        .unwrap_or(content.len());
     Some(&content[..section_end])
 }
 
@@ -242,17 +245,12 @@ pub fn plan(repo: &str, objective_number: u64, node_id: &str, body: Option<&str>
         )
     })?;
 
-    let node_idx = nodes
-        .iter()
-        .position(|n| n.id == node_id)
-        .ok_or_else(|| {
-            anyhow::anyhow!("node {node_id} not found in objective #{objective_number}")
-        })?;
+    let node_idx = nodes.iter().position(|n| n.id == node_id).ok_or_else(|| {
+        anyhow::anyhow!("node {node_id} not found in objective #{objective_number}")
+    })?;
 
     if let Some(existing) = nodes[node_idx].plan_issue {
-        anyhow::bail!(
-            "node {node_id} already has plan issue #{existing} — cannot create another"
-        );
+        anyhow::bail!("node {node_id} already has plan issue #{existing} — cannot create another");
     }
 
     let marker = format!("Objective: #{objective_number} (node {node_id})");
@@ -300,8 +298,7 @@ pub fn maybe_mark_node_done(repo: &str, plan_body: &str) -> Result<()> {
         None => return Ok(()),
     };
 
-    let obj_issue =
-        github::get_issue(repo, obj_number).context("fetching objective issue")?;
+    let obj_issue = github::get_issue(repo, obj_number).context("fetching objective issue")?;
     let obj_body = obj_issue.body.as_deref().unwrap_or("");
 
     let mut nodes = match parse_nodes_from_comment(obj_body) {
