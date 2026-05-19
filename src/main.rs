@@ -517,9 +517,18 @@ fn cmd_objective(subcmd: cli::ObjectiveCommands) -> Result<()> {
         cli::ObjectiveCommands::New { title, body } => objective::new(&repo, &title, &body),
         cli::ObjectiveCommands::List => objective::list_open(&repo),
         cli::ObjectiveCommands::View { number } => objective::view(&repo, number),
-        cli::ObjectiveCommands::Plan { number, node, body } => {
-            objective::plan(&repo, number, &node, body.as_deref())
-        }
+        cli::ObjectiveCommands::Plan {
+            number,
+            node,
+            all_unblocked,
+            body,
+        } => objective::plan(
+            &repo,
+            number,
+            node.as_deref(),
+            all_unblocked,
+            body.as_deref(),
+        ),
     }
 }
 
