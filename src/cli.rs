@@ -82,4 +82,9 @@ pub enum ObjectiveCommands {
         #[arg(long)]
         body: Option<String>,
     },
+    /// Synthesize learnings from all plans in an objective and close it when done
+    Land {
+        /// Objective issue number
+        number: u64,
+    },
 }

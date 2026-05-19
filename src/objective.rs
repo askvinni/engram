@@ -445,6 +445,138 @@ pub fn maybe_mark_node_done(repo: &str, plan_body: &str) -> Result<()> {
     Ok(())
 }
 
+/// Batch-land all plans in an objective: synthesise learnings from every node
+/// that has a linked plan issue and isn't yet done, commit everything in one
+/// branch+PR, and close the objective when all nodes are done.
+pub fn land(repo_root: &std::path::Path, repo: &str, objective_number: u64) -> Result<()> {
+    let obj_issue =
+        github::get_issue(repo, objective_number).context("fetching objective issue")?;
+    let obj_body = obj_issue.body.as_deref().unwrap_or("").to_string();
+
+    let mut nodes = parse_nodes_from_comment(&obj_body).ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not parse nodes from objective #{objective_number} — \
+             was it created with `engram objective new`?"
+        )
+    })?;
+
+    let landable: Vec<usize> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.plan_issue.is_some() && n.status != NodeStatus::Done)
+        .map(|(i, _)| i)
+        .collect();
+
+    if landable.is_empty() {
+        println!("No plans to land in objective #{objective_number}.");
+        if all_nodes_done(&nodes) && obj_issue.state != "CLOSED" {
+            let comment = build_close_comment(&nodes);
+            if let Err(e) = github::add_issue_comment(repo, objective_number, &comment) {
+                eprintln!("warning: could not post closing comment: {e:#}");
+            }
+            match github::close_issue(repo, objective_number) {
+                Ok(()) => println!("Closed objective #{objective_number} — all nodes done."),
+                Err(e) => eprintln!("warning: could not close objective: {e:#}"),
+            }
+        }
+        return Ok(());
+    }
+
+    let mut learned: Vec<u64> = vec![];
+    let mut failed = 0usize;
+
+    for &idx in &landable {
+        let plan_num = nodes[idx].plan_issue.unwrap();
+        let node_id = nodes[idx].id.clone();
+        println!("\nLearning from plan #{plan_num} (node {node_id})...");
+        let wrote = match crate::learn::write_memory(repo_root, plan_num, repo) {
+            Ok(wrote) => wrote,
+            Err(e) => {
+                eprintln!("  skipping #{plan_num}: {e:#}");
+                failed += 1;
+                continue;
+            }
+        };
+        if wrote {
+            learned.push(plan_num);
+        }
+        nodes[idx].status = NodeStatus::Done;
+        let updated = build_objective_body(&obj_body, &nodes);
+        if let Err(e) = github::update_issue_body(repo, objective_number, &updated) {
+            eprintln!("warning: could not update objective body after node {node_id}: {e:#}");
+        }
+    }
+
+    // Commit all memory changes in one branch + PR
+    if !learned.is_empty() {
+        let branch = format!("engram/objective-land-{objective_number}");
+        let ok = Command::new("git")
+            .args(["checkout", "-b", &branch])
+            .current_dir(repo_root)
+            .status()?
+            .success();
+        if !ok {
+            anyhow::bail!("git checkout -b {branch} failed");
+        }
+        Command::new("git")
+            .args(["add", ".engram/memory", "CLAUDE.md"])
+            .current_dir(repo_root)
+            .status()?;
+        let nothing_staged = Command::new("git")
+            .args(["diff", "--cached", "--quiet"])
+            .current_dir(repo_root)
+            .status()?
+            .success();
+        if !nothing_staged {
+            let issue_list = learned
+                .iter()
+                .map(|n| format!("#{n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Command::new("git")
+                .args(["commit", "-m", &format!("engram: learn from {issue_list}")])
+                .current_dir(repo_root)
+                .status()?;
+            Command::new("git")
+                .args(["push", "-u", "origin", &branch])
+                .current_dir(repo_root)
+                .status()?;
+            let pr_body = format!(
+                "Learnings from objective #{objective_number}: {issue_list}.\n\n---\n*Created by engram*"
+            );
+            let pr_url = github::create_pr(
+                repo,
+                &format!("engram: objective #{objective_number} learnings"),
+                &pr_body,
+                "engram-learned",
+            )?;
+            println!("\nPR created: {}", pr_url.trim());
+            for n in &learned {
+                if let Err(e) = github::add_label_to_issue(repo, *n, "engram-learned") {
+                    eprintln!("warning: could not label #{n}: {e:#}");
+                }
+            }
+        }
+    }
+
+    // Close objective if all nodes are now done
+    if all_nodes_done(&nodes) {
+        let comment = build_close_comment(&nodes);
+        if let Err(e) = github::add_issue_comment(repo, objective_number, &comment) {
+            eprintln!("warning: could not post closing comment: {e:#}");
+        }
+        match github::close_issue(repo, objective_number) {
+            Ok(()) => println!("Closed objective #{objective_number} — all nodes done."),
+            Err(e) => eprintln!("warning: could not close objective: {e:#}"),
+        }
+    }
+
+    if failed > 0 {
+        anyhow::bail!("{failed} plan(s) failed — see errors above");
+    }
+    Ok(())
+}
+
 fn generate_plan_body_for_node(
     objective_title: &str,
     objective_body: &str,
