@@ -335,6 +335,34 @@ pub fn add_sub_issue(repo: &str, parent_number: u64, child_number: u64) -> Resul
     Ok(())
 }
 
+pub fn add_issue_comment(repo: &str, number: u64, body: &str) -> Result<()> {
+    gh(&[
+        "issue",
+        "comment",
+        &number.to_string(),
+        "--repo",
+        repo,
+        "--body",
+        body,
+    ])?;
+    Ok(())
+}
+
+pub fn close_issue(repo: &str, number: u64) -> Result<()> {
+    let output = Command::new("gh")
+        .args(["issue", "close", &number.to_string(), "--repo", repo])
+        .output()
+        .context("running gh CLI")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("already closed") {
+            return Ok(());
+        }
+        anyhow::bail!("gh issue close #{number} failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
 pub fn list_unlearned_plans(repo: &str) -> Result<Vec<PlanIssue>> {
     #[derive(Deserialize)]
     struct LabelEntry {

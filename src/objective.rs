@@ -233,6 +233,22 @@ pub fn view(repo: &str, number: u64) -> Result<()> {
     Ok(())
 }
 
+/// Returns true only when the list is non-empty and every node has status Done.
+pub fn all_nodes_done(nodes: &[ObjectiveNode]) -> bool {
+    !nodes.is_empty() && nodes.iter().all(|n| n.status == NodeStatus::Done)
+}
+
+fn build_close_comment(nodes: &[ObjectiveNode]) -> String {
+    let mut lines = vec![
+        "All nodes completed — closing objective.".to_string(),
+        String::new(),
+    ];
+    for node in nodes {
+        lines.push(format!("- {} {}", node.id, node.description));
+    }
+    lines.join("\n")
+}
+
 /// Returns indices of nodes that are Pending with all dependencies Done.
 /// Single-pass — safe against circular deps.
 pub fn unblocked_nodes(nodes: &[ObjectiveNode]) -> Vec<usize> {
@@ -414,6 +430,18 @@ pub fn maybe_mark_node_done(repo: &str, plan_body: &str) -> Result<()> {
     let new_body = build_objective_body(obj_body, &nodes);
     github::update_issue_body(repo, obj_number, &new_body)?;
     println!("Marked node {node_id} as done in objective #{obj_number}.");
+
+    if all_nodes_done(&nodes) {
+        let comment = build_close_comment(&nodes);
+        if let Err(e) = github::add_issue_comment(repo, obj_number, &comment) {
+            eprintln!("warning: could not post closing comment on #{obj_number}: {e:#}");
+        }
+        match github::close_issue(repo, obj_number) {
+            Ok(()) => println!("Closed objective #{obj_number} — all nodes done."),
+            Err(e) => eprintln!("warning: could not close objective #{obj_number}: {e:#}"),
+        }
+    }
+
     Ok(())
 }
 
@@ -720,5 +748,43 @@ mod tests {
     #[test]
     fn unblocked_nodes_empty_input() {
         assert!(unblocked_nodes(&[]).is_empty());
+    }
+
+    #[test]
+    fn all_nodes_done_empty_list() {
+        assert!(!all_nodes_done(&[]));
+    }
+
+    #[test]
+    fn all_nodes_done_all_done() {
+        let nodes = vec![
+            node("1.1", NodeStatus::Done, &[]),
+            node("1.2", NodeStatus::Done, &[]),
+        ];
+        assert!(all_nodes_done(&nodes));
+    }
+
+    #[test]
+    fn all_nodes_done_one_pending() {
+        let nodes = vec![
+            node("1.1", NodeStatus::Done, &[]),
+            node("1.2", NodeStatus::Pending, &[]),
+        ];
+        assert!(!all_nodes_done(&nodes));
+    }
+
+    #[test]
+    fn all_nodes_done_one_in_progress() {
+        let nodes = vec![
+            node("1.1", NodeStatus::Done, &[]),
+            node("1.2", NodeStatus::InProgress, &[]),
+        ];
+        assert!(!all_nodes_done(&nodes));
+    }
+
+    #[test]
+    fn all_nodes_done_single_done() {
+        let nodes = vec![node("1.1", NodeStatus::Done, &[])];
+        assert!(all_nodes_done(&nodes));
     }
 }
