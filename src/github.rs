@@ -14,6 +14,8 @@ pub struct PullRequest {
     pub number: u64,
     pub title: String,
     pub body: Option<String>,
+    #[serde(rename = "headRefName", default)]
+    pub head_ref_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +97,7 @@ pub fn find_linked_pr(repo: &str, issue_number: u64) -> Result<Option<PullReques
                         number
                         title
                         body
+                        headRefName
                         state
                       }
                     }
@@ -149,6 +152,8 @@ pub fn find_linked_pr(repo: &str, issue_number: u64) -> Result<Option<PullReques
         number: u64,
         title: String,
         body: Option<String>,
+        #[serde(rename = "headRefName", default)]
+        head_ref_name: Option<String>,
         state: String,
     }
 
@@ -168,6 +173,7 @@ pub fn find_linked_pr(repo: &str, issue_number: u64) -> Result<Option<PullReques
         number: pr.number,
         title: pr.title,
         body: pr.body,
+        head_ref_name: pr.head_ref_name,
     }))
 }
 
@@ -184,7 +190,7 @@ pub fn find_pr_for_branch(repo: &str, branch: &str) -> Result<Option<PullRequest
         "--head",
         branch,
         "--json",
-        "number,title,body,state",
+        "number,title,body,state,headRefName",
         "--limit",
         "1",
     ])?;
