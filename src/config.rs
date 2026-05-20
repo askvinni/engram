@@ -67,3 +67,24 @@ pub fn find_repo_root() -> Result<PathBuf> {
     let path = String::from_utf8(output.stdout)?.trim().to_string();
     Ok(PathBuf::from(path))
 }
+
+pub fn resolve_repo(cfg: &Config, repo_root: &Path) -> Result<String> {
+    if let Some(repo) = cfg.repo() {
+        return Ok(repo.to_string());
+    }
+    let output = Command::new("gh")
+        .args([
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "-q",
+            ".nameWithOwner",
+        ])
+        .current_dir(repo_root)
+        .output()?;
+    if output.status.success() {
+        return Ok(String::from_utf8(output.stdout)?.trim().to_string());
+    }
+    anyhow::bail!("GitHub repo not configured — run `engram init`")
+}
