@@ -109,13 +109,14 @@ engram init
 
 ```
 engram init                                Initialize in this repo; install Claude skills
+engram doctor                              Verify all dependencies and configuration
+engram compact                             Prune and merge stale memory files
+
 engram plan new <title> [--body <body>]    Create a GitHub issue as a plan
 engram plan learn <issue> [--all]          Synthesize learnings from a closed issue+PR
 engram plan land <issue>                   learn + close issue + delete local branch
 engram plan list                           List open engram-plan issues
 engram plan status                         Show linked issue/PR for the current branch
-engram compact                             Prune and merge stale memory files
-engram doctor                              Verify all dependencies and configuration
 
 engram objective new <title> --body <body>         Create a multi-plan objective
 engram objective plan <number> --node <id>         Create a plan for one node
