@@ -67,12 +67,14 @@ pub fn load_prompt_hooks(repo_root: &std::path::Path) -> String {
         .join("\n\n")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn synthesize_learnings(
     issue_title: &str,
     issue_body: &str,
     pr_title: &str,
     pr_body: &str,
     pr_diff: &str,
+    conversation: &str,
     current_memory: &str,
     prompt_hooks: &str,
 ) -> Result<Vec<LearningItem>> {
@@ -82,10 +84,24 @@ pub fn synthesize_learnings(
         pr_diff
     };
 
+    let conversation_trimmed = if conversation.len() > 8000 {
+        &conversation[..8000]
+    } else {
+        conversation
+    };
+
     let memory_section = if current_memory.is_empty() {
         "_none yet_".to_string()
     } else {
         current_memory.to_string()
+    };
+
+    let conversation_section = if conversation_trimmed.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n## Planning Conversation\n{conversation_trimmed}\n*(truncated at 8000 chars if longer)*\n"
+        )
     };
 
     let hooks_section = if prompt_hooks.is_empty() {
@@ -112,7 +128,7 @@ pub fn synthesize_learnings(
 
 ## PR Diff
 {diff}
-
+{conversation_section}
 ## Current Memory
 {memory_section}
 {hooks_section}

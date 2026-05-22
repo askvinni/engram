@@ -19,6 +19,11 @@ pub struct PullRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct IssueComment {
+    pub body: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct PlanIssue {
     pub number: u64,
     pub title: String,
@@ -352,6 +357,26 @@ pub fn add_issue_comment(repo: &str, number: u64, body: &str) -> Result<()> {
         body,
     ])?;
     Ok(())
+}
+
+pub fn get_issue_comments(repo: &str, number: u64) -> Result<Vec<IssueComment>> {
+    let out = gh(&[
+        "issue",
+        "view",
+        &number.to_string(),
+        "--repo",
+        repo,
+        "--json",
+        "comments",
+    ])?;
+
+    #[derive(Deserialize)]
+    struct Response {
+        comments: Vec<IssueComment>,
+    }
+
+    let resp: Response = serde_json::from_str(&out).context("parsing issue comments JSON")?;
+    Ok(resp.comments)
 }
 
 pub fn close_issue(repo: &str, number: u64) -> Result<()> {

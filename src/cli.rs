@@ -36,6 +36,9 @@ pub enum PlanCommands {
         /// Issue body
         #[arg(long)]
         body: Option<String>,
+        /// Planning conversation to attach as a comment for richer learn synthesis
+        #[arg(long)]
+        conversation: Option<String>,
     },
     /// List open engram-plan issues
     List,
