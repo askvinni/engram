@@ -4,6 +4,8 @@ use std::process::Command;
 
 use crate::{claude, config, github, memory};
 
+const CONVERSATION_SENTINEL: &str = "<!-- engram:conversation -->";
+
 /// Validates the issue, synthesizes learnings, and writes them to memory on disk.
 /// Returns true if any learnings were written, false if none were found.
 pub fn write_memory(repo_root: &Path, issue_number: u64, repo: &str) -> Result<bool> {
@@ -23,6 +25,19 @@ pub fn write_memory(repo_root: &Path, issue_number: u64, repo: &str) -> Result<b
     println!("Fetching diff for PR #{}...", pr.number);
     let diff = github::get_pr_diff(repo, pr.number)?;
 
+    println!("Fetching issue comments...");
+    let comments = github::get_issue_comments(repo, issue_number)?;
+    let conversation = comments
+        .iter()
+        .find(|c| c.body.contains(CONVERSATION_SENTINEL))
+        .map(|c| {
+            c.body
+                .replacen(CONVERSATION_SENTINEL, "", 1)
+                .trim()
+                .to_string()
+        })
+        .unwrap_or_default();
+
     println!("Reading existing memory...");
     let current_memory = memory::read_all(repo_root)?;
 
@@ -35,6 +50,7 @@ pub fn write_memory(repo_root: &Path, issue_number: u64, repo: &str) -> Result<b
         &pr.title,
         pr.body.as_deref().unwrap_or(""),
         &diff,
+        &conversation,
         &current_memory,
         &prompt_hooks,
     )?;

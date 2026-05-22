@@ -68,11 +68,15 @@ Re-read Scope and Key files against what you found in Step 1. Surface mismatches
 
 ### Step 6 — Create the issue
 
-Only after steps 1–5 pass. Run:
+Only after steps 1–5 pass. Summarize the planning dialog that occurred **in this session** — the key design decisions, rejected alternatives, and constraint surfacing that led to the final plan body. Scope this summary strictly to the planning conversation; do not include implementation discussion or the full session history.
+
+Run:
 
 ```
-engram plan new "<title>" --body "<seven-section body>"
+engram plan new "<title>" --body "<seven-section body>" --conversation "<planning dialog summary>"
 ```
+
+The `--conversation` text is posted as a comment on the issue so `engram plan learn` can include the reasoning behind the plan in its synthesis prompt, producing richer pattern and tripwire memory files.
 
 Print the issue URL. Then add one sentence on what would make this plan produce strong learnings when `engram plan learn` runs — for example: *"Make sure the PR diff shows the new parsing logic clearly — that's what synthesis will use to generate the pattern file."*
 

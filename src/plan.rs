@@ -1,10 +1,15 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
 
 use crate::{config, github, learn, objective};
 
-pub fn new(repo_root: &Path, title: &str, body: Option<&str>) -> Result<()> {
+pub fn new(
+    repo_root: &Path,
+    title: &str,
+    body: Option<&str>,
+    conversation: Option<&str>,
+) -> Result<()> {
     let cfg = config::Config::load(repo_root)?;
     let repo = config::resolve_repo(&cfg, repo_root)?;
     let body = body.unwrap_or("");
@@ -16,7 +21,22 @@ pub fn new(repo_root: &Path, title: &str, body: Option<&str>) -> Result<()> {
         );
     }
     let url = github::create_issue(&repo, title, body, "engram-plan")?;
-    println!("{}", url.trim());
+    let url = url.trim();
+
+    if let Some(conv) = conversation {
+        if !conv.is_empty() {
+            let issue_number = url
+                .rsplit('/')
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .with_context(|| format!("could not parse issue number from URL: {url}"))?;
+            let comment_body = format!("<!-- engram:conversation -->\n{conv}");
+            github::add_issue_comment(&repo, issue_number, &comment_body)
+                .context("posting conversation comment")?;
+        }
+    }
+
+    println!("{url}");
     Ok(())
 }
 

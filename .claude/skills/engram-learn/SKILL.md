@@ -30,14 +30,15 @@ If either check fails, `engram plan learn` will exit with an error message. Fix 
 1. Fetches issue `#N` title and body
 2. Finds the merged PR via GitHub's `CLOSED_EVENT` GraphQL query (`src/github.rs:find_linked_pr`)
 3. Fetches the PR diff, capped at 8 000 bytes (`src/github.rs:get_pr_diff`)
-4. Reads all existing `.engram/memory/` files for deduplication context (`src/memory.rs:read_all`)
-5. Loads `.engram/prompt-hooks/*.md` (excluding `README.md`) to inject repo-specific synthesis rules
-6. Invokes `claude -p` **from `std::env::temp_dir()`** — not from the repo root — to prevent Claude Code from loading the repo's CLAUDE.md as agent context
-7. Strips markdown code fences from the response, parses a JSON array of `LearningItem`s
-8. For each item: writes to `.engram/memory/<category>/<slug>.md`, accumulating `source_issues` if the file already exists
-9. Rebuilds `.engram/memory/index.md`
-10. Updates the `<!-- engram:start --> ... <!-- engram:end -->` section in CLAUDE.md
-11. Creates branch `engram/learn-<N>`, commits, pushes, opens a PR labeled `engram-learned`
+4. Fetches issue comments and extracts the first comment containing `<!-- engram:conversation -->` (`src/github.rs:get_issue_comments`); the conversation text is included in the synthesis prompt under `## Planning Conversation` (also capped at 8 000 chars)
+5. Reads all existing `.engram/memory/` files for deduplication context (`src/memory.rs:read_all`)
+6. Loads `.engram/prompt-hooks/*.md` (excluding `README.md`) to inject repo-specific synthesis rules
+7. Invokes `claude -p` **from `std::env::temp_dir()`** — not from the repo root — to prevent Claude Code from loading the repo's CLAUDE.md as agent context
+8. Strips markdown code fences from the response, parses a JSON array of `LearningItem`s
+9. For each item: writes to `.engram/memory/<category>/<slug>.md`, accumulating `source_issues` if the file already exists
+10. Rebuilds `.engram/memory/index.md`
+11. Updates the `<!-- engram:start --> ... <!-- engram:end -->` section in CLAUDE.md
+12. Creates branch `engram/learn-<N>`, commits, pushes, opens a PR labeled `engram-learned`
 
 ## `engram plan land` vs `engram plan learn`
 

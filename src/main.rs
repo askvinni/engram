@@ -85,7 +85,11 @@ fn cmd_init() -> Result<()> {
 fn cmd_plan(subcmd: cli::PlanCommands) -> Result<()> {
     let repo_root = config::find_repo_root()?;
     match subcmd {
-        cli::PlanCommands::New { title, body } => plan::new(&repo_root, &title, body.as_deref()),
+        cli::PlanCommands::New {
+            title,
+            body,
+            conversation,
+        } => plan::new(&repo_root, &title, body.as_deref(), conversation.as_deref()),
         cli::PlanCommands::List => plan::list(&repo_root),
         cli::PlanCommands::Learn { issue, all } => {
             if all {
