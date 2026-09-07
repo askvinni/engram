@@ -300,6 +300,66 @@ pub fn write_topic_file(
     Ok(())
 }
 
+pub const VALID_CATEGORIES: &[&str] = &["patterns", "tripwires", "architecture", "testing"];
+
+/// Write a memory file directly from supplied text, without a PR or learn cycle.
+/// Returns the repo-relative path of the created file.
+pub fn write_direct(
+    repo_root: &Path,
+    category: &str,
+    title: &str,
+    body: &str,
+) -> Result<String> {
+    let slug = slugify(title);
+    let cat_dir = repo_root.join(format!(".engram/memory/{category}"));
+    std::fs::create_dir_all(&cat_dir)?;
+
+    let slug = unique_slug(&cat_dir, &slug);
+    let rel_path = format!(".engram/memory/{category}/{slug}.md");
+    let today = today_iso();
+
+    let content = format!(
+        "---\ntitle: \"{title}\"\nread_when: []\ntripwires: []\nlast_updated: \"{today}\"\nsource_issues: []\n---\n\n{body}\n"
+    );
+    std::fs::write(repo_root.join(&rel_path), content)?;
+    Ok(rel_path)
+}
+
+fn slugify(text: &str) -> String {
+    let s: String = text
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect();
+    let s = s.trim_matches('-').to_string();
+    // collapse runs of hyphens
+    let mut out = String::new();
+    let mut prev_hyphen = false;
+    for c in s.chars() {
+        if c == '-' {
+            if !prev_hyphen { out.push(c); }
+            prev_hyphen = true;
+        } else {
+            out.push(c);
+            prev_hyphen = false;
+        }
+    }
+    if out.is_empty() { "note".to_string() } else { out.chars().take(60).collect() }
+}
+
+fn unique_slug(cat_dir: &Path, base: &str) -> String {
+    let candidate = format!("{base}.md");
+    if !cat_dir.join(&candidate).exists() {
+        return base.to_string();
+    }
+    for n in 2u32.. {
+        let candidate = format!("{base}-{n}.md");
+        if !cat_dir.join(&candidate).exists() {
+            return format!("{base}-{n}");
+        }
+    }
+    base.to_string()
+}
+
 /// Auto-generate .engram/memory/index.md as a routing table for agents.
 pub fn rebuild_index(repo_root: &Path) -> Result<()> {
     let memory_dir = repo_root.join(".engram/memory");
@@ -664,6 +724,42 @@ mod tests {
         assert!(index.contains("My Pattern"));
         assert!(index.contains("when doing X"));
         assert!(index.contains("patterns/my-pattern.md"));
+    }
+
+    #[test]
+    fn write_direct_creates_file_with_frontmatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let rel = write_direct(root, "tripwires", "My Tripwire", "Body text.").unwrap();
+        let content = std::fs::read_to_string(root.join(&rel)).unwrap();
+        assert!(content.contains("title: \"My Tripwire\""));
+        assert!(content.contains("Body text."));
+        assert!(rel.starts_with(".engram/memory/tripwires/"));
+    }
+
+    #[test]
+    fn write_direct_slug_collision_gets_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let r1 = write_direct(root, "patterns", "Same Title", "first").unwrap();
+        let r2 = write_direct(root, "patterns", "Same Title", "second").unwrap();
+        assert_ne!(r1, r2);
+        assert!(r2.contains("-2"));
+    }
+
+    #[test]
+    fn slugify_lowercases_and_replaces_spaces() {
+        assert_eq!(slugify("Hello World"), "hello-world");
+    }
+
+    #[test]
+    fn slugify_collapses_multiple_hyphens() {
+        assert_eq!(slugify("foo  bar"), "foo-bar");
+    }
+
+    #[test]
+    fn slugify_empty_returns_note() {
+        assert_eq!(slugify(""), "note");
     }
 
     #[test]

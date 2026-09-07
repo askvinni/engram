@@ -29,7 +29,37 @@ fn main() -> Result<()> {
         Commands::Compact => cmd_compact(),
         Commands::Objective { subcommand } => cmd_objective(subcommand),
         Commands::Read { permalink } => cmd_read(&permalink, mode),
+        Commands::Write { category, body, title } => cmd_write(mode, &category, &body, title.as_deref()),
     }
+}
+
+fn cmd_write(mode: cli::OutputMode, category: &str, body: &str, title: Option<&str>) -> Result<()> {
+    if !memory::VALID_CATEGORIES.contains(&category) {
+        anyhow::bail!(
+            "unknown category {:?}; valid categories: {}",
+            category,
+            memory::VALID_CATEGORIES.join(", ")
+        );
+    }
+    let repo_root = config::find_repo_root()?;
+    let derived_title = title
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| body.lines().next().unwrap_or("note"));
+    let rel_path = memory::write_direct(&repo_root, category, derived_title, body)?;
+    let file_path = repo_root.join(&rel_path);
+    let content = std::fs::read_to_string(&file_path)?;
+    let slug = file_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    index::upsert_file(&repo_root, &rel_path, category, &slug, &content)?;
+    memory::rebuild_index(&repo_root)?;
+    match mode {
+        cli::OutputMode::Agent => println!("OK write {rel_path}"),
+        cli::OutputMode::Human => println!("Created {rel_path}"),
+    }
+    Ok(())
 }
 
 fn cmd_init() -> Result<()> {

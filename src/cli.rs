@@ -57,6 +57,17 @@ pub enum Commands {
         /// Exact path (e.g. patterns/foo.md) or filename stem to look up
         permalink: String,
     },
+    /// Write a memory file directly from stdin/args without a PR cycle
+    Write {
+        /// Memory category (patterns, tripwires, architecture, testing)
+        category: String,
+        /// Memory file body text
+        #[arg(long)]
+        body: String,
+        /// Optional title; defaults to a slug derived from the first line of body
+        #[arg(long)]
+        title: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
