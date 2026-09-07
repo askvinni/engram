@@ -1,10 +1,30 @@
 use clap::{Parser, Subcommand};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputMode {
+    Human,
+    Agent,
+}
+
 #[derive(Parser)]
 #[command(name = "engram", about = "Plan-based agentic development helper")]
 pub struct Cli {
+    /// Emit compact, stable, machine-readable output (no human chrome)
+    #[arg(long, global = true)]
+    pub agent: bool,
+
     #[command(subcommand)]
     pub command: Commands,
+}
+
+impl Cli {
+    pub fn output_mode(&self) -> OutputMode {
+        if self.agent {
+            OutputMode::Agent
+        } else {
+            OutputMode::Human
+        }
+    }
 }
 
 #[derive(Subcommand)]
