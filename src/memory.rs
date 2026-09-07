@@ -304,12 +304,7 @@ pub const VALID_CATEGORIES: &[&str] = &["patterns", "tripwires", "architecture",
 
 /// Write a memory file directly from supplied text, without a PR or learn cycle.
 /// Returns the repo-relative path of the created file.
-pub fn write_direct(
-    repo_root: &Path,
-    category: &str,
-    title: &str,
-    body: &str,
-) -> Result<String> {
+pub fn write_direct(repo_root: &Path, category: &str, title: &str, body: &str) -> Result<String> {
     let slug = slugify(title);
     let cat_dir = repo_root.join(format!(".engram/memory/{category}"));
     std::fs::create_dir_all(&cat_dir)?;
@@ -328,7 +323,13 @@ pub fn write_direct(
 fn slugify(text: &str) -> String {
     let s: String = text
         .chars()
-        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
     let s = s.trim_matches('-').to_string();
     // collapse runs of hyphens
@@ -336,14 +337,20 @@ fn slugify(text: &str) -> String {
     let mut prev_hyphen = false;
     for c in s.chars() {
         if c == '-' {
-            if !prev_hyphen { out.push(c); }
+            if !prev_hyphen {
+                out.push(c);
+            }
             prev_hyphen = true;
         } else {
             out.push(c);
             prev_hyphen = false;
         }
     }
-    if out.is_empty() { "note".to_string() } else { out.chars().take(60).collect() }
+    if out.is_empty() {
+        "note".to_string()
+    } else {
+        out.chars().take(60).collect()
+    }
 }
 
 fn unique_slug(cat_dir: &Path, base: &str) -> String {

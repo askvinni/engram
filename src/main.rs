@@ -29,7 +29,11 @@ fn main() -> Result<()> {
         Commands::Compact => cmd_compact(),
         Commands::Objective { subcommand } => cmd_objective(subcommand),
         Commands::Read { permalink } => cmd_read(&permalink, mode),
-        Commands::Write { category, body, title } => cmd_write(mode, &category, &body, title.as_deref()),
+        Commands::Write {
+            category,
+            body,
+            title,
+        } => cmd_write(mode, &category, &body, title.as_deref()),
     }
 }
 
