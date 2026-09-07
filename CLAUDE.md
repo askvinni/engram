@@ -73,6 +73,19 @@ let output = Command::new("claude")
 
 Check `output.status.success()` and surface stderr as the error message.
 
+## kata (optional issue mirror)
+
+kata is a separate local-first issue ledger. It is optional — check for `.kata.toml` at the repo root before doing anything below. If it's absent, skip kata entirely.
+
+When `.kata.toml` exists, mirror every `engram-plan` and `engram-objective` issue into kata as it is created or edited:
+
+- Title: same as the GitHub issue title.
+- Body: the **full** GitHub issue body — all seven plan sections, or Goal/Background/Roadmap/Acceptance criteria/Scope for an objective — prefixed with `GitHub: <issue URL>`. Never write just a link; kata must be searchable standalone.
+- Relationships: a plan node's kata issue gets `--parent <objective's kata ref>`. Anything blocked on another objective/plan completing first gets `--blocked-by <that kata ref>`.
+- Idempotency: use `--idempotency-key "engram-plan-<issue-number>"` or `"engram-objective-<issue-number>"` so retries don't duplicate issues.
+
+Native kata mirroring (automatic create/close/comment from `plan`/`land`/`learn`) is tracked as its own objective and not yet implemented — until it lands, do this by hand.
+
 ## Constants
 
 Prefer file-level `const` over magic literals:
