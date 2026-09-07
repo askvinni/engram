@@ -45,6 +45,11 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: ObjectiveCommands,
     },
+    /// Search memory files using the FTS index
+    Search {
+        /// Search query
+        query: String,
+    },
 }
 
 #[derive(Subcommand)]

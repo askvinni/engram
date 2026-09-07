@@ -2,6 +2,13 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
+#[derive(Debug)]
+pub struct SearchResult {
+    pub path: String,
+    pub category: String,
+    pub snippet: String,
+}
+
 const DB_RELATIVE: &str = ".engram/index.db";
 
 fn open_db(repo_root: &Path) -> Result<Connection> {
@@ -58,6 +65,48 @@ pub fn upsert_file(
 /// Returns true if the index db file exists. Consumed by `engram doctor` (node 4.4).
 pub fn check_index_health(repo_root: &Path) -> Result<bool> {
     Ok(repo_root.join(DB_RELATIVE).exists())
+}
+
+/// Search the FTS index, rebuilding it on demand if missing or empty.
+pub fn search(repo_root: &Path, query: &str) -> Result<Vec<SearchResult>> {
+    if !repo_root.join(DB_RELATIVE).exists() {
+        rebuild_index(repo_root)?;
+    }
+    let conn = open_db(repo_root)?;
+    let row_count: i64 = conn
+        .query_row("SELECT count(*) FROM memory_fts", [], |r| r.get(0))
+        .context("counting index rows")?;
+    if row_count == 0 {
+        drop(conn);
+        rebuild_index(repo_root)?;
+        let conn = open_db(repo_root)?;
+        return query_fts(&conn, query);
+    }
+    query_fts(&conn, query)
+}
+
+fn query_fts(conn: &Connection, query: &str) -> Result<Vec<SearchResult>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT path, category,
+                    snippet(memory_fts, 3, '', '', '...', 15)
+             FROM memory_fts
+             WHERE memory_fts MATCH ?1
+             ORDER BY rank",
+        )
+        .context("preparing search query")?;
+    let results = stmt
+        .query_map(params![query], |row| {
+            Ok(SearchResult {
+                path: row.get(0)?,
+                category: row.get(1)?,
+                snippet: row.get::<_, String>(2)?.trim().replace('\n', " "),
+            })
+        })
+        .context("executing search query")?
+        .collect::<Result<Vec<_>, _>>()
+        .context("collecting search results")?;
+    Ok(results)
 }
 
 fn insert_row(
@@ -212,6 +261,45 @@ mod tests {
             .query_row("SELECT count(*) FROM memory_fts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn search_returns_ranked_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut a = make_item("patterns", "race-condition");
+        a.body = "A race condition can occur when two threads access shared state.".to_string();
+        let mut b = make_item("tripwires", "lock-ordering");
+        b.body = "Lock ordering prevents deadlock but has nothing to do with races.".to_string();
+        write_topic_file(root, &a, 1).unwrap();
+        write_topic_file(root, &b, 2).unwrap();
+        rebuild_index(root).unwrap();
+
+        let results = search(root, "race condition").unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].path, ".engram/memory/patterns/race-condition.md");
+    }
+
+    #[test]
+    fn search_empty_result_returns_empty_vec() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".engram/memory")).unwrap();
+        rebuild_index(root).unwrap();
+        let results = search(root, "nonexistent query xyz").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_rebuilds_missing_index_on_demand() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut item = make_item("patterns", "foo");
+        item.body = "unique search term: xyzzy".to_string();
+        write_topic_file(root, &item, 1).unwrap();
+        // No explicit rebuild — search should build it on demand
+        let results = search(root, "xyzzy").unwrap();
+        assert_eq!(results.len(), 1);
     }
 
     #[test]
