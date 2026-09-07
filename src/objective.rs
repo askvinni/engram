@@ -977,7 +977,13 @@ mod tests {
     fn append_rejects_duplicate_id_and_unknown_dep() {
         let obj_body = body_with_nodes(&[node("1.1", NodeStatus::Pending, &[])]);
         let nodes = parse_nodes_from_comment(&obj_body).unwrap();
-        assert!(nodes.iter().any(|n| n.id == "1.1"), "duplicate should be caught");
-        assert!(!nodes.iter().any(|n| n.id == "9.9"), "unknown dep should be caught");
+        assert!(
+            nodes.iter().any(|n| n.id == "1.1"),
+            "duplicate should be caught"
+        );
+        assert!(
+            !nodes.iter().any(|n| n.id == "9.9"),
+            "unknown dep should be caught"
+        );
     }
 }
