@@ -29,6 +29,7 @@ fn main() -> Result<()> {
         Commands::Objective { subcommand } => cmd_objective(subcommand),
         Commands::Search { query } => cmd_search(mode, &query),
         Commands::Read { identifier } => cmd_read(&identifier, mode),
+        Commands::Write { category, body } => cmd_write(&category, &body, mode),
     }
 }
 
@@ -112,6 +113,24 @@ fn cmd_plan(subcmd: cli::PlanCommands) -> Result<()> {
 fn cmd_compact() -> Result<()> {
     let repo_root = config::find_repo_root()?;
     compact::run(&repo_root)
+}
+
+fn cmd_write(category: &str, body: &str, mode: cli::OutputMode) -> Result<()> {
+    use cli::OutputMode;
+    let repo_root = config::find_repo_root()?;
+    let rel_path = memory::write_direct(&repo_root, category, body)?;
+    let content = std::fs::read_to_string(repo_root.join(&rel_path))?;
+    let slug = std::path::Path::new(&rel_path)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    index::upsert_file(&repo_root, &rel_path, category, &slug, &content)?;
+    match mode {
+        OutputMode::Agent => println!("OK write path={rel_path}"),
+        OutputMode::Human => println!("Wrote {rel_path}"),
+    }
+    Ok(())
 }
 
 const PROMPT_HOOKS_README: &str = r#"# Prompt Hooks

@@ -55,6 +55,14 @@ pub enum Commands {
         /// Memory path (category/slug.md or category/slug) or bare filename stem
         identifier: String,
     },
+    /// Write a memory file directly from stdin/args without a plan or PR cycle
+    Write {
+        /// Category: patterns, tripwires, architecture, or testing
+        category: String,
+        /// Memory file body text
+        #[arg(long)]
+        body: String,
+    },
 }
 
 #[derive(Subcommand)]
