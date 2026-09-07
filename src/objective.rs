@@ -553,6 +553,58 @@ pub fn land(repo_root: &std::path::Path, repo: &str, objective_number: u64) -> R
     Ok(())
 }
 
+pub fn append(
+    repo: &str,
+    number: u64,
+    id: &str,
+    description: &str,
+    depends: Option<&str>,
+) -> Result<()> {
+    let obj_issue = github::get_issue(repo, number).context("fetching objective issue")?;
+    let obj_body = obj_issue.body.as_deref().unwrap_or("").to_string();
+
+    let mut nodes = parse_nodes_from_comment(&obj_body).ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not parse nodes from objective #{number} — \
+             was it created with `engram objective new`?"
+        )
+    })?;
+
+    if nodes.iter().any(|n| n.id == id) {
+        anyhow::bail!("node {id} already exists in objective #{number}");
+    }
+
+    let depends_on = depends
+        .map(|d| {
+            d.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    for dep in &depends_on {
+        if !nodes.iter().any(|n| &n.id == dep) {
+            anyhow::bail!("dependency {dep} not found in objective #{number}");
+        }
+    }
+
+    nodes.push(ObjectiveNode {
+        id: id.to_string(),
+        description: description.to_string(),
+        status: NodeStatus::Pending,
+        plan_issue: None,
+        pr_url: None,
+        depends_on,
+    });
+
+    let new_body = build_objective_body(&obj_body, &nodes);
+    github::update_issue_body(repo, number, &new_body).context("updating objective issue body")?;
+
+    println!("Appended node {id} to objective #{number}.");
+    Ok(())
+}
+
 fn generate_plan_body_for_node(
     objective_title: &str,
     objective_body: &str,
@@ -894,5 +946,98 @@ mod tests {
     fn all_nodes_done_single_done() {
         let nodes = vec![node("1.1", NodeStatus::Done, &[])];
         assert!(all_nodes_done(&nodes));
+    }
+
+    // --- append helpers ---
+
+    fn body_with_nodes(nodes: &[ObjectiveNode]) -> String {
+        let comment = write_nodes_to_comment(nodes);
+        format!("## Goal\nDo stuff\n\n## Roadmap\n{comment}")
+    }
+
+    #[test]
+    fn append_adds_node_to_rebuilt_body() {
+        let initial = vec![node("1.1", NodeStatus::Pending, &[])];
+        let obj_body = body_with_nodes(&initial);
+
+        let mut nodes = parse_nodes_from_comment(&obj_body).unwrap();
+        assert!(!nodes.iter().any(|n| n.id == "1.2"));
+
+        nodes.push(ObjectiveNode {
+            id: "1.2".to_string(),
+            description: "Second node".to_string(),
+            status: NodeStatus::Pending,
+            plan_issue: None,
+            pr_url: None,
+            depends_on: vec![],
+        });
+
+        let new_body = build_objective_body(&obj_body, &nodes);
+        let reparsed = parse_nodes_from_comment(&new_body).unwrap();
+        assert_eq!(reparsed.len(), 2);
+        assert_eq!(reparsed[1].id, "1.2");
+        assert_eq!(reparsed[1].description, "Second node");
+    }
+
+    #[test]
+    fn append_duplicate_id_detected() {
+        let initial = vec![node("1.1", NodeStatus::Pending, &[])];
+        let obj_body = body_with_nodes(&initial);
+        let nodes = parse_nodes_from_comment(&obj_body).unwrap();
+        assert!(nodes.iter().any(|n| n.id == "1.1"));
+    }
+
+    #[test]
+    fn append_unknown_dep_detected() {
+        let initial = vec![node("1.1", NodeStatus::Pending, &[])];
+        let obj_body = body_with_nodes(&initial);
+        let nodes = parse_nodes_from_comment(&obj_body).unwrap();
+        let missing_dep = "9.9";
+        assert!(!nodes.iter().any(|n| n.id == missing_dep));
+    }
+
+    #[test]
+    fn append_parses_comma_separated_depends() {
+        let raw = "1.1 , 1.2 , 1.3";
+        let depends_on: Vec<String> = raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(depends_on, vec!["1.1", "1.2", "1.3"]);
+    }
+
+    #[test]
+    fn append_none_depends_yields_empty_vec() {
+        let depends: Option<&str> = None;
+        let depends_on: Vec<String> = depends
+            .map(|d| {
+                d.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(depends_on.is_empty());
+    }
+
+    #[test]
+    fn append_with_dep_reflects_in_rebuilt_body() {
+        let initial = vec![node("1.1", NodeStatus::Pending, &[])];
+        let obj_body = body_with_nodes(&initial);
+        let mut nodes = parse_nodes_from_comment(&obj_body).unwrap();
+
+        nodes.push(ObjectiveNode {
+            id: "1.2".to_string(),
+            description: "Depends on first".to_string(),
+            status: NodeStatus::Pending,
+            plan_issue: None,
+            pr_url: None,
+            depends_on: vec!["1.1".to_string()],
+        });
+
+        let new_body = build_objective_body(&obj_body, &nodes);
+        let reparsed = parse_nodes_from_comment(&new_body).unwrap();
+        assert_eq!(reparsed[1].depends_on, vec!["1.1"]);
     }
 }

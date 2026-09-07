@@ -99,4 +99,18 @@ pub enum ObjectiveCommands {
         /// Objective issue number
         number: u64,
     },
+    /// Append a new node to an existing objective
+    Append {
+        /// Objective issue number
+        number: u64,
+        /// Node ID (e.g. 1.3)
+        #[arg(long)]
+        id: String,
+        /// Node description
+        #[arg(long)]
+        description: String,
+        /// Comma-separated node IDs this node depends on (e.g. 1.1,1.2)
+        #[arg(long)]
+        depends: Option<String>,
+    },
 }
