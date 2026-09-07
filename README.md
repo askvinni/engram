@@ -225,6 +225,23 @@ When you run `engram plan land <plan>` or `engram plan learn <plan>` on a plan t
 
 ---
 
+## kata integration (optional)
+
+[`kata`](https://kata.kenn.io) is a separate local-first issue ledger. Engram works standalone on GitHub Issues alone — kata is entirely optional. If you also run kata, we recommend mirroring every `engram-plan` and `engram-objective` issue into it, so agents have one searchable ledger across every tool in the kenn.io stack (kata, engram, roborev, kwt) instead of having to check GitHub separately.
+
+Native mirroring (kata issues created/closed automatically by `plan`/`land`/`learn`) is tracked as its own objective and not yet built. Until then, mirror by hand:
+
+```
+kata create "<same title as the GitHub issue>" \
+  --body-file <full-body-file> \
+  --parent <kata ref of the objective, for a plan node> \
+  --idempotency-key "engram-plan-<issue-number>"
+```
+
+**The kata issue body must contain the complete GitHub issue body** — every plan section (Why/Background/Approach/...) or objective section (Goal/Background/Roadmap/...) — prefixed with `GitHub: <issue URL>`. Don't just paste a link: kata is meant to be searched on its own, and a bare link forces a context switch back to GitHub on every hit. Use `--parent`/`--blocked-by` to mirror the same objective/dependency structure the GitHub issues have.
+
+---
+
 ## Claude Code skills
 
 `engram init` installs three skills into `.claude/skills/`. These are invocable as slash commands in Claude Code:
