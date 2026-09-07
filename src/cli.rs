@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
     Human,
@@ -18,6 +19,7 @@ pub struct Cli {
 }
 
 impl Cli {
+    #[allow(dead_code)]
     pub fn output_mode(&self) -> OutputMode {
         if self.agent {
             OutputMode::Agent
