@@ -28,7 +28,7 @@ fn open_db(repo_root: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Rebuild the FTS index from scratch by scanning all memory files.
+#[allow(dead_code)]
 pub fn rebuild_index(repo_root: &Path) -> Result<()> {
     let conn = open_db(repo_root)?;
     let topics = crate::memory::list_all_topics(repo_root).context("listing memory files")?;
@@ -38,12 +38,18 @@ pub fn rebuild_index(repo_root: &Path) -> Result<()> {
 
     for topic in &topics {
         let rel_path = format!(".engram/memory/{}/{}.md", topic.category, topic.slug);
-        insert_row(&conn, &rel_path, &topic.category, &topic.slug, &topic.content)?;
+        insert_row(
+            &conn,
+            &rel_path,
+            &topic.category,
+            &topic.slug,
+            &topic.content,
+        )?;
     }
     Ok(())
 }
 
-/// Insert or replace one file's entry in the FTS index.
+#[allow(dead_code)]
 pub fn upsert_file(
     repo_root: &Path,
     rel_path: &str,
@@ -55,7 +61,7 @@ pub fn upsert_file(
     upsert_row(&conn, rel_path, category, slug, content)
 }
 
-/// Returns true if the index db file exists. Consumed by `engram doctor` (node 4.4).
+#[allow(dead_code)]
 pub fn check_index_health(repo_root: &Path) -> Result<bool> {
     Ok(repo_root.join(DB_RELATIVE).exists())
 }
@@ -81,6 +87,7 @@ fn insert_row(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn upsert_row(
     conn: &Connection,
     path: &str,
@@ -98,8 +105,11 @@ fn upsert_row(
         .context("looking up existing fts_rowid")?;
 
     if let Some(old_rowid) = existing {
-        conn.execute("DELETE FROM memory_fts WHERE rowid = ?1", params![old_rowid])
-            .context("deleting stale fts row")?;
+        conn.execute(
+            "DELETE FROM memory_fts WHERE rowid = ?1",
+            params![old_rowid],
+        )
+        .context("deleting stale fts row")?;
         conn.execute("DELETE FROM file_index WHERE path = ?1", params![path])
             .context("deleting stale file_index row")?;
     }
@@ -170,10 +180,22 @@ mod tests {
         let root = dir.path();
         std::fs::create_dir_all(root.join(".engram/memory")).unwrap();
 
-        upsert_file(root, ".engram/memory/patterns/foo.md", "patterns", "foo", "first content")
-            .unwrap();
-        upsert_file(root, ".engram/memory/patterns/foo.md", "patterns", "foo", "updated content")
-            .unwrap();
+        upsert_file(
+            root,
+            ".engram/memory/patterns/foo.md",
+            "patterns",
+            "foo",
+            "first content",
+        )
+        .unwrap();
+        upsert_file(
+            root,
+            ".engram/memory/patterns/foo.md",
+            "patterns",
+            "foo",
+            "updated content",
+        )
+        .unwrap();
 
         let conn = Connection::open(root.join(".engram/index.db")).unwrap();
         let count: i64 = conn
