@@ -4,6 +4,8 @@ use std::path::Path;
 const ENGRAM_START: &str = "<!-- engram:start -->";
 const ENGRAM_END: &str = "<!-- engram:end -->";
 
+pub const VALID_CATEGORIES: &[&str] = &["patterns", "tripwires", "architecture", "testing"];
+
 pub struct TopicFile {
     pub category: String,
     pub slug: String,
@@ -13,7 +15,7 @@ pub struct TopicFile {
 pub fn list_all_topics(repo_root: &Path) -> Result<Vec<TopicFile>> {
     let memory_dir = repo_root.join(".engram/memory");
     let mut topics = Vec::new();
-    for category in &["patterns", "tripwires", "architecture", "testing"] {
+    for category in VALID_CATEGORIES {
         let cat_dir = memory_dir.join(category);
         if !cat_dir.exists() {
             continue;
@@ -208,7 +210,7 @@ pub fn read_all(repo_root: &Path) -> Result<String> {
     }
 
     let mut all = String::new();
-    for category in &["patterns", "tripwires", "architecture", "testing"] {
+    for category in VALID_CATEGORIES {
         let cat_dir = memory_dir.join(category);
         if !cat_dir.exists() {
             continue;
@@ -309,7 +311,7 @@ pub fn rebuild_index(repo_root: &Path) -> Result<()> {
 
     let mut rows = Vec::new();
 
-    for category in &["patterns", "tripwires", "architecture", "testing"] {
+    for category in VALID_CATEGORIES {
         let cat_dir = memory_dir.join(category);
         if !cat_dir.exists() {
             continue;
@@ -356,6 +358,37 @@ pub fn rebuild_index(repo_root: &Path) -> Result<()> {
 
     std::fs::write(memory_dir.join("index.md"), content)?;
     Ok(())
+}
+
+/// Write a memory file directly from body text, without an issue or PR.
+/// Returns the repo-relative path of the created file.
+pub fn write_direct(repo_root: &Path, category: &str, body: &str) -> Result<String> {
+    if !VALID_CATEGORIES.contains(&category) {
+        anyhow::bail!(
+            "unknown category {:?}; valid: {}",
+            category,
+            VALID_CATEGORIES.join(", ")
+        );
+    }
+
+    let today = today_iso();
+    let base_slug = format!("agent-note-{}", today.replace('-', ""));
+    let cat_dir = repo_root.join(format!(".engram/memory/{category}"));
+    std::fs::create_dir_all(&cat_dir)?;
+
+    let mut slug = base_slug.clone();
+    let mut counter = 1u32;
+    while cat_dir.join(format!("{slug}.md")).exists() {
+        slug = format!("{base_slug}-{counter}");
+        counter += 1;
+    }
+
+    let content = format!(
+        "---\ntitle: \"\"\nread_when:\ntripwires: []\nlast_updated: \"{today}\"\nsource_issues: []\n---\n\n{body}\n"
+    );
+    std::fs::write(cat_dir.join(format!("{slug}.md")), &content)?;
+
+    Ok(format!(".engram/memory/{category}/{slug}.md"))
 }
 
 pub fn write_claude_md_section(repo_root: &Path) -> Result<()> {
@@ -676,5 +709,32 @@ mod tests {
 
         let index = std::fs::read_to_string(root.join(".engram/memory/index.md")).unwrap();
         assert!(index.contains("No learnings yet"));
+    }
+
+    #[test]
+    fn write_direct_creates_file_in_category() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let rel_path = write_direct(root, "tripwires", "Observed race in X.").unwrap();
+        let content = std::fs::read_to_string(root.join(&rel_path)).unwrap();
+        assert!(content.contains("Observed race in X."));
+        assert!(rel_path.starts_with(".engram/memory/tripwires/"));
+    }
+
+    #[test]
+    fn write_direct_rejects_unknown_category() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = write_direct(dir.path(), "foobar", "body").unwrap_err();
+        assert!(err.to_string().contains("unknown category"));
+        assert!(err.to_string().contains("patterns"));
+    }
+
+    #[test]
+    fn write_direct_collision_uses_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p1 = write_direct(root, "patterns", "first").unwrap();
+        let p2 = write_direct(root, "patterns", "second").unwrap();
+        assert_ne!(p1, p2);
     }
 }

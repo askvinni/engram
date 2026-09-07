@@ -20,12 +20,14 @@ static ISSUE_TEMPLATES_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/.github/ISSU
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let output_mode = cli.output_mode();
     match cli.command {
         Commands::Init => cmd_init(),
         Commands::Plan { subcommand } => cmd_plan(subcommand),
         Commands::Doctor => cmd_doctor(),
         Commands::Compact => cmd_compact(),
         Commands::Objective { subcommand } => cmd_objective(subcommand),
+        Commands::Write { category, body } => cmd_write(&category, &body, output_mode),
     }
 }
 
@@ -109,6 +111,24 @@ fn cmd_plan(subcmd: cli::PlanCommands) -> Result<()> {
 fn cmd_compact() -> Result<()> {
     let repo_root = config::find_repo_root()?;
     compact::run(&repo_root)
+}
+
+fn cmd_write(category: &str, body: &str, output_mode: cli::OutputMode) -> Result<()> {
+    use cli::OutputMode;
+    let repo_root = config::find_repo_root()?;
+    let rel_path = memory::write_direct(&repo_root, category, body)?;
+    let content = std::fs::read_to_string(repo_root.join(&rel_path))?;
+    let slug = std::path::Path::new(&rel_path)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    index::upsert_file(&repo_root, &rel_path, category, &slug, &content)?;
+    match output_mode {
+        OutputMode::Agent => println!("OK write path={rel_path}"),
+        OutputMode::Human => println!("Wrote {rel_path}"),
+    }
+    Ok(())
 }
 
 const PROMPT_HOOKS_README: &str = r#"# Prompt Hooks

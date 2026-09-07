@@ -45,6 +45,14 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: ObjectiveCommands,
     },
+    /// Write a memory file directly from stdin/args without a plan or PR cycle
+    Write {
+        /// Category: patterns, tripwires, architecture, or testing
+        category: String,
+        /// Memory file body text
+        #[arg(long)]
+        body: String,
+    },
 }
 
 #[derive(Subcommand)]
