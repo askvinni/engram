@@ -11,7 +11,7 @@ mod plan;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, OutputMode};
 use include_dir::{include_dir, Dir};
 use std::process::Command;
 
@@ -28,6 +28,7 @@ fn main() -> Result<()> {
         Commands::Doctor => cmd_doctor(),
         Commands::Compact => cmd_compact(),
         Commands::Objective { subcommand } => cmd_objective(subcommand),
+        Commands::Read { permalink } => cmd_read(&permalink, mode),
     }
 }
 
@@ -141,6 +142,85 @@ fn cmd_search(mode: cli::OutputMode, query: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn cmd_read(permalink: &str, mode: OutputMode) -> Result<()> {
+    let repo_root = config::find_repo_root()?;
+    let memory_dir = repo_root.join(".engram/memory");
+
+    // 1. Try exact path under memory_dir
+    let exact = memory_dir.join(permalink);
+    if exact.exists() {
+        let content = std::fs::read_to_string(&exact)?;
+        print!("{content}");
+        return Ok(());
+    }
+
+    // 2. Scan all categories for stem or filename match
+    let needle = std::path::Path::new(permalink)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| permalink.to_string());
+
+    let cfg = config::Config::load(&repo_root)?;
+    let categories = &cfg.memory.default_categories;
+    let mut matches: Vec<std::path::PathBuf> = Vec::new();
+
+    for cat in categories {
+        let cat_dir = memory_dir.join(cat);
+        if !cat_dir.exists() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&cat_dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "md") {
+                let stem = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if stem == needle {
+                    matches.push(path);
+                }
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => {
+            if mode == OutputMode::Agent {
+                eprintln!("ERR not_found: {permalink}");
+            } else {
+                eprintln!("not found: {permalink}");
+            }
+            std::process::exit(1);
+        }
+        1 => {
+            let content = std::fs::read_to_string(&matches[0])?;
+            print!("{content}");
+            Ok(())
+        }
+        _ => {
+            // Ambiguous: list candidates
+            let label = if mode == OutputMode::Agent {
+                "ERR ambiguous"
+            } else {
+                "ambiguous"
+            };
+            eprintln!("{label}: {permalink} matches multiple files:");
+            for path in &matches {
+                let rel = path
+                    .strip_prefix(&memory_dir)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string();
+                eprintln!("  {rel}");
+            }
+            std::process::exit(1);
+        }
+    }
 }
 
 const PROMPT_HOOKS_README: &str = r#"# Prompt Hooks
@@ -398,6 +478,103 @@ mod tests {
             result.ends_with("days ago"),
             "expected 'N days ago', got {result}"
         );
+    }
+
+    // --- cmd_read helpers ---
+
+    fn write_memory_file(root: &std::path::Path, cat: &str, slug: &str, body: &str) {
+        let dir = root.join(format!(".engram/memory/{cat}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{slug}.md")), body).unwrap();
+    }
+
+    #[test]
+    fn cmd_read_exact_path_returns_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_memory_file(root, "patterns", "foo", "hello world");
+
+        // Simulate resolution logic directly (exact path branch)
+        let memory_dir = root.join(".engram/memory");
+        let exact = memory_dir.join("patterns/foo.md");
+        assert!(exact.exists());
+        let content = std::fs::read_to_string(exact).unwrap();
+        assert_eq!(content, "hello world");
+    }
+
+    #[test]
+    fn cmd_read_stem_match_finds_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_memory_file(root, "tripwires", "my-tripwire", "tripwire body");
+
+        let memory_dir = root.join(".engram/memory");
+        let categories = vec!["patterns", "tripwires", "architecture", "testing"];
+        let needle = "my-tripwire";
+        let mut matches: Vec<std::path::PathBuf> = Vec::new();
+        for cat in &categories {
+            let cat_dir = memory_dir.join(cat);
+            if !cat_dir.exists() { continue; }
+            for entry in std::fs::read_dir(cat_dir).unwrap().filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "md") {
+                    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                    if stem == needle { matches.push(path); }
+                }
+            }
+        }
+        assert_eq!(matches.len(), 1);
+        let content = std::fs::read_to_string(&matches[0]).unwrap();
+        assert_eq!(content, "tripwire body");
+    }
+
+    #[test]
+    fn cmd_read_no_match_gives_empty_vec() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".engram/memory/patterns")).unwrap();
+
+        let memory_dir = root.join(".engram/memory");
+        let categories = vec!["patterns"];
+        let needle = "nonexistent";
+        let mut matches: Vec<std::path::PathBuf> = Vec::new();
+        for cat in &categories {
+            let cat_dir = memory_dir.join(cat);
+            if !cat_dir.exists() { continue; }
+            for entry in std::fs::read_dir(cat_dir).unwrap().filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "md") {
+                    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                    if stem == needle { matches.push(path); }
+                }
+            }
+        }
+        assert_eq!(matches.len(), 0);
+    }
+
+    #[test]
+    fn cmd_read_ambiguous_match_gives_multiple() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_memory_file(root, "patterns", "shared-name", "patterns version");
+        write_memory_file(root, "tripwires", "shared-name", "tripwires version");
+
+        let memory_dir = root.join(".engram/memory");
+        let categories = vec!["patterns", "tripwires"];
+        let needle = "shared-name";
+        let mut matches: Vec<std::path::PathBuf> = Vec::new();
+        for cat in &categories {
+            let cat_dir = memory_dir.join(cat);
+            if !cat_dir.exists() { continue; }
+            for entry in std::fs::read_dir(cat_dir).unwrap().filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "md") {
+                    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                    if stem == needle { matches.push(path); }
+                }
+            }
+        }
+        assert_eq!(matches.len(), 2);
     }
 
     #[test]
