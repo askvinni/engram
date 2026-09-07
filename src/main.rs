@@ -222,6 +222,12 @@ fn cmd_objective(subcmd: cli::ObjectiveCommands) -> Result<()> {
             body.as_deref(),
         ),
         cli::ObjectiveCommands::Land { number } => objective::land(&repo_root, &repo, number),
+        cli::ObjectiveCommands::Append {
+            number,
+            id,
+            description,
+            depends,
+        } => objective::append(&repo, number, &id, &description, depends.as_deref()),
     }
 }
 
