@@ -77,6 +77,43 @@ pub fn check_index_health(repo_root: &Path) -> Result<bool> {
     Ok(repo_root.join(DB_RELATIVE).exists())
 }
 
+#[derive(Debug)]
+pub struct SearchResult {
+    pub path: String,
+    pub category: String,
+    pub snippet: String,
+}
+
+/// Query the FTS index, ranked by bm25. Rebuilds the index on demand if missing.
+pub fn search(repo_root: &Path, query: &str) -> Result<Vec<SearchResult>> {
+    if !repo_root.join(DB_RELATIVE).exists() {
+        rebuild_index(repo_root)?;
+    }
+    let conn = open_db(repo_root)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT path, category, content, bm25(memory_fts) AS rank
+             FROM memory_fts
+             WHERE memory_fts MATCH ?1
+             ORDER BY rank",
+        )
+        .context("preparing search query")?;
+    let results = stmt
+        .query_map(params![query], |row| {
+            let content: String = row.get(2)?;
+            let snippet: String = content.chars().take(120).collect();
+            Ok(SearchResult {
+                path: row.get(0)?,
+                category: row.get(1)?,
+                snippet,
+            })
+        })
+        .context("executing search query")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("collecting search results")?;
+    Ok(results)
+}
+
 fn insert_row(
     conn: &Connection,
     path: &str,
@@ -201,5 +238,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, "updated");
+    }
+
+    #[test]
+    fn search_returns_matching_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let full = LearningItem {
+            category: "patterns".to_string(),
+            slug: "race-condition".to_string(),
+            title: "race-condition title".to_string(),
+            read_when: vec!["when testing".to_string()],
+            tripwires: vec![],
+            body: "A race condition occurs when two threads access shared state concurrently."
+                .to_string(),
+        };
+        write_topic_file(root, &full, 1).unwrap();
+        rebuild_index(root).unwrap();
+
+        let results = search(root, "race condition").unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].path.contains("race-condition"));
+        assert_eq!(results[0].category, "patterns");
+    }
+
+    #[test]
+    fn search_empty_result_returns_empty_vec() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".engram/memory")).unwrap();
+        rebuild_index(root).unwrap();
+
+        let results = search(root, "zzzyyyxxx").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_rebuilds_index_on_demand_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_topic_file(root, &make_item("patterns", "foo"), 1).unwrap();
+
+        // No rebuild_index call — index doesn't exist yet
+        assert!(!root.join(".engram/index.db").exists());
+        let results = search(root, "foo title").unwrap();
+        // Index was created on demand
+        assert!(root.join(".engram/index.db").exists());
+        assert_eq!(results.len(), 1);
     }
 }

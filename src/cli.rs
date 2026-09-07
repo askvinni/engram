@@ -38,6 +38,11 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: PlanCommands,
     },
+    /// Search memory files using full-text search
+    Search {
+        /// Query string (FTS5 syntax supported)
+        query: String,
+    },
     /// Check that all engram dependencies are installed and configured
     Doctor,
     /// Prune and merge memory files that don't meet the future-looking standard
