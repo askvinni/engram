@@ -28,6 +28,7 @@ fn main() -> Result<()> {
         Commands::Compact => cmd_compact(),
         Commands::Objective { subcommand } => cmd_objective(subcommand),
         Commands::Search { query } => cmd_search(mode, &query),
+        Commands::Read { identifier } => cmd_read(&identifier, mode),
     }
 }
 
@@ -320,6 +321,91 @@ fn infer_repo(repo_root: &std::path::Path) -> Option<String> {
     }
 }
 
+fn cmd_read(identifier: &str, mode: cli::OutputMode) -> Result<()> {
+    use cli::OutputMode;
+    let repo_root = config::find_repo_root()?;
+    let memory_dir = repo_root.join(".engram/memory");
+
+    let matches = resolve_memory_path(&memory_dir, identifier)?;
+
+    match matches.len() {
+        0 => {
+            match mode {
+                OutputMode::Agent => eprintln!("not_found {identifier}"),
+                OutputMode::Human => eprintln!("No memory file found for: {identifier}"),
+            }
+            std::process::exit(1);
+        }
+        1 => {
+            let content = std::fs::read_to_string(&matches[0])?;
+            print!("{content}");
+            Ok(())
+        }
+        _ => {
+            match mode {
+                OutputMode::Agent => {
+                    eprintln!("ambiguous {identifier}");
+                    for path in &matches {
+                        if let Ok(rel) = path.strip_prefix(&memory_dir) {
+                            eprintln!("  candidate {}", rel.display());
+                        }
+                    }
+                }
+                OutputMode::Human => {
+                    eprintln!("Ambiguous '{identifier}' — matches multiple files:");
+                    for path in &matches {
+                        if let Ok(rel) = path.strip_prefix(&memory_dir) {
+                            eprintln!("  {}", rel.display());
+                        }
+                    }
+                }
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
+fn resolve_memory_path(
+    memory_dir: &std::path::Path,
+    identifier: &str,
+) -> Result<Vec<std::path::PathBuf>> {
+    // Strategy 1: exact path — category/slug or category/slug.md
+    let exact = if identifier.ends_with(".md") {
+        memory_dir.join(identifier)
+    } else {
+        memory_dir.join(format!("{identifier}.md"))
+    };
+    if exact.exists() {
+        return Ok(vec![exact]);
+    }
+
+    // Strategy 2: scan all categories for a matching filename stem
+    let stem = std::path::Path::new(identifier)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| identifier.to_string());
+
+    let mut found = Vec::new();
+    for cat in &["patterns", "tripwires", "architecture", "testing"] {
+        let cat_dir = memory_dir.join(cat);
+        if !cat_dir.exists() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&cat_dir)?.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "md") {
+                if path
+                    .file_stem()
+                    .is_some_and(|s| s.to_string_lossy() == stem)
+                {
+                    found.push(path);
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
 pub(crate) fn days_ago(iso: &str) -> String {
     let date_part = iso.split('T').next().unwrap_or(iso);
     let parts: Vec<u32> = date_part
@@ -442,5 +528,61 @@ mod tests {
         )
         .unwrap();
         assert!(!skills_current(root));
+    }
+
+    // --- resolve_memory_path ---
+
+    fn write_memory_file(root: &std::path::Path, category: &str, slug: &str, body: &str) {
+        let dir = root.join(category);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{slug}.md")), body).unwrap();
+    }
+
+    #[test]
+    fn resolve_exact_path_with_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = dir.path();
+        write_memory_file(mem, "patterns", "foo", "content");
+        let result = resolve_memory_path(mem, "patterns/foo.md").unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].ends_with("patterns/foo.md"));
+    }
+
+    #[test]
+    fn resolve_exact_path_without_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = dir.path();
+        write_memory_file(mem, "patterns", "bar", "content");
+        let result = resolve_memory_path(mem, "patterns/bar").unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].ends_with("patterns/bar.md"));
+    }
+
+    #[test]
+    fn resolve_by_stem_finds_across_categories() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = dir.path();
+        write_memory_file(mem, "tripwires", "my-topic", "content");
+        let result = resolve_memory_path(mem, "my-topic").unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].ends_with("my-topic.md"));
+    }
+
+    #[test]
+    fn resolve_ambiguous_returns_multiple() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = dir.path();
+        write_memory_file(mem, "patterns", "dupe", "a");
+        write_memory_file(mem, "tripwires", "dupe", "b");
+        let result = resolve_memory_path(mem, "dupe").unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn resolve_not_found_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = dir.path();
+        let result = resolve_memory_path(mem, "nonexistent").unwrap();
+        assert!(result.is_empty());
     }
 }

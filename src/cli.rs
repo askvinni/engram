@@ -50,6 +50,11 @@ pub enum Commands {
         /// Search query
         query: String,
     },
+    /// Fetch a memory file by path or tag
+    Read {
+        /// Memory path (category/slug.md or category/slug) or bare filename stem
+        identifier: String,
+    },
 }
 
 #[derive(Subcommand)]
