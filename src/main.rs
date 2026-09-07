@@ -13,7 +13,24 @@ use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, Commands, OutputMode};
 use include_dir::{include_dir, Dir};
+use serde::Serialize;
 use std::process::Command;
+
+/// JSON schema for `engram search --json`
+#[derive(Serialize)]
+struct SearchResultJson {
+    path: String,
+    category: String,
+    snippet: String,
+}
+
+/// JSON schema for `engram read --json`
+#[derive(Serialize)]
+struct ReadResultJson {
+    path: String,
+    content: String,
+}
+
 
 static SKILLS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/.claude/skills");
 static ISSUE_TEMPLATES_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/.github/ISSUE_TEMPLATE");
@@ -118,14 +135,18 @@ fn cmd_search(mode: cli::OutputMode, query: &str) -> Result<()> {
     use cli::OutputMode;
     let repo_root = config::find_repo_root()?;
     let results = index::search(&repo_root, query)?;
-    if results.is_empty() {
-        match mode {
-            OutputMode::Agent => println!("OK search count=0"),
-            OutputMode::Human => println!("No results for {:?}", query),
-        }
-        return Ok(());
-    }
     match mode {
+        OutputMode::Json => {
+            let out: Vec<SearchResultJson> = results
+                .iter()
+                .map(|r| SearchResultJson {
+                    path: r.path.clone(),
+                    category: r.category.clone(),
+                    snippet: r.snippet.clone(),
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
         OutputMode::Agent => {
             println!("OK search count={}", results.len());
             for r in &results {
@@ -136,8 +157,12 @@ fn cmd_search(mode: cli::OutputMode, query: &str) -> Result<()> {
             }
         }
         OutputMode::Human => {
-            for r in &results {
-                println!("{} ({})\n  {}\n", r.path, r.category, r.snippet);
+            if results.is_empty() {
+                println!("No results for {:?}", query);
+            } else {
+                for r in &results {
+                    println!("{} ({})\n  {}\n", r.path, r.category, r.snippet);
+                }
             }
         }
     }
@@ -197,33 +222,56 @@ fn cmd_read(permalink: &str, mode: OutputMode) -> Result<()> {
 
     match matches.len() {
         0 => {
-            if mode == OutputMode::Agent {
-                eprintln!("ERR not_found: {permalink}");
-            } else {
-                eprintln!("not found: {permalink}");
+            match mode {
+                OutputMode::Json => eprintln!("{{\"error\":\"not_found\",\"id\":\"{permalink}\"}}"),
+                OutputMode::Agent => eprintln!("ERR not_found: {permalink}"),
+                OutputMode::Human => eprintln!("not found: {permalink}"),
             }
             std::process::exit(1);
         }
         1 => {
+            let rel = matches[0].strip_prefix(&memory_dir).unwrap_or(&matches[0]);
             let content = std::fs::read_to_string(&matches[0])?;
-            print!("{content}");
+            if mode == OutputMode::Json {
+                let out = ReadResultJson {
+                    path: rel.display().to_string(),
+                    content,
+                };
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                print!("{content}");
+            }
             Ok(())
         }
         _ => {
-            // Ambiguous: list candidates
-            let label = if mode == OutputMode::Agent {
-                "ERR ambiguous"
-            } else {
-                "ambiguous"
-            };
-            eprintln!("{label}: {permalink} matches multiple files:");
-            for path in &matches {
-                let rel = path
-                    .strip_prefix(&memory_dir)
-                    .unwrap_or(path)
-                    .display()
-                    .to_string();
-                eprintln!("  {rel}");
+            let candidates: Vec<String> = matches
+                .iter()
+                .map(|p| {
+                    p.strip_prefix(&memory_dir)
+                        .unwrap_or(p)
+                        .display()
+                        .to_string()
+                })
+                .collect();
+            match mode {
+                OutputMode::Json => {
+                    eprintln!(
+                        "{{\"error\":\"ambiguous\",\"id\":\"{permalink}\",\"candidates\":{}}}",
+                        serde_json::to_string(&candidates)?
+                    );
+                }
+                OutputMode::Agent => {
+                    eprintln!("ERR ambiguous: {permalink} matches multiple files:");
+                    for c in &candidates {
+                        eprintln!("  {c}");
+                    }
+                }
+                OutputMode::Human => {
+                    eprintln!("ambiguous: {permalink} matches multiple files:");
+                    for c in &candidates {
+                        eprintln!("  {c}");
+                    }
+                }
             }
             std::process::exit(1);
         }
