@@ -20,12 +20,14 @@ static ISSUE_TEMPLATES_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/.github/ISSU
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let mode = cli.output_mode();
     match cli.command {
         Commands::Init => cmd_init(),
         Commands::Plan { subcommand } => cmd_plan(subcommand),
         Commands::Doctor => cmd_doctor(),
         Commands::Compact => cmd_compact(),
         Commands::Objective { subcommand } => cmd_objective(subcommand),
+        Commands::Search { query } => cmd_search(mode, &query),
     }
 }
 
@@ -197,6 +199,32 @@ fn cmd_doctor() -> Result<()> {
 
     if !all_ok {
         anyhow::bail!("one or more checks failed");
+    }
+    Ok(())
+}
+
+fn cmd_search(mode: cli::OutputMode, query: &str) -> Result<()> {
+    use anyhow::Context;
+    let repo_root = config::find_repo_root()?;
+    let results = index::search(&repo_root, query).context("searching memory index")?;
+    if results.is_empty() {
+        match mode {
+            cli::OutputMode::Agent => println!("OK search count=0"),
+            cli::OutputMode::Human => println!("No results found for {:?}", query),
+        }
+        return Ok(());
+    }
+    match mode {
+        cli::OutputMode::Agent => {
+            for r in &results {
+                println!("result path={} category={} snippet={}", r.path, r.category, r.snippet);
+            }
+        }
+        cli::OutputMode::Human => {
+            for (i, r) in results.iter().enumerate() {
+                println!("{}. {} [{}]\n   {}", i + 1, r.path, r.category, r.snippet);
+            }
+        }
     }
     Ok(())
 }
