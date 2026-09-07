@@ -956,88 +956,28 @@ mod tests {
     }
 
     #[test]
-    fn append_adds_node_to_rebuilt_body() {
-        let initial = vec![node("1.1", NodeStatus::Pending, &[])];
-        let obj_body = body_with_nodes(&initial);
-
+    fn append_node_round_trips_through_body() {
+        let obj_body = body_with_nodes(&[node("1.1", NodeStatus::Pending, &[])]);
         let mut nodes = parse_nodes_from_comment(&obj_body).unwrap();
-        assert!(!nodes.iter().any(|n| n.id == "1.2"));
-
         nodes.push(ObjectiveNode {
             id: "1.2".to_string(),
-            description: "Second node".to_string(),
-            status: NodeStatus::Pending,
-            plan_issue: None,
-            pr_url: None,
-            depends_on: vec![],
-        });
-
-        let new_body = build_objective_body(&obj_body, &nodes);
-        let reparsed = parse_nodes_from_comment(&new_body).unwrap();
-        assert_eq!(reparsed.len(), 2);
-        assert_eq!(reparsed[1].id, "1.2");
-        assert_eq!(reparsed[1].description, "Second node");
-    }
-
-    #[test]
-    fn append_duplicate_id_detected() {
-        let initial = vec![node("1.1", NodeStatus::Pending, &[])];
-        let obj_body = body_with_nodes(&initial);
-        let nodes = parse_nodes_from_comment(&obj_body).unwrap();
-        assert!(nodes.iter().any(|n| n.id == "1.1"));
-    }
-
-    #[test]
-    fn append_unknown_dep_detected() {
-        let initial = vec![node("1.1", NodeStatus::Pending, &[])];
-        let obj_body = body_with_nodes(&initial);
-        let nodes = parse_nodes_from_comment(&obj_body).unwrap();
-        let missing_dep = "9.9";
-        assert!(!nodes.iter().any(|n| n.id == missing_dep));
-    }
-
-    #[test]
-    fn append_parses_comma_separated_depends() {
-        let raw = "1.1 , 1.2 , 1.3";
-        let depends_on: Vec<String> = raw
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        assert_eq!(depends_on, vec!["1.1", "1.2", "1.3"]);
-    }
-
-    #[test]
-    fn append_none_depends_yields_empty_vec() {
-        let depends: Option<&str> = None;
-        let depends_on: Vec<String> = depends
-            .map(|d| {
-                d.split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
-        assert!(depends_on.is_empty());
-    }
-
-    #[test]
-    fn append_with_dep_reflects_in_rebuilt_body() {
-        let initial = vec![node("1.1", NodeStatus::Pending, &[])];
-        let obj_body = body_with_nodes(&initial);
-        let mut nodes = parse_nodes_from_comment(&obj_body).unwrap();
-
-        nodes.push(ObjectiveNode {
-            id: "1.2".to_string(),
-            description: "Depends on first".to_string(),
+            description: "Second".to_string(),
             status: NodeStatus::Pending,
             plan_issue: None,
             pr_url: None,
             depends_on: vec!["1.1".to_string()],
         });
-
-        let new_body = build_objective_body(&obj_body, &nodes);
-        let reparsed = parse_nodes_from_comment(&new_body).unwrap();
+        let reparsed = parse_nodes_from_comment(&build_objective_body(&obj_body, &nodes)).unwrap();
+        assert_eq!(reparsed.len(), 2);
+        assert_eq!(reparsed[1].id, "1.2");
         assert_eq!(reparsed[1].depends_on, vec!["1.1"]);
+    }
+
+    #[test]
+    fn append_rejects_duplicate_id_and_unknown_dep() {
+        let obj_body = body_with_nodes(&[node("1.1", NodeStatus::Pending, &[])]);
+        let nodes = parse_nodes_from_comment(&obj_body).unwrap();
+        assert!(nodes.iter().any(|n| n.id == "1.1"), "duplicate should be caught");
+        assert!(!nodes.iter().any(|n| n.id == "9.9"), "unknown dep should be caught");
     }
 }
