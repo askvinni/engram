@@ -128,7 +128,10 @@ fn cmd_search(mode: cli::OutputMode, query: &str) -> Result<()> {
         OutputMode::Agent => {
             println!("OK search count={}", results.len());
             for r in &results {
-                println!("- path={} category={} snippet={}", r.path, r.category, r.snippet);
+                println!(
+                    "- path={} category={} snippet={}",
+                    r.path, r.category, r.snippet
+                );
             }
         }
         OutputMode::Human => {
