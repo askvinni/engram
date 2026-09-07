@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct SearchResult {
     pub path: String,
     pub category: String,

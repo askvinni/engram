@@ -13,7 +13,25 @@ use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, Commands};
 use include_dir::{include_dir, Dir};
+use serde::Serialize;
 use std::process::Command;
+
+#[derive(Debug, Serialize)]
+struct SearchOutput<'a> {
+    results: &'a [index::SearchResult],
+}
+
+#[derive(Debug, Serialize)]
+struct ReadOutput {
+    path: String,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WriteOutput {
+    path: String,
+    category: String,
+}
 
 static SKILLS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/.claude/skills");
 static ISSUE_TEMPLATES_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/.github/ISSUE_TEMPLATE");
@@ -127,6 +145,15 @@ fn cmd_write(category: &str, body: &str, mode: cli::OutputMode) -> Result<()> {
         .to_string();
     index::upsert_file(&repo_root, &rel_path, category, &slug, &content)?;
     match mode {
+        OutputMode::Json => {
+            println!(
+                "{}",
+                serde_json::to_string(&WriteOutput {
+                    path: rel_path,
+                    category: category.to_string(),
+                })?
+            );
+        }
         OutputMode::Agent => println!("OK write path={rel_path}"),
         OutputMode::Human => println!("Wrote {rel_path}"),
     }
@@ -225,24 +252,29 @@ fn cmd_doctor() -> Result<()> {
 
 fn cmd_search(mode: cli::OutputMode, query: &str) -> Result<()> {
     use anyhow::Context;
+    use cli::OutputMode;
     let repo_root = config::find_repo_root()?;
     let results = index::search(&repo_root, query).context("searching memory index")?;
-    if results.is_empty() {
-        match mode {
-            cli::OutputMode::Agent => println!("OK search count=0"),
-            cli::OutputMode::Human => println!("No results found for {:?}", query),
-        }
-        return Ok(());
-    }
     match mode {
-        cli::OutputMode::Agent => {
-            for r in &results {
-                println!("result path={} category={} snippet={}", r.path, r.category, r.snippet);
+        OutputMode::Json => {
+            println!("{}", serde_json::to_string(&SearchOutput { results: &results })?);
+        }
+        OutputMode::Agent => {
+            if results.is_empty() {
+                println!("OK search count=0");
+            } else {
+                for r in &results {
+                    println!("result path={} category={} snippet={}", r.path, r.category, r.snippet);
+                }
             }
         }
-        cli::OutputMode::Human => {
-            for (i, r) in results.iter().enumerate() {
-                println!("{}. {} [{}]\n   {}", i + 1, r.path, r.category, r.snippet);
+        OutputMode::Human => {
+            if results.is_empty() {
+                println!("No results found for {:?}", query);
+            } else {
+                for (i, r) in results.iter().enumerate() {
+                    println!("{}. {} [{}]\n   {}", i + 1, r.path, r.category, r.snippet);
+                }
             }
         }
     }
@@ -350,18 +382,41 @@ fn cmd_read(identifier: &str, mode: cli::OutputMode) -> Result<()> {
     match matches.len() {
         0 => {
             match mode {
+                OutputMode::Json => {
+                    eprintln!("{}", serde_json::json!({"error": "not_found", "identifier": identifier}));
+                }
                 OutputMode::Agent => eprintln!("not_found {identifier}"),
                 OutputMode::Human => eprintln!("No memory file found for: {identifier}"),
             }
             std::process::exit(1);
         }
         1 => {
+            let path = matches[0]
+                .strip_prefix(&memory_dir)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| matches[0].display().to_string());
             let content = std::fs::read_to_string(&matches[0])?;
-            print!("{content}");
+            match mode {
+                OutputMode::Json => {
+                    println!("{}", serde_json::to_string(&ReadOutput { path, content })?);
+                }
+                OutputMode::Agent | OutputMode::Human => print!("{content}"),
+            }
             Ok(())
         }
         _ => {
             match mode {
+                OutputMode::Json => {
+                    let candidates: Vec<String> = matches
+                        .iter()
+                        .filter_map(|p| p.strip_prefix(&memory_dir).ok())
+                        .map(|p| p.display().to_string())
+                        .collect();
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"error": "ambiguous", "identifier": identifier, "candidates": candidates})
+                    );
+                }
                 OutputMode::Agent => {
                     eprintln!("ambiguous {identifier}");
                     for path in &matches {
