@@ -514,12 +514,19 @@ mod tests {
         let mut matches: Vec<std::path::PathBuf> = Vec::new();
         for cat in &categories {
             let cat_dir = memory_dir.join(cat);
-            if !cat_dir.exists() { continue; }
+            if !cat_dir.exists() {
+                continue;
+            }
             for entry in std::fs::read_dir(cat_dir).unwrap().filter_map(|e| e.ok()) {
                 let path = entry.path();
                 if path.extension().is_some_and(|e| e == "md") {
-                    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                    if stem == needle { matches.push(path); }
+                    let stem = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if stem == needle {
+                        matches.push(path);
+                    }
                 }
             }
         }
@@ -540,12 +547,19 @@ mod tests {
         let mut matches: Vec<std::path::PathBuf> = Vec::new();
         for cat in &categories {
             let cat_dir = memory_dir.join(cat);
-            if !cat_dir.exists() { continue; }
+            if !cat_dir.exists() {
+                continue;
+            }
             for entry in std::fs::read_dir(cat_dir).unwrap().filter_map(|e| e.ok()) {
                 let path = entry.path();
                 if path.extension().is_some_and(|e| e == "md") {
-                    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                    if stem == needle { matches.push(path); }
+                    let stem = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if stem == needle {
+                        matches.push(path);
+                    }
                 }
             }
         }
@@ -565,12 +579,19 @@ mod tests {
         let mut matches: Vec<std::path::PathBuf> = Vec::new();
         for cat in &categories {
             let cat_dir = memory_dir.join(cat);
-            if !cat_dir.exists() { continue; }
+            if !cat_dir.exists() {
+                continue;
+            }
             for entry in std::fs::read_dir(cat_dir).unwrap().filter_map(|e| e.ok()) {
                 let path = entry.path();
                 if path.extension().is_some_and(|e| e == "md") {
-                    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                    if stem == needle { matches.push(path); }
+                    let stem = path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if stem == needle {
+                        matches.push(path);
+                    }
                 }
             }
         }
