@@ -3,6 +3,7 @@ mod cli;
 mod compact;
 mod config;
 mod github;
+mod index;
 mod learn;
 mod memory;
 mod objective;
