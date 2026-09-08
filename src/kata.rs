@@ -1,10 +1,12 @@
 use std::process::Command;
 use std::sync::OnceLock;
 
+#[allow(dead_code)]
 static KATA_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
 /// Returns true iff `kata` is on PATH and the current repo has a `.kata.toml` binding.
 /// The result is cached for the lifetime of the process.
+#[allow(dead_code)]
 pub fn kata_available() -> bool {
     *KATA_AVAILABLE.get_or_init(detect)
 }
