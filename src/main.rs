@@ -4,6 +4,7 @@ mod compact;
 mod config;
 mod github;
 mod index;
+mod kata;
 mod learn;
 mod memory;
 mod objective;
