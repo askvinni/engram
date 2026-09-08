@@ -4,27 +4,30 @@ use std::path::Path;
 
 const DB_RELATIVE: &str = ".engram/index.db";
 
+const MIGRATIONS: &[&str] = &[include_str!("../migrations/001_initial_schema.sql")];
+
+fn run_migrations(conn: &Connection) -> Result<()> {
+    let version: usize = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .context("reading schema version")?;
+    for (i, sql) in MIGRATIONS.iter().enumerate().skip(version) {
+        conn.execute_batch(sql)
+            .with_context(|| format!("applying migration {}", i + 1))?;
+        conn.execute_batch(&format!("PRAGMA user_version = {}", i + 1))
+            .with_context(|| format!("bumping schema version to {}", i + 1))?;
+    }
+    Ok(())
+}
+
 fn open_db(repo_root: &Path) -> Result<Connection> {
     let db_path = repo_root.join(DB_RELATIVE);
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).context("creating .engram dir")?;
     }
     let conn = Connection::open(&db_path).context("opening index.db")?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         CREATE TABLE IF NOT EXISTS file_index (
-             path     TEXT PRIMARY KEY,
-             fts_rowid INTEGER NOT NULL
-         );
-         CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
-             path     UNINDEXED,
-             category UNINDEXED,
-             slug     UNINDEXED,
-             content,
-             tokenize='unicode61'
-         );",
-    )
-    .context("initializing schema")?;
+    conn.execute_batch("PRAGMA journal_mode=WAL;")
+        .context("setting WAL mode")?;
+    run_migrations(&conn)?;
     Ok(conn)
 }
 
