@@ -10,4 +10,4 @@ last_updated: "2026-09-08"
 source_issues: [96]
 ---
 
-cmd_read establishes the canonical three-branch contract for any engram command that resolves a user-typed identifier to a file: 0 matches exits non-zero with a one-line 'not found' message (prefixed ERR in --agent mode); 1 match prints content and exits 0; 2+ matches prints all candidate paths relative to the memory root and exits non-zero. The N>1 path is especially important in --agent mode — a silent pick would cause the calling agent to act on an arbitrary file with no indication something was wrong, and interactive prompting is impossible in non-interactive contexts. Any future resolver subcommand (resolve-by-tag, read-by-title, etc.) must follow the same three-branch shape. See src/main.rs:cmd_read for the reference implementation.
+See src/main.rs:cmd_read for the reference implementation. In --agent mode, failure paths must prefix output with `ERR` so callers can parse without inspecting exit codes. The N>1 path is critical — a silent pick would cause the calling agent to act on an arbitrary file with no indication of ambiguity.

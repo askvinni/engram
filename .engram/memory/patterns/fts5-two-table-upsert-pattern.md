@@ -11,4 +11,4 @@ last_updated: "2026-09-08"
 source_issues: [84]
 ---
 
-SQLite FTS5 virtual tables only support efficient row access by their internal rowid — there is no indexed lookup by an arbitrary column value like a file path. Without a companion table mapping path to fts_rowid, upsert_file() would have no way to delete a specific file's stale FTS row without a full table scan, making incremental updates O(n) in index size. The file_index table (path TEXT PRIMARY KEY, fts_rowid INTEGER NOT NULL) solves this: upsert_file reads the rowid, deletes the old FTS row by rowid, inserts the new content, and stores the new rowid. rebuild_index() bypasses file_index by clearing all rows and reinserting from disk, but any targeted single-file update path depends on this companion table. See src/index.rs:upsert_file and migrations/001_initial_schema.sql.
+FTS5 virtual tables only support row access by internal rowid. Without the file_index companion table (path TEXT PRIMARY KEY, fts_rowid INTEGER), targeted single-file updates require a full table scan. See src/index.rs:upsert_row.

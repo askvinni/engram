@@ -10,4 +10,4 @@ last_updated: "2026-09-08"
 source_issues: [88]
 ---
 
-clap's default behaviour does not propagate a flag defined on the root `Cli` struct into subcommand parse contexts. Without `global = true`, a top-level `--agent` flag succeeds for bare invocations but silently parses as the default (false) — or outright rejects the command — when a subcommand follows, because clap treats the flag as belonging only to the root command's argument set. Setting `global = true` on the `#[arg]` attribute tells clap to inject the flag into every subcommand's parse context, making it available wherever `Cli` is accessed. This applies to any future cross-cutting flag added to `Cli` that command handlers downstream need to read, such as `--json`, `--quiet`, or `--dry-run`. See src/cli.rs.
+Without `global = true`, clap treats a flag as belonging only to the root command's argument set — it silently parses as the default value in any subcommand context. See the existing `--agent` flag in src/cli.rs for the reference pattern.

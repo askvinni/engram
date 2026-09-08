@@ -10,4 +10,4 @@ last_updated: "2026-09-08"
 source_issues: [96]
 ---
 
-scan_memory_matches() in src/main.rs accepts a categories slice from cfg.memory.default_categories and only iterates those directories. A memory file written to a category not present in that config list will never appear as a stem-scan match, even though it sits under .engram/memory/ and is fully valid. The exact-path branch (the first resolution step in cmd_read) has no such restriction and resolves any path under .engram/memory/ regardless of category configuration — so the workaround is always available, but the asymmetry is non-obvious. This affects anyone who adds a new memory category via write_topic_file without also updating default_categories, and any future resolution function built on top of scan_memory_matches. See src/main.rs:scan_memory_matches and src/main.rs:cmd_read.
+scan_memory_matches() only searches directories listed in cfg.memory.default_categories. A file in an unlisted category is invisible to stem lookup but reachable via exact path (the first resolution step in cmd_read has no category restriction). See src/main.rs:scan_memory_matches.
