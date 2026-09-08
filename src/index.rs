@@ -209,42 +209,24 @@ mod tests {
         let root = dir.path();
         std::fs::create_dir_all(root.join(".engram/memory")).unwrap();
 
-        upsert_file(
-            root,
-            ".engram/memory/patterns/foo.md",
-            "patterns",
-            "foo",
-            "first",
-        )
-        .unwrap();
+        upsert_file(root, ".engram/memory/patterns/foo.md", "patterns", "foo", "first").unwrap();
         assert_eq!(fts_count(root), 1);
 
-        upsert_file(
-            root,
-            ".engram/memory/patterns/foo.md",
-            "patterns",
-            "foo",
-            "updated",
-        )
-        .unwrap();
+        upsert_file(root, ".engram/memory/patterns/foo.md", "patterns", "foo", "updated").unwrap();
         assert_eq!(fts_count(root), 1);
 
         let conn = Connection::open(root.join(".engram/index.db")).unwrap();
         let stored: String = conn
-            .query_row(
-                "SELECT content FROM memory_fts WHERE slug = 'foo'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT content FROM memory_fts WHERE slug = 'foo'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(stored, "updated");
     }
 
     #[test]
-    fn search_returns_matching_results() {
+    fn search_finds_match_and_handles_miss() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let full = LearningItem {
+        let item = LearningItem {
             category: "patterns".to_string(),
             slug: "race-condition".to_string(),
             title: "race-condition title".to_string(),
@@ -253,24 +235,16 @@ mod tests {
             body: "A race condition occurs when two threads access shared state concurrently."
                 .to_string(),
         };
-        write_topic_file(root, &full, 1).unwrap();
+        write_topic_file(root, &item, 1).unwrap();
         rebuild_index(root).unwrap();
 
-        let results = search(root, "race condition").unwrap();
-        assert_eq!(results.len(), 1);
-        assert!(results[0].path.contains("race-condition"));
-        assert_eq!(results[0].category, "patterns");
-    }
+        let hits = search(root, "race condition").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].path.contains("race-condition"));
+        assert_eq!(hits[0].category, "patterns");
 
-    #[test]
-    fn search_empty_result_returns_empty_vec() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join(".engram/memory")).unwrap();
-        rebuild_index(root).unwrap();
-
-        let results = search(root, "zzzyyyxxx").unwrap();
-        assert!(results.is_empty());
+        let miss = search(root, "zzzyyyxxx").unwrap();
+        assert!(miss.is_empty());
     }
 
     #[test]
@@ -279,10 +253,8 @@ mod tests {
         let root = dir.path();
         write_topic_file(root, &make_item("patterns", "foo"), 1).unwrap();
 
-        // No rebuild_index call — index doesn't exist yet
         assert!(!root.join(".engram/index.db").exists());
         let results = search(root, "foo title").unwrap();
-        // Index was created on demand
         assert!(root.join(".engram/index.db").exists());
         assert_eq!(results.len(), 1);
     }
