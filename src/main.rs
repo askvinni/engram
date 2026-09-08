@@ -20,9 +20,11 @@ static ISSUE_TEMPLATES_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/.github/ISSU
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let mode = cli.output_mode();
     match cli.command {
         Commands::Init => cmd_init(),
         Commands::Plan { subcommand } => cmd_plan(subcommand),
+        Commands::Search { query } => cmd_search(mode, &query),
         Commands::Doctor => cmd_doctor(),
         Commands::Compact => cmd_compact(),
         Commands::Objective { subcommand } => cmd_objective(subcommand),
@@ -109,6 +111,36 @@ fn cmd_plan(subcmd: cli::PlanCommands) -> Result<()> {
 fn cmd_compact() -> Result<()> {
     let repo_root = config::find_repo_root()?;
     compact::run(&repo_root)
+}
+
+fn cmd_search(mode: cli::OutputMode, query: &str) -> Result<()> {
+    use cli::OutputMode;
+    let repo_root = config::find_repo_root()?;
+    let results = index::search(&repo_root, query)?;
+    if results.is_empty() {
+        match mode {
+            OutputMode::Agent => println!("OK search count=0"),
+            OutputMode::Human => println!("No results for {:?}", query),
+        }
+        return Ok(());
+    }
+    match mode {
+        OutputMode::Agent => {
+            println!("OK search count={}", results.len());
+            for r in &results {
+                println!(
+                    "- path={} category={} snippet={}",
+                    r.path, r.category, r.snippet
+                );
+            }
+        }
+        OutputMode::Human => {
+            for r in &results {
+                println!("{} ({})\n  {}\n", r.path, r.category, r.snippet);
+            }
+        }
+    }
+    Ok(())
 }
 
 const PROMPT_HOOKS_README: &str = r#"# Prompt Hooks
