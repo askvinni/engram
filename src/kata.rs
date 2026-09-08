@@ -53,7 +53,9 @@ pub fn create(title: &str, body: &str, idempotency_key: &str) -> Result<String> 
     v["issue"]["short_id"]
         .as_str()
         .map(|s| s.to_string())
-        .ok_or_else(|| anyhow::anyhow!("kata create JSON missing issue.short_id: {}", stdout.trim()))
+        .ok_or_else(|| {
+            anyhow::anyhow!("kata create JSON missing issue.short_id: {}", stdout.trim())
+        })
 }
 
 #[cfg(test)]
