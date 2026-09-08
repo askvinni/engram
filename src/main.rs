@@ -31,7 +31,6 @@ struct ReadResultJson {
     content: String,
 }
 
-
 static SKILLS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/.claude/skills");
 static ISSUE_TEMPLATES_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/.github/ISSUE_TEMPLATE");
 
@@ -207,7 +206,15 @@ fn cmd_read(permalink: &str, mode: OutputMode) -> Result<()> {
     let exact = memory_dir.join(permalink);
     if exact.exists() {
         let content = std::fs::read_to_string(&exact)?;
-        print!("{content}");
+        if mode == OutputMode::Json {
+            let out = ReadResultJson {
+                path: permalink.to_string(),
+                content,
+            };
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        } else {
+            print!("{content}");
+        }
         return Ok(());
     }
 
