@@ -209,15 +209,33 @@ mod tests {
         let root = dir.path();
         std::fs::create_dir_all(root.join(".engram/memory")).unwrap();
 
-        upsert_file(root, ".engram/memory/patterns/foo.md", "patterns", "foo", "first").unwrap();
+        upsert_file(
+            root,
+            ".engram/memory/patterns/foo.md",
+            "patterns",
+            "foo",
+            "first",
+        )
+        .unwrap();
         assert_eq!(fts_count(root), 1);
 
-        upsert_file(root, ".engram/memory/patterns/foo.md", "patterns", "foo", "updated").unwrap();
+        upsert_file(
+            root,
+            ".engram/memory/patterns/foo.md",
+            "patterns",
+            "foo",
+            "updated",
+        )
+        .unwrap();
         assert_eq!(fts_count(root), 1);
 
         let conn = Connection::open(root.join(".engram/index.db")).unwrap();
         let stored: String = conn
-            .query_row("SELECT content FROM memory_fts WHERE slug = 'foo'", [], |r| r.get(0))
+            .query_row(
+                "SELECT content FROM memory_fts WHERE slug = 'foo'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(stored, "updated");
     }
