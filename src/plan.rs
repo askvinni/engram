@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
 
-use crate::{config, github, learn, objective};
+use crate::{config, github, kata, learn, objective};
 
 pub fn new(
     repo_root: &Path,
@@ -23,13 +23,30 @@ pub fn new(
     let url = github::create_issue(&repo, title, body, "engram-plan")?;
     let url = url.trim();
 
+    let issue_number = url
+        .rsplit('/')
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .with_context(|| format!("could not parse issue number from URL: {url}"))?;
+
+    if kata::kata_available() {
+        let kata_body = format!("GitHub: {url}\n\n{body}");
+        let idempotency_key = format!("engram-plan-{issue_number}");
+        match kata::create(title, &kata_body, &idempotency_key) {
+            Ok(kata_ref) => {
+                let updated_body = format!("{body}\nKata: {kata_ref}");
+                if let Err(e) = github::update_issue_body(&repo, issue_number, &updated_body) {
+                    eprintln!("warning: could not append Kata ref to GitHub issue: {e:#}");
+                }
+            }
+            Err(e) => {
+                eprintln!("warning: kata create failed (continuing): {e:#}");
+            }
+        }
+    }
+
     if let Some(conv) = conversation {
         if !conv.is_empty() {
-            let issue_number = url
-                .rsplit('/')
-                .next()
-                .and_then(|s| s.parse::<u64>().ok())
-                .with_context(|| format!("could not parse issue number from URL: {url}"))?;
             let comment_body = format!("<!-- engram:conversation -->\n{conv}");
             github::add_issue_comment(&repo, issue_number, &comment_body)
                 .context("posting conversation comment")?;

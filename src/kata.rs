@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -6,7 +7,6 @@ static KATA_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
 /// Returns true iff `kata` is on PATH and the current repo has a `.kata.toml` binding.
 /// The result is cached for the lifetime of the process.
-#[allow(dead_code)]
 pub fn kata_available() -> bool {
     *KATA_AVAILABLE.get_or_init(detect)
 }
@@ -24,6 +24,37 @@ fn detect() -> bool {
     crate::config::find_repo_root()
         .map(|root| root.join(".kata.toml").exists())
         .unwrap_or(false)
+}
+
+/// Create a kata issue and return its short ref (e.g. "abc4").
+/// The idempotency key ensures retries after partial failure don't duplicate the issue.
+pub fn create(title: &str, body: &str, idempotency_key: &str) -> Result<String> {
+    let output = Command::new("kata")
+        .args([
+            "create",
+            title,
+            "--body",
+            body,
+            "--idempotency-key",
+            idempotency_key,
+            "--agent",
+        ])
+        .output()
+        .context("running kata create")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("kata create failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("kata create output not UTF-8")?;
+    // Agent output first line: "OK create <ref>"
+    stdout
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("OK create "))
+        .map(|r| r.trim().to_string())
+        .ok_or_else(|| anyhow::anyhow!("unexpected kata create output: {}", stdout.trim()))
 }
 
 #[cfg(test)]
