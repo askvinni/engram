@@ -37,7 +37,7 @@ pub fn create(title: &str, body: &str, idempotency_key: &str) -> Result<String> 
             body,
             "--idempotency-key",
             idempotency_key,
-            "--agent",
+            "--json",
         ])
         .output()
         .context("running kata create")?;
@@ -48,13 +48,12 @@ pub fn create(title: &str, body: &str, idempotency_key: &str) -> Result<String> 
     }
 
     let stdout = String::from_utf8(output.stdout).context("kata create output not UTF-8")?;
-    // Agent output first line: "OK create <ref>"
-    stdout
-        .lines()
-        .next()
-        .and_then(|line| line.strip_prefix("OK create "))
-        .map(|r| r.trim().to_string())
-        .ok_or_else(|| anyhow::anyhow!("unexpected kata create output: {}", stdout.trim()))
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).context("parsing kata create JSON output")?;
+    v["issue"]["short_id"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("kata create JSON missing issue.short_id: {}", stdout.trim()))
 }
 
 #[cfg(test)]
