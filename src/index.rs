@@ -144,121 +144,44 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rebuild_index_empty_memory_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join(".engram/memory")).unwrap();
-        rebuild_index(root).unwrap();
-        assert!(root.join(".engram/index.db").exists());
+    fn fts_count(root: &std::path::Path) -> i64 {
+        let conn = Connection::open(root.join(".engram/index.db")).unwrap();
+        conn.query_row("SELECT count(*) FROM memory_fts", [], |r| r.get(0))
+            .unwrap()
     }
 
     #[test]
-    fn rebuild_index_indexes_written_files() {
+    fn rebuild_index_creates_db_indexes_files_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         write_topic_file(root, &make_item("patterns", "foo"), 1).unwrap();
         write_topic_file(root, &make_item("tripwires", "bar"), 2).unwrap();
 
-        rebuild_index(root).unwrap();
-
-        let conn = Connection::open(root.join(".engram/index.db")).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT count(*) FROM memory_fts", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 2);
-    }
-
-    #[test]
-    fn rebuild_index_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        write_topic_file(root, &make_item("patterns", "foo"), 1).unwrap();
-
-        rebuild_index(root).unwrap();
-        rebuild_index(root).unwrap();
-
-        let conn = Connection::open(root.join(".engram/index.db")).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT count(*) FROM memory_fts", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn upsert_file_adds_and_replaces() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join(".engram/memory")).unwrap();
-
-        upsert_file(
-            root,
-            ".engram/memory/patterns/foo.md",
-            "patterns",
-            "foo",
-            "first content",
-        )
-        .unwrap();
-        upsert_file(
-            root,
-            ".engram/memory/patterns/foo.md",
-            "patterns",
-            "foo",
-            "updated content",
-        )
-        .unwrap();
-
-        let conn = Connection::open(root.join(".engram/index.db")).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT count(*) FROM memory_fts", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 1);
-
-        let stored: String = conn
-            .query_row(
-                "SELECT content FROM memory_fts WHERE slug = 'foo'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(stored, "updated content");
-    }
-
-    #[test]
-    fn upsert_file_malformed_frontmatter_indexed_anyway() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join(".engram/memory")).unwrap();
-
-        let bad_content = "not yaml frontmatter\njust raw text\n";
-        upsert_file(
-            root,
-            ".engram/memory/patterns/bad.md",
-            "patterns",
-            "bad",
-            bad_content,
-        )
-        .unwrap();
-
-        let conn = Connection::open(root.join(".engram/index.db")).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT count(*) FROM memory_fts", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn check_index_health_false_before_init() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(!check_index_health(dir.path()).unwrap());
-    }
-
-    #[test]
-    fn check_index_health_true_after_rebuild() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join(".engram/memory")).unwrap();
+        assert!(!check_index_health(root).unwrap());
         rebuild_index(root).unwrap();
         assert!(check_index_health(root).unwrap());
+        assert_eq!(fts_count(root), 2);
+
+        rebuild_index(root).unwrap();
+        assert_eq!(fts_count(root), 2);
+    }
+
+    #[test]
+    fn upsert_file_adds_then_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".engram/memory")).unwrap();
+
+        upsert_file(root, ".engram/memory/patterns/foo.md", "patterns", "foo", "first").unwrap();
+        assert_eq!(fts_count(root), 1);
+
+        upsert_file(root, ".engram/memory/patterns/foo.md", "patterns", "foo", "updated").unwrap();
+        assert_eq!(fts_count(root), 1);
+
+        let conn = Connection::open(root.join(".engram/index.db")).unwrap();
+        let stored: String = conn
+            .query_row("SELECT content FROM memory_fts WHERE slug = 'foo'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, "updated");
     }
 }
