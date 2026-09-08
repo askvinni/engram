@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 pub enum OutputMode {
     Human,
     Agent,
+    Json,
 }
 
 #[derive(Parser)]
@@ -14,6 +15,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub agent: bool,
 
+    /// Emit structured JSON output for jq-style consumers; takes precedence over --agent
+    #[arg(long, global = true)]
+    pub json: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -21,7 +26,9 @@ pub struct Cli {
 impl Cli {
     #[allow(dead_code)]
     pub fn output_mode(&self) -> OutputMode {
-        if self.agent {
+        if self.json {
+            OutputMode::Json
+        } else if self.agent {
             OutputMode::Agent
         } else {
             OutputMode::Human
