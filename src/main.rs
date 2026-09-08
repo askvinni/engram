@@ -11,7 +11,7 @@ mod plan;
 
 use anyhow::Result;
 use clap::Parser;
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, OutputMode};
 use include_dir::{include_dir, Dir};
 use std::process::Command;
 
@@ -28,6 +28,7 @@ fn main() -> Result<()> {
         Commands::Doctor => cmd_doctor(),
         Commands::Compact => cmd_compact(),
         Commands::Objective { subcommand } => cmd_objective(subcommand),
+        Commands::Read { permalink } => cmd_read(&permalink, mode),
     }
 }
 
@@ -141,6 +142,92 @@ fn cmd_search(mode: cli::OutputMode, query: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn scan_memory_matches(
+    memory_dir: &std::path::Path,
+    categories: &[String],
+    needle: &str,
+) -> Vec<std::path::PathBuf> {
+    let mut matches = Vec::new();
+    for cat in categories {
+        let cat_dir = memory_dir.join(cat);
+        if !cat_dir.exists() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&cat_dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "md") {
+                let stem = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if stem == needle {
+                    matches.push(path);
+                }
+            }
+        }
+    }
+    matches
+}
+
+fn cmd_read(permalink: &str, mode: OutputMode) -> Result<()> {
+    let repo_root = config::find_repo_root()?;
+    let memory_dir = repo_root.join(".engram/memory");
+
+    // 1. Try exact path under memory_dir
+    let exact = memory_dir.join(permalink);
+    if exact.exists() {
+        let content = std::fs::read_to_string(&exact)?;
+        print!("{content}");
+        return Ok(());
+    }
+
+    // 2. Scan all categories for stem match
+    let needle = std::path::Path::new(permalink)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| permalink.to_string());
+
+    let cfg = config::Config::load(&repo_root)?;
+    let matches = scan_memory_matches(&memory_dir, &cfg.memory.default_categories, &needle);
+
+    match matches.len() {
+        0 => {
+            if mode == OutputMode::Agent {
+                eprintln!("ERR not_found: {permalink}");
+            } else {
+                eprintln!("not found: {permalink}");
+            }
+            std::process::exit(1);
+        }
+        1 => {
+            let content = std::fs::read_to_string(&matches[0])?;
+            print!("{content}");
+            Ok(())
+        }
+        _ => {
+            // Ambiguous: list candidates
+            let label = if mode == OutputMode::Agent {
+                "ERR ambiguous"
+            } else {
+                "ambiguous"
+            };
+            eprintln!("{label}: {permalink} matches multiple files:");
+            for path in &matches {
+                let rel = path
+                    .strip_prefix(&memory_dir)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string();
+                eprintln!("  {rel}");
+            }
+            std::process::exit(1);
+        }
+    }
 }
 
 const PROMPT_HOOKS_README: &str = r#"# Prompt Hooks
@@ -398,6 +485,31 @@ mod tests {
             result.ends_with("days ago"),
             "expected 'N days ago', got {result}"
         );
+    }
+
+    fn write_memory_file(root: &std::path::Path, cat: &str, slug: &str, body: &str) {
+        let dir = root.join(format!(".engram/memory/{cat}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{slug}.md")), body).unwrap();
+    }
+
+    fn cats(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn scan_memory_matches_finds_and_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_memory_file(root, "patterns", "foo", "foo body");
+        write_memory_file(root, "tripwires", "foo", "tripwires body");
+        let memory_dir = root.join(".engram/memory");
+
+        let found = scan_memory_matches(&memory_dir, &cats(&["patterns", "tripwires"]), "foo");
+        assert_eq!(found.len(), 2);
+
+        let missing = scan_memory_matches(&memory_dir, &cats(&["patterns"]), "nope");
+        assert!(missing.is_empty());
     }
 
     #[test]

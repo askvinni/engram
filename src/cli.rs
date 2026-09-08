@@ -52,6 +52,11 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: ObjectiveCommands,
     },
+    /// Read a memory file by path or tag
+    Read {
+        /// Exact path (e.g. patterns/foo.md) or filename stem to look up
+        permalink: String,
+    },
 }
 
 #[derive(Subcommand)]
