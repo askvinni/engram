@@ -1,16 +1,24 @@
 use anyhow::{Context, Result};
+use include_dir::{include_dir, Dir};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 const DB_RELATIVE: &str = ".engram/index.db";
 
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/001_initial_schema.sql")];
+static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
 fn run_migrations(conn: &Connection) -> Result<()> {
     let version: usize = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .context("reading schema version")?;
-    for (i, sql) in MIGRATIONS.iter().enumerate().skip(version) {
+
+    let mut files: Vec<_> = MIGRATIONS_DIR.files().collect();
+    files.sort_by_key(|f| f.path());
+
+    for (i, file) in files.iter().enumerate().skip(version) {
+        let sql = file
+            .contents_utf8()
+            .with_context(|| format!("migration {} is not UTF-8", i + 1))?;
         conn.execute_batch(sql)
             .with_context(|| format!("applying migration {}", i + 1))?;
         conn.execute_batch(&format!("PRAGMA user_version = {}", i + 1))
