@@ -159,7 +159,7 @@ pub fn build_objective_body(body: &str, nodes: &[ObjectiveNode]) -> String {
 }
 
 /// Look for `Objective: #N (node ID)` on any line of `body`.
-fn parse_objective_marker(body: &str) -> Option<(u64, String)> {
+pub(crate) fn parse_objective_marker(body: &str) -> Option<(u64, String)> {
     for line in body.lines() {
         if let Some(rest) = line.trim().strip_prefix("Objective: #") {
             if let Some((num_str, rest2)) = rest.split_once(" (node ") {
@@ -238,7 +238,7 @@ pub fn all_nodes_done(nodes: &[ObjectiveNode]) -> bool {
     !nodes.is_empty() && nodes.iter().all(|n| n.status == NodeStatus::Done)
 }
 
-fn build_close_comment(nodes: &[ObjectiveNode]) -> String {
+pub(crate) fn build_close_comment(nodes: &[ObjectiveNode]) -> String {
     let mut lines = vec![
         "All nodes completed — closing objective.".to_string(),
         String::new(),

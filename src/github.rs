@@ -267,6 +267,46 @@ pub fn update_issue_body(repo: &str, number: u64, body: &str) -> Result<()> {
     Ok(())
 }
 
+/// Update an issue's title and/or body in a single `gh issue edit` call.
+/// Passing `None` for a field leaves it untouched.
+pub fn update_issue(
+    repo: &str,
+    number: u64,
+    title: Option<&str>,
+    body: Option<&str>,
+) -> Result<()> {
+    if title.is_none() && body.is_none() {
+        return Ok(());
+    }
+    let number_str = number.to_string();
+    let mut args = vec!["issue", "edit", &number_str, "--repo", repo];
+    if let Some(t) = title {
+        args.push("--title");
+        args.push(t);
+    }
+    if let Some(b) = body {
+        args.push("--body");
+        args.push(b);
+    }
+    gh(&args)?;
+    Ok(())
+}
+
+pub fn reopen_issue(repo: &str, number: u64) -> Result<()> {
+    let output = Command::new("gh")
+        .args(["issue", "reopen", &number.to_string(), "--repo", repo])
+        .output()
+        .context("running gh CLI")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("already open") {
+            return Ok(());
+        }
+        anyhow::bail!("gh issue reopen #{number} failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
 pub fn list_open_objectives(repo: &str) -> Result<Vec<PlanIssue>> {
     let out = gh(&[
         "issue",
