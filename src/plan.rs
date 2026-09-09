@@ -151,11 +151,42 @@ pub fn land(repo_root: &Path, issue: u64) -> Result<()> {
         println!("Issue #{issue} already closed.");
     }
 
+    let linked_pr = github::find_linked_pr(&repo, issue);
+
+    if let Some(kata_ref) = parse_kata_ref(gh_issue.body.as_deref().unwrap_or("")) {
+        match &linked_pr {
+            Ok(Some(pr)) => match &pr.merge_commit_sha {
+                Some(sha) => {
+                    let message = format!(
+                        "Closed by engram plan land for GitHub issue #{issue}, merged in PR #{}.",
+                        pr.number
+                    );
+                    match kata::close(&kata_ref, &message, sha) {
+                        Ok(()) => println!("Closed kata issue {kata_ref}."),
+                        Err(e) => {
+                            eprintln!("warning: could not close kata issue {kata_ref}: {e:#}")
+                        }
+                    }
+                }
+                None => eprintln!(
+                    "warning: no merge commit found for PR #{}; skipping kata close for {kata_ref}",
+                    pr.number
+                ),
+            },
+            Ok(None) => eprintln!(
+                "warning: no merged PR found for issue #{issue}; skipping kata close for {kata_ref}"
+            ),
+            Err(e) => eprintln!(
+                "warning: could not look up PR for issue #{issue}; skipping kata close for {kata_ref}: {e:#}"
+            ),
+        }
+    }
+
     if let Err(e) = objective::maybe_mark_node_done(&repo, gh_issue.body.as_deref().unwrap_or("")) {
         eprintln!("warning: could not update objective node: {e:#}");
     }
 
-    match github::find_linked_pr(&repo, issue) {
+    match linked_pr {
         Ok(Some(pr)) => {
             if let Some(branch_name) = pr.head_ref_name {
                 let result = Command::new("git")
@@ -251,6 +282,15 @@ pub fn status(repo_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Parse the `Kata: <ref>` marker that `engram plan new` appends to the issue
+/// body when a linked kata issue was created (see `plan::new`).
+fn parse_kata_ref(body: &str) -> Option<String> {
+    body.lines()
+        .find_map(|line| line.trim().strip_prefix("Kata:"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn parse_closes_issue(body: &str) -> Option<u64> {
     let lower = body.to_lowercase();
     for keyword in ["closes #", "fixes #", "resolves #"] {
@@ -310,6 +350,25 @@ mod tests {
     fn parse_closes_issue_in_pr_body_multiline() {
         let body = "## Summary\nDoes some stuff.\n\nCloses #55\n";
         assert_eq!(parse_closes_issue(body), Some(55));
+    }
+
+    #[test]
+    fn parse_kata_ref_finds_marker() {
+        let body = "**Why** x\n**Scope** x\nKata: abc4";
+        assert_eq!(parse_kata_ref(body), Some("abc4".to_string()));
+    }
+
+    #[test]
+    fn parse_kata_ref_returns_none_when_absent() {
+        assert_eq!(parse_kata_ref("**Why** x\n**Scope** x"), None);
+    }
+
+    #[test]
+    fn parse_kata_ref_trims_whitespace() {
+        assert_eq!(
+            parse_kata_ref("body text\nKata:   zzzz9  \n"),
+            Some("zzzz9".to_string())
+        );
     }
 
     #[test]
