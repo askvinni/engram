@@ -9,6 +9,7 @@ pub fn new(
     title: &str,
     body: Option<&str>,
     conversation: Option<&str>,
+    no_kata: bool,
 ) -> Result<()> {
     let cfg = config::Config::load(repo_root)?;
     let repo = config::resolve_repo(&cfg, repo_root)?;
@@ -29,7 +30,7 @@ pub fn new(
         .and_then(|s| s.parse::<u64>().ok())
         .with_context(|| format!("could not parse issue number from URL: {url}"))?;
 
-    if kata::kata_available() {
+    if !no_kata && kata::kata_available() {
         let kata_body = format!("GitHub: {url}\n\n{body}");
         let idempotency_key = format!("engram-plan-{issue_number}");
         match kata::create(title, &kata_body, &idempotency_key) {
@@ -72,12 +73,12 @@ pub fn list(repo_root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn learn_single(repo_root: &Path, issue: u64) -> Result<()> {
+pub fn learn_single(repo_root: &Path, issue: u64, no_kata: bool) -> Result<()> {
     let cfg = config::Config::load(repo_root)?;
-    learn::run(repo_root, &cfg, issue)
+    learn::run(repo_root, &cfg, issue, no_kata)
 }
 
-pub fn learn_all(repo_root: &Path) -> Result<()> {
+pub fn learn_all(repo_root: &Path, no_kata: bool) -> Result<()> {
     let cfg = config::Config::load(repo_root)?;
     let repo = config::resolve_repo(&cfg, repo_root)?;
 
@@ -92,7 +93,7 @@ pub fn learn_all(repo_root: &Path) -> Result<()> {
     let mut failed = 0usize;
     for issue in &issues {
         println!("\nLearning from issue #{}: {}", issue.number, issue.title);
-        match learn::write_memory(repo_root, issue.number, &repo) {
+        match learn::write_memory(repo_root, issue.number, &repo, no_kata) {
             Ok(true) => learned.push(issue.number),
             Ok(false) => {}
             Err(e) => {
@@ -135,11 +136,11 @@ pub fn learn_all(repo_root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn land(repo_root: &Path, issue: u64) -> Result<()> {
+pub fn land(repo_root: &Path, issue: u64, no_kata: bool) -> Result<()> {
     let cfg = config::Config::load(repo_root)?;
     let repo = config::resolve_repo(&cfg, repo_root)?;
 
-    learn::run(repo_root, &cfg, issue)?;
+    learn::run(repo_root, &cfg, issue, no_kata)?;
 
     let gh_issue = github::get_issue(&repo, issue)?;
     if gh_issue.state != "CLOSED" {

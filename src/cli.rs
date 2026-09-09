@@ -78,6 +78,9 @@ pub enum PlanCommands {
         /// Planning conversation to attach as a comment for richer learn synthesis
         #[arg(long)]
         conversation: Option<String>,
+        /// Skip all kata calls for this invocation, even if kata is available
+        #[arg(long)]
+        no_kata: bool,
     },
     /// List open engram-plan issues
     List,
@@ -88,11 +91,17 @@ pub enum PlanCommands {
         /// Process all closed plan issues that have not yet been learned
         #[arg(long, conflicts_with = "issue")]
         all: bool,
+        /// Skip all kata calls for this invocation, even if kata is available
+        #[arg(long)]
+        no_kata: bool,
     },
     /// Learn from a closed issue+PR, close the issue, and delete the local branch
     Land {
         /// GitHub issue number
         issue: u64,
+        /// Skip all kata calls for this invocation, even if kata is available
+        #[arg(long)]
+        no_kata: bool,
     },
     /// Show the linked engram issue and PR for the current branch
     Status,
