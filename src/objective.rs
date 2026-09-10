@@ -286,6 +286,7 @@ pub fn unblocked_nodes(nodes: &[ObjectiveNode]) -> Vec<usize> {
 /// Create a plan issue for the node at `node_idx`, mutate `nodes` to reflect
 /// InProgress status, and return the plan issue URL. Does not update the
 /// objective issue body — callers are responsible for that.
+#[allow(clippy::too_many_arguments)]
 fn create_plan_for_node(
     repo: &str,
     objective_number: u64,
@@ -343,7 +344,12 @@ fn create_plan_for_node(
         let kata_parent = kata::parse_ref(obj_body);
         let kata_body = format!("GitHub: {plan_url}\n\n{plan_body}");
         let idempotency_key = format!("engram-plan-{plan_issue_number}");
-        match kata::create(&plan_title, &kata_body, &idempotency_key, kata_parent.as_deref()) {
+        match kata::create(
+            &plan_title,
+            &kata_body,
+            &idempotency_key,
+            kata_parent.as_deref(),
+        ) {
             Ok(kata_ref) => {
                 let updated_body = format!("{plan_body}\nKata: {kata_ref}");
                 if let Err(e) = github::update_issue_body(repo, plan_issue_number, &updated_body) {
