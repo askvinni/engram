@@ -58,6 +58,40 @@ pub fn create(title: &str, body: &str, idempotency_key: &str) -> Result<String> 
         })
 }
 
+/// Close a kata issue with commit evidence. If the issue was already deleted or
+/// never existed (out-of-band), treats that as success rather than failure —
+/// the intent (closed) has effectively been satisfied.
+pub fn close(kata_ref: &str, message: &str, commit_sha: &str) -> Result<()> {
+    let output = Command::new("kata")
+        .args([
+            "close",
+            kata_ref,
+            "--done",
+            "--message",
+            message,
+            "--commit",
+            commit_sha,
+            "--json",
+        ])
+        .output()
+        .context("running kata close")?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let kind = serde_json::from_str::<serde_json::Value>(&stderr)
+        .ok()
+        .and_then(|v| v["error"]["kind"].as_str().map(|s| s.to_string()));
+
+    if kind.as_deref() == Some("not_found") {
+        return Ok(());
+    }
+
+    anyhow::bail!("kata close failed: {}", stderr.trim());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

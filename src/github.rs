@@ -9,13 +9,15 @@ pub struct Issue {
     pub state: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PullRequest {
     pub number: u64,
     pub title: String,
     pub body: Option<String>,
     #[serde(rename = "headRefName", default)]
     pub head_ref_name: Option<String>,
+    #[serde(default)]
+    pub merge_commit_sha: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +106,7 @@ pub fn find_linked_pr(repo: &str, issue_number: u64) -> Result<Option<PullReques
                         body
                         headRefName
                         state
+                        mergeCommit { oid }
                       }
                     }
                   }
@@ -160,6 +163,12 @@ pub fn find_linked_pr(repo: &str, issue_number: u64) -> Result<Option<PullReques
         #[serde(rename = "headRefName", default)]
         head_ref_name: Option<String>,
         state: String,
+        #[serde(rename = "mergeCommit", default)]
+        merge_commit: Option<MergeCommit>,
+    }
+    #[derive(Deserialize)]
+    struct MergeCommit {
+        oid: String,
     }
 
     let resp: Response = serde_json::from_str(&out).context("parsing GraphQL response")?;
@@ -179,6 +188,7 @@ pub fn find_linked_pr(repo: &str, issue_number: u64) -> Result<Option<PullReques
         title: pr.title,
         body: pr.body,
         head_ref_name: pr.head_ref_name,
+        merge_commit_sha: pr.merge_commit.map(|m| m.oid),
     }))
 }
 
