@@ -64,6 +64,24 @@ pub enum Commands {
         /// Exact path (e.g. patterns/foo.md) or filename stem to look up
         permalink: String,
     },
+    /// kata mirror maintenance
+    Kata {
+        #[command(subcommand)]
+        subcommand: KataCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum KataCommands {
+    /// Reconcile drift between a GitHub issue and its linked kata mirror
+    Sync {
+        /// GitHub issue number to sync
+        #[arg(long, conflicts_with = "all")]
+        issue: Option<u64>,
+        /// Sync every linked issue pair
+        #[arg(long, conflicts_with = "issue")]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]

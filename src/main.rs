@@ -46,6 +46,7 @@ fn main() -> Result<()> {
         Commands::Compact => cmd_compact(),
         Commands::Objective { subcommand } => cmd_objective(subcommand),
         Commands::Read { permalink } => cmd_read(&permalink, mode),
+        Commands::Kata { subcommand } => cmd_kata(subcommand),
     }
 }
 
@@ -415,6 +416,60 @@ fn cmd_objective(subcmd: cli::ObjectiveCommands) -> Result<()> {
             description,
             depends,
         } => objective::append(&repo, number, &id, &description, depends.as_deref()),
+    }
+}
+
+fn cmd_kata(subcmd: cli::KataCommands) -> Result<()> {
+    let repo_root = config::find_repo_root()?;
+    let cfg = config::Config::load(&repo_root)?;
+    let repo = config::resolve_repo(&cfg, &repo_root)?;
+
+    match subcmd {
+        cli::KataCommands::Sync { issue, all } => {
+            if all {
+                let results = kata::sync_all(&repo)?;
+                let mut failed = 0usize;
+                for result in results {
+                    match result {
+                        Ok(report) => print_sync_report(&report),
+                        Err(e) => {
+                            eprintln!("warning: {e:#}");
+                            failed += 1;
+                        }
+                    }
+                }
+                if failed > 0 {
+                    anyhow::bail!("{failed} pair(s) failed to sync — see warnings above");
+                }
+                Ok(())
+            } else if let Some(number) = issue {
+                let kata_ref = kata::find_kata_ref_for_issue(&repo, number)?;
+                let report = kata::sync_pair(&repo, number, &kata_ref)?;
+                print_sync_report(&report);
+                Ok(())
+            } else {
+                anyhow::bail!("specify --issue <N> or pass --all")
+            }
+        }
+    }
+}
+
+fn print_sync_report(report: &kata::SyncReport) {
+    println!("#{} <-> {}", report.github_number, report.kata_ref);
+    if report.synced_fields.is_empty()
+        && report.conflicts.is_empty()
+        && report.blocked_close_note.is_none()
+    {
+        println!("  no changes");
+    }
+    for field in &report.synced_fields {
+        println!("  synced: {field}");
+    }
+    for conflict in &report.conflicts {
+        println!("  conflict: {conflict}");
+    }
+    if let Some(note) = &report.blocked_close_note {
+        println!("  blocked: {note}");
     }
 }
 
