@@ -394,7 +394,11 @@ fn cmd_objective(subcmd: cli::ObjectiveCommands) -> Result<()> {
     let repo = config::resolve_repo(&cfg, &repo_root)?;
 
     match subcmd {
-        cli::ObjectiveCommands::New { title, body } => objective::new(&repo, &title, &body),
+        cli::ObjectiveCommands::New {
+            title,
+            body,
+            no_kata,
+        } => objective::new(&repo, &title, &body, no_kata),
         cli::ObjectiveCommands::List => objective::list_open(&repo),
         cli::ObjectiveCommands::View { number } => objective::view(&repo, number),
         cli::ObjectiveCommands::Plan {
@@ -402,12 +406,14 @@ fn cmd_objective(subcmd: cli::ObjectiveCommands) -> Result<()> {
             node,
             all_unblocked,
             body,
+            no_kata,
         } => objective::plan(
             &repo,
             number,
             node.as_deref(),
             all_unblocked,
             body.as_deref(),
+            no_kata,
         ),
         cli::ObjectiveCommands::Land { number } => objective::land(&repo_root, &repo, number),
         cli::ObjectiveCommands::Append {

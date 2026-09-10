@@ -84,7 +84,7 @@ When `.kata.toml` exists, mirror every `engram-plan` and `engram-objective` issu
 - Relationships: a plan node's kata issue gets `--parent <objective's kata ref>`. Anything blocked on another objective/plan completing first gets `--blocked-by <that kata ref>`.
 - Idempotency: use `--idempotency-key "engram-plan-<issue-number>"` or `"engram-objective-<issue-number>"` so retries don't duplicate issues.
 
-Native kata mirroring (automatic create/close/comment from `plan`/`land`/`learn`) is tracked as its own objective and not yet implemented — until it lands, do this by hand.
+Native kata mirroring for issue *creation* is implemented: `plan new`, `objective new`, and `objective plan` (both `--node` and `--all-unblocked`) each create the kata mirror automatically and set `--parent` where applicable (`--no-kata` skips it per-invocation). `--blocked-by` between plans is only derived by `engram kata sync`, not at creation time. Automatic *close*/*comment* mirroring from `land`/`learn` beyond `plan land`'s existing kata close is still unimplemented — do that by hand until it lands.
 
 ## Constants
 

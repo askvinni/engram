@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 
-use crate::github;
+use crate::{github, kata};
 
 const NODES_MARKER_START: &str = "<!-- engram:nodes ";
 const NODES_MARKER_END: &str = " -->";
@@ -186,7 +186,7 @@ fn extract_section<'a>(body: &'a str, heading: &str) -> Option<&'a str> {
     Some(&content[..section_end])
 }
 
-pub fn new(repo: &str, title: &str, body: &str) -> Result<()> {
+pub fn new(repo: &str, title: &str, body: &str, no_kata: bool) -> Result<()> {
     let roadmap_text = extract_section(body, "Roadmap")
         .ok_or_else(|| anyhow::anyhow!("body must contain a ## Roadmap section"))?;
 
@@ -199,7 +199,30 @@ pub fn new(repo: &str, title: &str, body: &str) -> Result<()> {
 
     let issue_body = build_objective_body(body, &nodes);
     let url = github::create_issue(repo, title, &issue_body, "engram-objective")?;
-    println!("{}", url.trim());
+    let url = url.trim().to_string();
+
+    if !no_kata && kata::kata_available() {
+        let issue_number = url
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .with_context(|| format!("could not parse issue number from URL: {url}"))?;
+        let kata_body = format!("GitHub: {url}\n\n{issue_body}");
+        let idempotency_key = format!("engram-objective-{issue_number}");
+        match kata::create(title, &kata_body, &idempotency_key, None) {
+            Ok(kata_ref) => {
+                let updated_body = format!("{issue_body}\nKata: {kata_ref}");
+                if let Err(e) = github::update_issue_body(repo, issue_number, &updated_body) {
+                    eprintln!("warning: could not append Kata ref to GitHub issue: {e:#}");
+                }
+            }
+            Err(e) => {
+                eprintln!("warning: kata create failed (continuing): {e:#}");
+            }
+        }
+    }
+
+    println!("{url}");
     Ok(())
 }
 
@@ -263,6 +286,7 @@ pub fn unblocked_nodes(nodes: &[ObjectiveNode]) -> Vec<usize> {
 /// Create a plan issue for the node at `node_idx`, mutate `nodes` to reflect
 /// InProgress status, and return the plan issue URL. Does not update the
 /// objective issue body — callers are responsible for that.
+#[allow(clippy::too_many_arguments)]
 fn create_plan_for_node(
     repo: &str,
     objective_number: u64,
@@ -271,6 +295,7 @@ fn create_plan_for_node(
     nodes: &mut [ObjectiveNode],
     node_idx: usize,
     body: Option<&str>,
+    no_kata: bool,
 ) -> Result<String> {
     let node_id = nodes[node_idx].id.clone();
     let node_description = nodes[node_idx].description.clone();
@@ -315,6 +340,28 @@ fn create_plan_for_node(
         eprintln!("warning: could not link #{plan_issue_number} as sub-issue: {e:#}");
     }
 
+    if !no_kata && kata::kata_available() {
+        let kata_parent = kata::parse_ref(obj_body);
+        let kata_body = format!("GitHub: {plan_url}\n\n{plan_body}");
+        let idempotency_key = format!("engram-plan-{plan_issue_number}");
+        match kata::create(
+            &plan_title,
+            &kata_body,
+            &idempotency_key,
+            kata_parent.as_deref(),
+        ) {
+            Ok(kata_ref) => {
+                let updated_body = format!("{plan_body}\nKata: {kata_ref}");
+                if let Err(e) = github::update_issue_body(repo, plan_issue_number, &updated_body) {
+                    eprintln!("warning: could not append Kata ref to GitHub issue: {e:#}");
+                }
+            }
+            Err(e) => {
+                eprintln!("warning: kata create failed (continuing): {e:#}");
+            }
+        }
+    }
+
     Ok(plan_url)
 }
 
@@ -324,6 +371,7 @@ pub fn plan(
     node_id: Option<&str>,
     all_unblocked: bool,
     body: Option<&str>,
+    no_kata: bool,
 ) -> Result<()> {
     let obj_issue =
         github::get_issue(repo, objective_number).context("fetching objective issue")?;
@@ -355,6 +403,7 @@ pub fn plan(
                 &mut nodes,
                 idx,
                 None,
+                no_kata,
             ) {
                 Ok(url) => {
                     println!("{url} (node {nid})");
@@ -393,6 +442,7 @@ pub fn plan(
             &mut nodes,
             node_idx,
             body,
+            no_kata,
         )?;
 
         let new_body = build_objective_body(&obj_body, &nodes);
