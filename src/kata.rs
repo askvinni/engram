@@ -37,17 +37,29 @@ fn detect() -> bool {
 
 /// Create a kata issue and return its short ref (e.g. "abc4").
 /// The idempotency key ensures retries after partial failure don't duplicate the issue.
-pub fn create(title: &str, body: &str, idempotency_key: &str) -> Result<String> {
+/// `parent`, when given, links the new issue under that kata ref (containment only).
+pub fn create(
+    title: &str,
+    body: &str,
+    idempotency_key: &str,
+    parent: Option<&str>,
+) -> Result<String> {
+    let mut args = vec![
+        "create",
+        title,
+        "--body",
+        body,
+        "--idempotency-key",
+        idempotency_key,
+    ];
+    if let Some(p) = parent {
+        args.push("--parent");
+        args.push(p);
+    }
+    args.push("--json");
+
     let output = Command::new("kata")
-        .args([
-            "create",
-            title,
-            "--body",
-            body,
-            "--idempotency-key",
-            idempotency_key,
-            "--json",
-        ])
+        .args(&args)
         .output()
         .context("running kata create")?;
 

@@ -33,7 +33,7 @@ pub fn new(
     if !no_kata && kata::kata_available() {
         let kata_body = format!("GitHub: {url}\n\n{body}");
         let idempotency_key = format!("engram-plan-{issue_number}");
-        match kata::create(title, &kata_body, &idempotency_key) {
+        match kata::create(title, &kata_body, &idempotency_key, None) {
             Ok(kata_ref) => {
                 let updated_body = format!("{body}\nKata: {kata_ref}");
                 if let Err(e) = github::update_issue_body(&repo, issue_number, &updated_body) {
