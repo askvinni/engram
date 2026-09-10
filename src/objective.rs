@@ -498,7 +498,7 @@ pub fn land(repo_root: &std::path::Path, repo: &str, objective_number: u64) -> R
         let plan_num = nodes[idx].plan_issue.unwrap();
         let node_id = nodes[idx].id.clone();
         println!("\nLearning from plan #{plan_num} (node {node_id})...");
-        let wrote = match crate::learn::write_memory(repo_root, plan_num, repo) {
+        let wrote = match crate::learn::write_memory(repo_root, plan_num, repo, false) {
             Ok(wrote) => wrote,
             Err(e) => {
                 eprintln!("  skipping #{plan_num}: {e:#}");

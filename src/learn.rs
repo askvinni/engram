@@ -8,7 +8,15 @@ const CONVERSATION_SENTINEL: &str = "<!-- engram:conversation -->";
 
 /// Validates the issue, synthesizes learnings, and writes them to memory on disk.
 /// Returns true if any learnings were written, false if none were found.
-pub fn write_memory(repo_root: &Path, issue_number: u64, repo: &str) -> Result<bool> {
+///
+/// `no_kata` suppresses the synthesis comment posted to the linked kata issue below,
+/// even when kata is available.
+pub fn write_memory(
+    repo_root: &Path,
+    issue_number: u64,
+    repo: &str,
+    no_kata: bool,
+) -> Result<bool> {
     println!("Fetching issue #{issue_number}...");
     let issue = github::get_issue(repo, issue_number)?;
     if issue.state != "CLOSED" {
@@ -77,7 +85,7 @@ pub fn write_memory(repo_root: &Path, issue_number: u64, repo: &str) -> Result<b
     github::add_issue_comment(repo, issue_number, &synthesis_text)
         .context("posting synthesis comment to GitHub issue")?;
 
-    if kata::kata_available() {
+    if !no_kata && kata::kata_available() {
         if let Some(kata_ref) = kata::parse_ref(issue.body.as_deref().unwrap_or("")) {
             match kata::comment(&kata_ref, &synthesis_text) {
                 Ok(()) => println!("Posted synthesis comment to kata {kata_ref}."),
@@ -104,10 +112,10 @@ fn format_synthesis_comment(items: &[claude::LearningItem]) -> String {
     out
 }
 
-pub fn run(repo_root: &Path, cfg: &config::Config, issue_number: u64) -> Result<()> {
+pub fn run(repo_root: &Path, cfg: &config::Config, issue_number: u64, no_kata: bool) -> Result<()> {
     let repo = config::resolve_repo(cfg, repo_root)?;
 
-    if !write_memory(repo_root, issue_number, &repo)? {
+    if !write_memory(repo_root, issue_number, &repo, no_kata)? {
         return Ok(());
     }
 

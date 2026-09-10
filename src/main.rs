@@ -110,18 +110,29 @@ fn cmd_plan(subcmd: cli::PlanCommands) -> Result<()> {
             title,
             body,
             conversation,
-        } => plan::new(&repo_root, &title, body.as_deref(), conversation.as_deref()),
+            no_kata,
+        } => plan::new(
+            &repo_root,
+            &title,
+            body.as_deref(),
+            conversation.as_deref(),
+            no_kata,
+        ),
         cli::PlanCommands::List => plan::list(&repo_root),
-        cli::PlanCommands::Learn { issue, all } => {
+        cli::PlanCommands::Learn {
+            issue,
+            all,
+            no_kata,
+        } => {
             if all {
-                plan::learn_all(&repo_root)
+                plan::learn_all(&repo_root, no_kata)
             } else if let Some(n) = issue {
-                plan::learn_single(&repo_root, n)
+                plan::learn_single(&repo_root, n, no_kata)
             } else {
                 anyhow::bail!("specify an issue number or pass --all")
             }
         }
-        cli::PlanCommands::Land { issue } => plan::land(&repo_root, issue),
+        cli::PlanCommands::Land { issue, no_kata } => plan::land(&repo_root, issue, no_kata),
         cli::PlanCommands::Status => plan::status(&repo_root),
     }
 }
