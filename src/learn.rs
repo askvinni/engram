@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
 
-use crate::{claude, config, github, memory};
+use crate::{claude, config, github, kata, memory};
 
 const CONVERSATION_SENTINEL: &str = "<!-- engram:conversation -->";
 
@@ -72,7 +72,36 @@ pub fn write_memory(repo_root: &Path, issue_number: u64, repo: &str) -> Result<b
     println!("Updating CLAUDE.md...");
     memory::write_claude_md_section(repo_root)?;
 
+    println!("Posting synthesis comment to issue #{issue_number}...");
+    let synthesis_text = format_synthesis_comment(&items);
+    github::add_issue_comment(repo, issue_number, &synthesis_text)
+        .context("posting synthesis comment to GitHub issue")?;
+
+    if kata::kata_available() {
+        if let Some(kata_ref) = kata::parse_ref(issue.body.as_deref().unwrap_or("")) {
+            match kata::comment(&kata_ref, &synthesis_text) {
+                Ok(()) => println!("Posted synthesis comment to kata {kata_ref}."),
+                Err(e) => {
+                    eprintln!("warning: could not post synthesis comment to kata {kata_ref}: {e:#}")
+                }
+            }
+        }
+    }
+
     Ok(true)
+}
+
+/// Format synthesized learning items as a comment body shared verbatim
+/// between the GitHub issue and its linked kata issue.
+fn format_synthesis_comment(items: &[claude::LearningItem]) -> String {
+    let mut out = String::from("## Learnings synthesized by engram\n");
+    for item in items {
+        out.push_str(&format!(
+            "\n### [{}] {} (`{}`)\n\n{}\n",
+            item.category, item.title, item.slug, item.body
+        ));
+    }
+    out
 }
 
 pub fn run(repo_root: &Path, cfg: &config::Config, issue_number: u64) -> Result<()> {
@@ -178,4 +207,39 @@ pub fn commit_memory_pr(
     }
 
     Ok(Some(pr_url))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_item(category: &str, slug: &str, title: &str) -> claude::LearningItem {
+        claude::LearningItem {
+            category: category.to_string(),
+            slug: slug.to_string(),
+            title: title.to_string(),
+            read_when: vec!["when testing".to_string()],
+            tripwires: vec![],
+            body: format!("Body of {slug}."),
+        }
+    }
+
+    #[test]
+    fn format_synthesis_comment_includes_every_item() {
+        let items = vec![
+            make_item("patterns", "race-condition", "Race condition"),
+            make_item("tripwires", "no-mocked-db", "Don't mock the database"),
+        ];
+        let comment = format_synthesis_comment(&items);
+        assert!(comment.contains("[patterns] Race condition (`race-condition`)"));
+        assert!(comment.contains("Body of race-condition."));
+        assert!(comment.contains("[tripwires] Don't mock the database (`no-mocked-db`)"));
+        assert!(comment.contains("Body of no-mocked-db."));
+    }
+
+    #[test]
+    fn format_synthesis_comment_empty_items() {
+        let comment = format_synthesis_comment(&[]);
+        assert_eq!(comment, "## Learnings synthesized by engram\n");
+    }
 }

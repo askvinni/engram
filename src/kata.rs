@@ -92,6 +92,29 @@ pub fn close(kata_ref: &str, message: &str, commit_sha: &str) -> Result<()> {
     anyhow::bail!("kata close failed: {}", stderr.trim());
 }
 
+/// Post a comment to a kata issue.
+pub fn comment(kata_ref: &str, body: &str) -> Result<()> {
+    let output = Command::new("kata")
+        .args(["comment", kata_ref, "--body", body])
+        .output()
+        .context("running kata comment")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("kata comment failed: {}", stderr.trim());
+    }
+    Ok(())
+}
+
+/// Parse the `Kata: <ref>` line that `plan::new` appends to a GitHub issue body.
+pub fn parse_ref(issue_body: &str) -> Option<String> {
+    issue_body
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Kata:"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,5 +123,23 @@ mod tests {
     fn kata_available_returns_bool() {
         // Just verify it runs without panicking; actual value depends on the environment.
         let _ = kata_available();
+    }
+
+    #[test]
+    fn parse_ref_finds_kata_line() {
+        let body = "**Why**\nSome text.\n\nKata: abc4";
+        assert_eq!(parse_ref(body), Some("abc4".to_string()));
+    }
+
+    #[test]
+    fn parse_ref_returns_none_when_absent() {
+        let body = "**Why**\nSome text with no kata ref.";
+        assert_eq!(parse_ref(body), None);
+    }
+
+    #[test]
+    fn parse_ref_ignores_blank_ref() {
+        let body = "Kata: \n";
+        assert_eq!(parse_ref(body), None);
     }
 }
