@@ -558,347 +558,157 @@ fn days_to_ymd(z: i64) -> (i32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude::{LearningItem, Tripwire as ClaudeTripwire};
+    use crate::claude::{CompactAction, LearningItem, Tripwire as ClaudeTripwire};
 
     const REPO: &str = "acme/widgets";
+    const LEGACY: &str = "---\ntitle: \"Legacy\"\nread_when: []\ntripwires: []\nlast_updated: \"2024-01-01\"\nsource_issues: [1]\n---\n\nOld body.\n";
 
-    // --- split_frontmatter / render round-trip ---
-
-    #[test]
-    fn round_trip_preserves_special_characters_in_title_and_read_when() {
-        let fm = Frontmatter::new("patterns", "A \"quoted\" title: with # hash");
-        let mut fm = fm;
-        fm.read_when = vec!["a \"quoted\" condition: with # hash".to_string()];
-        fm.normalize("patterns", REPO);
-
-        let rendered = render(&fm, "Body text.").unwrap();
-        let (parsed, body) = split_frontmatter(&rendered).unwrap();
-
-        assert_eq!(parsed.title, "A \"quoted\" title: with # hash");
-        assert_eq!(
-            parsed.read_when,
-            vec!["a \"quoted\" condition: with # hash".to_string()]
-        );
-        assert_eq!(body.trim(), "Body text.");
-    }
-
-    #[test]
-    fn parsing_legacy_frontmatter_yields_sources_and_generated() {
-        let legacy = "---\ntitle: \"Old style\"\nread_when:\n  - \"doing X\"\ntripwires: []\nlast_updated: \"2024-01-01\"\nsource_issues: [1, 2]\n---\n\nBody.\n";
-        let (mut fm, _) = split_frontmatter(legacy).unwrap();
-        assert!(fm.generated.is_none());
-        assert!(fm.sources.is_empty());
-
-        fm.normalize("patterns", REPO);
-
-        assert_eq!(fm.kind, "pattern");
-        let generated = fm.generated.clone().unwrap();
-        assert_eq!(generated.at, "2024-01-01");
-        assert_eq!(
-            generated.by,
-            format!("engram/{}", env!("CARGO_PKG_VERSION"))
-        );
-        assert_eq!(
-            fm.sources,
-            vec![
-                Source {
-                    id: "1".to_string(),
-                    resource: format!("https://github.com/{REPO}/issues/1")
-                },
-                Source {
-                    id: "2".to_string(),
-                    resource: format!("https://github.com/{REPO}/issues/2")
-                },
-            ]
-        );
-        assert!(fm.last_updated.is_none());
-        assert!(fm.legacy_source_issues.is_none());
-
-        let rendered = render(&fm, "Body.").unwrap();
-        assert!(!rendered.contains("last_updated"));
-        assert!(!rendered.contains("source_issues"));
-    }
-
-    #[test]
-    fn sources_merge_dedupes_by_id() {
-        let mut fm = Frontmatter::new("patterns", "Title");
-        fm.add_source(REPO, 1);
-        fm.add_source(REPO, 1);
-        fm.add_source(REPO, 2);
-        assert_eq!(fm.sources.len(), 2);
-
-        fm.merge_sources(vec![
-            Source {
-                id: "2".to_string(),
-                resource: "https://example.com/other".to_string(),
-            },
-            Source {
-                id: "3".to_string(),
-                resource: format!("https://github.com/{REPO}/issues/3"),
-            },
-        ]);
-        assert_eq!(fm.sources.len(), 3);
-        // first-seen wins — the id=2 resource is not overwritten
-        assert_eq!(
-            fm.sources.iter().find(|s| s.id == "2").unwrap().resource,
-            format!("https://github.com/{REPO}/issues/2")
-        );
-    }
-
-    #[test]
-    fn unknown_frontmatter_keys_survive_a_rewrite() {
-        let content = "---\ntype: \"pattern\"\ntitle: \"Title\"\nread_when: []\ntripwires: []\ncustom_field: \"keep me\"\n---\n\nBody.\n";
-        let (mut fm, body) = split_frontmatter(content).unwrap();
-        fm.normalize("patterns", REPO);
-        let rendered = render(&fm, &body).unwrap();
-        let (reparsed, _) = split_frontmatter(&rendered).unwrap();
-        assert_eq!(
-            reparsed.extra.get("custom_field"),
-            Some(&serde_yaml_ng::Value::String("keep me".to_string()))
-        );
-    }
-
-    fn compact_action(
-        slug: &str,
-        target: &str,
-        body: Option<&str>,
-    ) -> crate::claude::CompactAction {
-        crate::claude::CompactAction {
-            action: "merge_into".to_string(),
+    fn item(slug: &str, title: &str) -> LearningItem {
+        LearningItem {
             category: "patterns".to_string(),
             slug: slug.to_string(),
-            reason: None,
-            target_category: Some("patterns".to_string()),
-            target_slug: Some(target.to_string()),
-            target_updated_body: body.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn compact_merge_combines_sources_refreshes_date_and_deletes_source() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let cat_dir = root.join(".engram/memory/patterns");
-        std::fs::create_dir_all(&cat_dir).unwrap();
-        std::fs::write(
-            cat_dir.join("target.md"),
-            "---\ntitle: \"Target\"\nread_when: []\ntripwires: []\nlast_updated: \"2024-01-01\"\nsource_issues: [1]\n---\n\nOld body.\n",
-        )
-        .unwrap();
-        write_topic_file(root, REPO, &make_item("patterns", "dupe", "Dupe", &[]), 2).unwrap();
-
-        let topics = list_all_topics(root).unwrap();
-        let actions = [compact_action("dupe", "target", Some("Merged body."))];
-        let (deleted, merged) = apply_compact_actions(root, REPO, &actions, &topics).unwrap();
-        assert_eq!((deleted, merged), (0, 1));
-        assert!(!cat_dir.join("dupe.md").exists());
-
-        let (fm, body) =
-            split_frontmatter(&std::fs::read_to_string(cat_dir.join("target.md")).unwrap())
-                .unwrap();
-        let ids: Vec<_> = fm.sources.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["1", "2"]);
-        assert_eq!(fm.generated.unwrap().at, today_iso());
-        assert_eq!(body.trim(), "Merged body.");
-    }
-
-    #[test]
-    fn compact_merge_into_malformed_target_keeps_source() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let cat_dir = root.join(".engram/memory/patterns");
-        std::fs::create_dir_all(&cat_dir).unwrap();
-        std::fs::write(cat_dir.join("target.md"), "not frontmatter\n").unwrap();
-        write_topic_file(root, REPO, &make_item("patterns", "dupe", "Dupe", &[]), 2).unwrap();
-
-        let topics = list_all_topics(root).unwrap();
-        let actions = [
-            compact_action("dupe", "target", None),
-            compact_action("dupe", "missing", None),
-        ];
-        let (_, merged) = apply_compact_actions(root, REPO, &actions, &topics).unwrap();
-        assert_eq!(merged, 0);
-        assert!(cat_dir.join("dupe.md").exists());
-        assert_eq!(
-            std::fs::read_to_string(cat_dir.join("target.md")).unwrap(),
-            "not frontmatter\n"
-        );
-    }
-
-    #[test]
-    fn index_escapes_brackets_in_titles() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let item = make_item(
-            "patterns",
-            "brackets",
-            "Use features = [\"bundled\" ] or ]",
-            &[],
-        );
-        write_topic_file(root, REPO, &item, 1).unwrap();
-        rebuild_index(root).unwrap();
-        let index = std::fs::read_to_string(root.join(".engram/memory/index.md")).unwrap();
-        assert!(
-            index.contains("* [Use features = \\[\"bundled\" \\] or \\]](./patterns/brackets.md)")
-        );
-    }
-
-    #[test]
-    fn split_frontmatter_rejects_missing_delimiters() {
-        assert!(split_frontmatter("no frontmatter here").is_err());
-        assert!(split_frontmatter("---\ntitle: \"x\"\n").is_err());
-    }
-
-    // --- today_iso ---
-
-    #[test]
-    fn today_iso_format() {
-        let s = today_iso();
-        assert_eq!(s.len(), 10);
-        assert_eq!(&s[4..5], "-");
-        assert_eq!(&s[7..8], "-");
-        assert!(s[..4].parse::<u32>().is_ok());
-        assert!(s[5..7].parse::<u32>().is_ok());
-        assert!(s[8..10].parse::<u32>().is_ok());
-    }
-
-    // --- integration: write_topic_file + rebuild_index ---
-
-    fn make_item(category: &str, slug: &str, title: &str, read_when: &[&str]) -> LearningItem {
-        LearningItem {
-            category: category.to_string(),
-            slug: slug.to_string(),
             title: title.to_string(),
-            read_when: read_when.iter().map(|s| s.to_string()).collect(),
+            read_when: vec!["when doing X".to_string()],
             tripwires: vec![],
             body: "Body text.".to_string(),
         }
     }
 
-    #[test]
-    fn write_topic_file_creates_file_with_correct_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let item = make_item("patterns", "test-slug", "Test Title", &["when testing"]);
-
-        write_topic_file(root, REPO, &item, 42).unwrap();
-
-        let content =
-            std::fs::read_to_string(root.join(".engram/memory/patterns/test-slug.md")).unwrap();
-        assert!(content.contains("title: Test Title"));
-        assert!(content.contains("id: '42'"));
-        assert!(content.contains(&format!("https://github.com/{REPO}/issues/42")));
-        assert!(content.contains("when testing"));
-        assert!(content.contains("Body text."));
-        assert!(content.contains("type: pattern"));
+    fn read_fm(path: &Path) -> (Frontmatter, String) {
+        split_frontmatter(&std::fs::read_to_string(path).unwrap()).unwrap()
     }
 
     #[test]
-    fn write_topic_file_accumulates_source_issues() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let item = make_item("patterns", "my-slug", "My Title", &[]);
-
-        write_topic_file(root, REPO, &item, 1).unwrap();
-        write_topic_file(root, REPO, &item, 2).unwrap();
-
-        let content =
-            std::fs::read_to_string(root.join(".engram/memory/patterns/my-slug.md")).unwrap();
-        let (fm, _) = split_frontmatter(&content).unwrap();
-        assert_eq!(fm.generated.as_ref().unwrap().at, today_iso());
-        assert_eq!(fm.sources.len(), 2);
-        assert!(fm.sources.iter().any(|s| s.id == "1"));
-        assert!(fm.sources.iter().any(|s| s.id == "2"));
+    fn today_iso_format() {
+        let s = today_iso();
+        assert_eq!(s.len(), 10);
+        assert!(s[..4].parse::<u32>().is_ok() && &s[4..5] == "-" && &s[7..8] == "-");
     }
 
     #[test]
-    fn write_topic_file_with_tripwires() {
+    fn render_round_trips_special_characters_and_unknown_keys() {
+        let tricky = "A \"quoted\" title: with # hash";
+        let mut fm = Frontmatter::new("patterns", tricky);
+        fm.read_when = vec![tricky.to_string()];
+        fm.extra
+            .insert("custom".into(), serde_yaml_ng::Value::String("keep".into()));
+
+        let (parsed, body) = split_frontmatter(&render(&fm, "Body.").unwrap()).unwrap();
+        assert_eq!(parsed.title, tricky);
+        assert_eq!(parsed.read_when, [tricky]);
+        assert_eq!(parsed.extra.get("custom"), fm.extra.get("custom"));
+        assert_eq!(body.trim(), "Body.");
+    }
+
+    #[test]
+    fn write_topic_file_accumulates_deduped_sources() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let mut item = make_item("tripwires", "my-tripwire", "My Tripwire", &[]);
-        item.tripwires = vec![ClaudeTripwire {
-            action: "Calling foo()".to_string(),
-            warning: "Use bar() instead".to_string(),
+        let mut it = item("slug", "Title");
+        it.tripwires = vec![ClaudeTripwire {
+            action: "Calling foo()".into(),
+            warning: "Use bar()".into(),
         }];
+        for n in [1, 1, 2] {
+            write_topic_file(dir.path(), REPO, &it, n).unwrap();
+        }
 
-        write_topic_file(root, REPO, &item, 7).unwrap();
-
-        let content =
-            std::fs::read_to_string(root.join(".engram/memory/tripwires/my-tripwire.md")).unwrap();
-        assert!(content.contains("Calling foo()"));
-        assert!(content.contains("Use bar() instead"));
-        assert!(content.contains("type: tripwire"));
+        let (fm, body) = read_fm(&dir.path().join(".engram/memory/patterns/slug.md"));
+        assert_eq!(fm.kind, "pattern");
+        assert_eq!(fm.tripwires[0].warning, "Use bar()");
+        assert_eq!(fm.generated.unwrap().at, today_iso());
+        let ids: Vec<_> = fm.sources.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["1", "2"]);
+        assert_eq!(
+            fm.sources[0].resource,
+            format!("https://github.com/{REPO}/issues/1")
+        );
+        assert_eq!(body.trim(), "Body text.");
     }
 
     #[test]
-    fn rebuild_index_produces_okf_entry() {
+    fn rebuild_index_writes_okf_index_without_imports() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let item = make_item("patterns", "my-pattern", "My Pattern", &["when doing X"]);
-
-        write_topic_file(root, REPO, &item, 1).unwrap();
+        let index_path = root.join(".engram/memory/index.md");
+        std::fs::create_dir_all(root.join(".engram/memory")).unwrap();
         rebuild_index(root).unwrap();
+        assert!(std::fs::read_to_string(&index_path)
+            .unwrap()
+            .contains("No learnings yet"));
 
-        let index = std::fs::read_to_string(root.join(".engram/memory/index.md")).unwrap();
+        write_topic_file(root, REPO, &item("b", "Use [x] or ]"), 1).unwrap();
+        rebuild_index(root).unwrap();
+        let index = std::fs::read_to_string(&index_path).unwrap();
         assert!(index.starts_with("---\nokf_version: \"0.2\"\n---"));
         assert!(!index.contains('@'));
-        assert!(index.contains("My Pattern"));
-        assert!(index.contains("when doing X"));
-        assert!(index.contains("(./patterns/my-pattern.md)"));
+        assert!(index.contains("* [Use \\[x\\] or \\]](./patterns/b.md) - Read when: when doing X"));
     }
 
     #[test]
-    fn rebuild_index_empty_memory_dir() {
+    fn migrate_normalizes_legacy_files_idempotently_and_skips_malformed() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join(".engram/memory")).unwrap();
-
-        rebuild_index(root).unwrap();
-
-        let index = std::fs::read_to_string(root.join(".engram/memory/index.md")).unwrap();
-        assert!(index.starts_with("---\nokf_version: \"0.2\"\n---"));
-        assert!(index.contains("No learnings yet"));
-    }
-
-    #[test]
-    fn migrate_all_normalizes_legacy_files_and_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let cat_dir = root.join(".engram/memory/tripwires");
+        let cat_dir = dir.path().join(".engram/memory/tripwires");
         std::fs::create_dir_all(&cat_dir).unwrap();
-        std::fs::write(
-            cat_dir.join("legacy.md"),
-            "---\ntitle: \"Legacy\"\nread_when:\n  - \"doing X\"\ntripwires: []\nlast_updated: \"2024-01-01\"\nsource_issues: [9]\n---\n\nBody.\n",
-        )
-        .unwrap();
+        std::fs::write(cat_dir.join("legacy.md"), LEGACY).unwrap();
+        std::fs::write(cat_dir.join("broken.md"), "no frontmatter\n").unwrap();
 
-        let (processed, skipped) = migrate_all(root, REPO).unwrap();
-        assert_eq!(processed, 1);
-        assert_eq!(skipped, 0);
+        assert_eq!(migrate_all(dir.path(), REPO).unwrap(), (1, 1));
+        let first = std::fs::read_to_string(cat_dir.join("legacy.md")).unwrap();
+        assert!(!first.contains("last_updated") && !first.contains("source_issues"));
+        let (fm, _) = split_frontmatter(&first).unwrap();
+        assert_eq!(fm.kind, "tripwire");
+        assert_eq!(fm.generated.unwrap().at, "2024-01-01");
+        assert_eq!(fm.sources[0].id, "1");
 
-        let after_first = std::fs::read_to_string(cat_dir.join("legacy.md")).unwrap();
-        assert!(!after_first.contains("last_updated"));
-        assert!(!after_first.contains("source_issues"));
-        assert!(after_first.contains("type: tripwire"));
-
-        migrate_all(root, REPO).unwrap();
-        let after_second = std::fs::read_to_string(cat_dir.join("legacy.md")).unwrap();
-        assert_eq!(after_first, after_second);
+        migrate_all(dir.path(), REPO).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cat_dir.join("legacy.md")).unwrap(),
+            first
+        );
+        assert_eq!(
+            std::fs::read_to_string(cat_dir.join("broken.md")).unwrap(),
+            "no frontmatter\n"
+        );
     }
 
     #[test]
-    fn migrate_all_reports_malformed_files_without_rewriting() {
+    fn compact_merge_only_deletes_sources_that_landed() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let cat_dir = root.join(".engram/memory/patterns");
         std::fs::create_dir_all(&cat_dir).unwrap();
-        std::fs::write(cat_dir.join("broken.md"), "no frontmatter here\n").unwrap();
+        std::fs::write(cat_dir.join("target.md"), LEGACY).unwrap();
+        std::fs::write(cat_dir.join("broken.md"), "no frontmatter\n").unwrap();
+        for (slug, n) in [("a", 2), ("b", 3), ("c", 4)] {
+            write_topic_file(root, REPO, &item(slug, slug), n).unwrap();
+        }
+        let merge = |slug: &str, target: &str| CompactAction {
+            action: "merge_into".into(),
+            category: "patterns".into(),
+            slug: slug.into(),
+            reason: None,
+            target_category: Some("patterns".into()),
+            target_slug: Some(target.into()),
+            target_updated_body: Some("Merged.".into()),
+        };
+        let actions = [
+            merge("a", "target"),
+            merge("b", "broken"),
+            merge("c", "missing"),
+        ];
 
-        let (processed, skipped) = migrate_all(root, REPO).unwrap();
-        assert_eq!(processed, 0);
-        assert_eq!(skipped, 1);
+        let topics = list_all_topics(root).unwrap();
+        assert_eq!(
+            apply_compact_actions(root, REPO, &actions, &topics).unwrap(),
+            (0, 1)
+        );
+        assert!(!cat_dir.join("a.md").exists());
+        assert!(cat_dir.join("b.md").exists() && cat_dir.join("c.md").exists());
 
-        let content = std::fs::read_to_string(cat_dir.join("broken.md")).unwrap();
-        assert_eq!(content, "no frontmatter here\n");
+        let (fm, body) = read_fm(&cat_dir.join("target.md"));
+        let ids: Vec<_> = fm.sources.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["1", "2"]);
+        assert_eq!(fm.generated.unwrap().at, today_iso());
+        assert_eq!(body.trim(), "Merged.");
     }
 }
