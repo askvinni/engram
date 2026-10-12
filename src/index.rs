@@ -191,8 +191,8 @@ mod tests {
     fn rebuild_index_creates_db_indexes_files_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        write_topic_file(root, &make_item("patterns", "foo"), 1).unwrap();
-        write_topic_file(root, &make_item("tripwires", "bar"), 2).unwrap();
+        write_topic_file(root, "acme/widgets", &make_item("patterns", "foo"), 1).unwrap();
+        write_topic_file(root, "acme/widgets", &make_item("tripwires", "bar"), 2).unwrap();
 
         assert!(!check_index_health(root).unwrap());
         rebuild_index(root).unwrap();
@@ -253,7 +253,7 @@ mod tests {
             body: "A race condition occurs when two threads access shared state concurrently."
                 .to_string(),
         };
-        write_topic_file(root, &item, 1).unwrap();
+        write_topic_file(root, "acme/widgets", &item, 1).unwrap();
         rebuild_index(root).unwrap();
 
         let hits = search(root, "race condition").unwrap();
@@ -269,7 +269,7 @@ mod tests {
     fn search_rebuilds_index_on_demand_when_missing() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        write_topic_file(root, &make_item("patterns", "foo"), 1).unwrap();
+        write_topic_file(root, "acme/widgets", &make_item("patterns", "foo"), 1).unwrap();
 
         assert!(!root.join(".engram/index.db").exists());
         let results = search(root, "foo title").unwrap();

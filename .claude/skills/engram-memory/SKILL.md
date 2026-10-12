@@ -38,10 +38,11 @@ When a learning could fit two categories, prefer `tripwires/` if it records a pa
 
 ## Frontmatter fields
 
-Every memory file has YAML frontmatter:
+Every memory file has typed, OKF v0.2-compatible YAML frontmatter (`src/memory.rs:Frontmatter`):
 
 ```yaml
 ---
+type: tripwire                       # pattern | tripwire | architecture | testing
 title: "Human-readable title"
 read_when:
   - "calling claude -p programmatically from engram"
@@ -49,12 +50,20 @@ read_when:
 tripwires:              # can be [] for patterns/architecture/testing files
   - action: "Invoking claude -p with current_dir set to a repo directory"
     warning: "Always use current_dir(std::env::temp_dir()) — repo CLAUDE.md turns Claude into an agent"
-last_updated: "YYYY-MM-DD"
-source_issues: [26, 31]  # GitHub issue numbers that produced this learning
+generated:
+  by: "engram/0.1.0"
+  at: "2026-05-18"
+sources:
+  - id: "26"
+    resource: "https://github.com/<owner>/<repo>/issues/26"
+  - id: "31"
+    resource: "https://github.com/<owner>/<repo>/issues/31"
 ---
 ```
 
-`source_issues` lets you trace a memory file back to its originating PR and diff. If a learning seems wrong, check the source issue for context.
+`sources` lets you trace a memory file back to its originating issue(s) and diff. If a learning seems wrong, check the linked issue for context. `title`, `read_when`, and `tripwires` are engram extension keys the OKF spec explicitly permits; `type`, `generated`, and `sources` map to the OKF v0.2 schema.
+
+Files written before this schema existed used `last_updated`/`source_issues` instead of `generated`/`sources`. The reader still accepts that legacy shape; run `engram memory migrate` to rewrite everything into the current shape (idempotent — safe to run repeatedly).
 
 ## Running `engram compact`
 
@@ -84,7 +93,7 @@ Do not run compact immediately after `engram plan learn` — wait until several 
 
 You can edit memory files directly without going through `engram learn`:
 
-1. Edit the file and update `last_updated` to today's date
+1. Edit the file and update `generated.at` to today's date
 2. If the learning no longer applies (e.g., the source was refactored), delete the file
 3. Run `engram compact`-equivalent rebuild by editing `index.md` to remove the deleted entry, or just let the next `engram learn` call rebuild the index
 
@@ -100,6 +109,8 @@ CLAUDE.md contains an auto-managed section:
 <!-- engram:end -->
 ```
 
-This section holds **only** the `@path` reference — never inline memory content directly. If any memory file's body contains the string `<!-- engram:end -->` literally, the boundary detection in `src/memory.rs:write_claude_md_section` will break and truncate the section.
+This section holds **only** the `@path` reference to `index.md` itself — never inline memory content directly, and never `@`-reference individual topic files from here. If any memory file's body contains the string `<!-- engram:end -->` literally, the boundary detection in `src/memory.rs:write_claude_md_section` will break and truncate the section.
+
+`index.md`'s own entries link to topic files with plain `./category/slug.md` markdown links, not `@` imports — an `@`-prefixed link there would eager-load every memory file into every session, silently defeating `read_when` routing. Only the one `@.engram/memory/index.md` line in CLAUDE.md is eager-loaded.
 
 Do not manually edit text between the markers; `engram learn` and `engram compact` manage it automatically.
