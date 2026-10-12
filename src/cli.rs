@@ -84,9 +84,20 @@ pub enum KataCommands {
     },
 }
 
-/// kdispatch metadata flags shared by every command that creates a kata mirror.
+/// `--no-kata`, shared by every command that touches kata.
 #[derive(Debug, Args)]
-pub struct KataMetaArgs {
+pub struct NoKataArg {
+    /// Skip all kata calls for this invocation, even if kata is available
+    #[arg(long)]
+    pub no_kata: bool,
+}
+
+/// Flags shared by every command that creates a kata mirror: the opt-out plus
+/// the kdispatch metadata (`jira`, `type`) to set on the new issue.
+#[derive(Debug, Args)]
+pub struct KataMirrorArgs {
+    #[command(flatten)]
+    pub skip: NoKataArg,
     /// Jira key for the kata mirror's `jira` metadata (e.g. ABC-123); otherwise read from a `Jira:` body line or the title
     #[arg(long, value_parser = crate::kata::parse_jira_arg)]
     pub jira: Option<String>,
@@ -95,11 +106,11 @@ pub struct KataMetaArgs {
     pub kind: Option<String>,
 }
 
-impl From<KataMetaArgs> for crate::kata::TrackerMeta {
-    fn from(args: KataMetaArgs) -> Self {
+impl KataMirrorArgs {
+    pub fn tracker(&self) -> crate::kata::TrackerMeta {
         crate::kata::TrackerMeta {
-            jira: args.jira,
-            kind: args.kind,
+            jira: self.jira.clone(),
+            kind: self.kind.clone(),
         }
     }
 }
@@ -117,10 +128,7 @@ pub enum PlanCommands {
         #[arg(long)]
         conversation: Option<String>,
         #[command(flatten)]
-        tracker: KataMetaArgs,
-        /// Skip all kata calls for this invocation, even if kata is available
-        #[arg(long)]
-        no_kata: bool,
+        kata: KataMirrorArgs,
     },
     /// List open engram-plan issues
     List,
@@ -131,17 +139,15 @@ pub enum PlanCommands {
         /// Process all closed plan issues that have not yet been learned
         #[arg(long, conflicts_with = "issue")]
         all: bool,
-        /// Skip all kata calls for this invocation, even if kata is available
-        #[arg(long)]
-        no_kata: bool,
+        #[command(flatten)]
+        kata: NoKataArg,
     },
     /// Learn from a closed issue+PR, close the issue, and delete the local branch
     Land {
         /// GitHub issue number
         issue: u64,
-        /// Skip all kata calls for this invocation, even if kata is available
-        #[arg(long)]
-        no_kata: bool,
+        #[command(flatten)]
+        kata: NoKataArg,
     },
     /// Show the linked engram issue and PR for the current branch
     Status,
@@ -157,10 +163,7 @@ pub enum ObjectiveCommands {
         #[arg(long)]
         body: String,
         #[command(flatten)]
-        tracker: KataMetaArgs,
-        /// Skip all kata calls for this invocation, even if kata is available
-        #[arg(long)]
-        no_kata: bool,
+        kata: KataMirrorArgs,
     },
     /// List open objective issues
     List,
@@ -187,10 +190,7 @@ pub enum ObjectiveCommands {
         #[arg(long)]
         body: Option<String>,
         #[command(flatten)]
-        tracker: KataMetaArgs,
-        /// Skip all kata calls for this invocation, even if kata is available
-        #[arg(long)]
-        no_kata: bool,
+        kata: KataMirrorArgs,
     },
     /// Synthesize learnings from all plans in an objective and close it when done
     Land {

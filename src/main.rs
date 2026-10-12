@@ -111,31 +111,26 @@ fn cmd_plan(subcmd: cli::PlanCommands) -> Result<()> {
             title,
             body,
             conversation,
-            tracker,
-            no_kata,
+            kata,
         } => plan::new(
             &repo_root,
             &title,
             body.as_deref(),
             conversation.as_deref(),
-            &tracker.into(),
-            no_kata,
+            &kata.tracker(),
+            kata.skip.no_kata,
         ),
         cli::PlanCommands::List => plan::list(&repo_root),
-        cli::PlanCommands::Learn {
-            issue,
-            all,
-            no_kata,
-        } => {
+        cli::PlanCommands::Learn { issue, all, kata } => {
             if all {
-                plan::learn_all(&repo_root, no_kata)
+                plan::learn_all(&repo_root, kata.no_kata)
             } else if let Some(n) = issue {
-                plan::learn_single(&repo_root, n, no_kata)
+                plan::learn_single(&repo_root, n, kata.no_kata)
             } else {
                 anyhow::bail!("specify an issue number or pass --all")
             }
         }
-        cli::PlanCommands::Land { issue, no_kata } => plan::land(&repo_root, issue, no_kata),
+        cli::PlanCommands::Land { issue, kata } => plan::land(&repo_root, issue, kata.no_kata),
         cli::PlanCommands::Status => plan::status(&repo_root),
     }
 }
@@ -396,12 +391,9 @@ fn cmd_objective(subcmd: cli::ObjectiveCommands) -> Result<()> {
     let repo = config::resolve_repo(&cfg, &repo_root)?;
 
     match subcmd {
-        cli::ObjectiveCommands::New {
-            title,
-            body,
-            tracker,
-            no_kata,
-        } => objective::new(&repo, &title, &body, &tracker.into(), no_kata),
+        cli::ObjectiveCommands::New { title, body, kata } => {
+            objective::new(&repo, &title, &body, &kata.tracker(), kata.skip.no_kata)
+        }
         cli::ObjectiveCommands::List => objective::list_open(&repo),
         cli::ObjectiveCommands::View { number } => objective::view(&repo, number),
         cli::ObjectiveCommands::Plan {
@@ -409,16 +401,15 @@ fn cmd_objective(subcmd: cli::ObjectiveCommands) -> Result<()> {
             node,
             all_unblocked,
             body,
-            tracker,
-            no_kata,
+            kata,
         } => objective::plan(
             &repo,
             number,
             node.as_deref(),
             all_unblocked,
             body.as_deref(),
-            &tracker.into(),
-            no_kata,
+            &kata.tracker(),
+            kata.skip.no_kata,
         ),
         cli::ObjectiveCommands::Land { number } => objective::land(&repo_root, &repo, number),
         cli::ObjectiveCommands::Append {
