@@ -984,30 +984,30 @@ mod tests {
     #[test]
     fn tracker_meta_flags_win_over_body_and_title() {
         let m = TrackerMeta::resolve(
-            Some("WASP-1"),
+            Some("NGRM-1"),
             Some("fix"),
-            "[WASP-2] feat: thing",
-            "Jira: WASP-3\nType: chore",
+            "[NGRM-2] feat: thing",
+            "Jira: NGRM-3\nType: chore",
         );
-        assert_eq!(m, meta(Some("WASP-1"), Some("fix")));
+        assert_eq!(m, meta(Some("NGRM-1"), Some("fix")));
     }
 
     #[test]
     fn tracker_meta_reads_body_lines() {
-        let body = "## Why\n- **Jira:** https://acme.atlassian.net/browse/WASP-42\ntype: feat\n";
+        let body = "## Why\n- **Jira:** https://acme.atlassian.net/browse/NGRM-42\ntype: feat\n";
         let m = TrackerMeta::resolve(None, None, "Some title", body);
-        assert_eq!(m, meta(Some("WASP-42"), Some("feat")));
+        assert_eq!(m, meta(Some("NGRM-42"), Some("feat")));
     }
 
     #[test]
     fn tracker_meta_reads_title() {
         assert_eq!(
-            TrackerMeta::resolve(None, None, "[1.1] [WASP-7] add thing", ""),
-            meta(Some("WASP-7"), None)
+            TrackerMeta::resolve(None, None, "[1.1] [NGRM-7] add thing", ""),
+            meta(Some("NGRM-7"), None)
         );
         assert_eq!(
-            TrackerMeta::resolve(None, None, "WASP-8: fix(api): thing", ""),
-            meta(Some("WASP-8"), None)
+            TrackerMeta::resolve(None, None, "NGRM-8: fix(api): thing", ""),
+            meta(Some("NGRM-8"), None)
         );
         assert_eq!(
             TrackerMeta::resolve(None, None, "fix(api)!: thing", ""),
@@ -1029,22 +1029,22 @@ mod tests {
 
     #[test]
     fn tracker_meta_or_fills_only_missing_fields() {
-        let m = meta(None, Some("fix")).or(meta(Some("WASP-1"), Some("feat")));
-        assert_eq!(m, meta(Some("WASP-1"), Some("fix")));
-        assert_eq!(m.create_meta_args(), vec!["jira=WASP-1", "type=fix"]);
+        let m = meta(None, Some("fix")).or(meta(Some("NGRM-1"), Some("feat")));
+        assert_eq!(m, meta(Some("NGRM-1"), Some("fix")));
+        assert_eq!(m.create_meta_args(), vec!["jira=NGRM-1", "type=fix"]);
     }
 
     #[test]
     fn tracker_meta_from_kata_metadata() {
-        let md = serde_json::json!({"jira": "WASP-9", "engram.sync": {}});
-        assert_eq!(TrackerMeta::from_metadata(&md), meta(Some("WASP-9"), None));
+        let md = serde_json::json!({"jira": "NGRM-9", "engram.sync": {}});
+        assert_eq!(TrackerMeta::from_metadata(&md), meta(Some("NGRM-9"), None));
     }
 
     #[test]
     fn jira_and_type_args_normalize_and_reject() {
-        assert_eq!(parse_jira_arg("wasp-12"), Ok("WASP-12".to_string()));
-        assert!(parse_jira_arg("WASP").is_err());
-        assert!(parse_jira_arg("12-WASP").is_err());
+        assert_eq!(parse_jira_arg("ngrm-12"), Ok("NGRM-12".to_string()));
+        assert!(parse_jira_arg("NGRM").is_err());
+        assert!(parse_jira_arg("12-NGRM").is_err());
         assert_eq!(parse_type_arg("Feat"), Ok("feat".to_string()));
         assert!(parse_type_arg("feature").is_err());
     }
