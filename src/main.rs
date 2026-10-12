@@ -10,7 +10,7 @@ mod memory;
 mod objective;
 mod plan;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Commands, OutputMode};
 use include_dir::{include_dir, Dir};
@@ -47,6 +47,7 @@ fn main() -> Result<()> {
         Commands::Objective { subcommand } => cmd_objective(subcommand),
         Commands::Read { permalink } => cmd_read(&permalink, mode),
         Commands::Kata { subcommand } => cmd_kata(subcommand),
+        Commands::Memory { subcommand } => cmd_memory(subcommand),
     }
 }
 
@@ -144,6 +145,28 @@ fn cmd_plan(subcmd: cli::PlanCommands) -> Result<()> {
 fn cmd_compact() -> Result<()> {
     let repo_root = config::find_repo_root()?;
     compact::run(&repo_root)
+}
+
+fn cmd_memory(subcmd: cli::MemoryCommands) -> Result<()> {
+    let repo_root = config::find_repo_root()?;
+    match subcmd {
+        cli::MemoryCommands::Migrate => cmd_memory_migrate(&repo_root),
+    }
+}
+
+fn cmd_memory_migrate(repo_root: &std::path::Path) -> Result<()> {
+    let cfg = config::Config::load(repo_root)?;
+    let repo = config::resolve_repo(&cfg, repo_root)
+        .context("resolving GitHub repo for memory migrate")?;
+
+    let (processed, skipped) = memory::migrate_all(repo_root, &repo)?;
+    println!("Migrated {processed} file(s), skipped {skipped}.");
+
+    memory::rebuild_index(repo_root)?;
+    memory::write_claude_md_section(repo_root)?;
+    println!("Rebuilt index and CLAUDE.md section.");
+
+    Ok(())
 }
 
 fn cmd_search(mode: cli::OutputMode, query: &str) -> Result<()> {

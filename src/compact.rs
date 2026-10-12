@@ -5,6 +5,8 @@ use std::process::Command;
 use crate::{claude, memory};
 
 pub fn run(repo_root: &Path) -> Result<()> {
+    let repo = resolve_repo(repo_root)?;
+
     println!("Reading memory files...");
     let topics = memory::list_all_topics(repo_root)?;
     if topics.is_empty() {
@@ -61,7 +63,7 @@ pub fn run(repo_root: &Path) -> Result<()> {
     }
 
     println!("Applying changes...");
-    let (deleted, merged) = memory::apply_compact_actions(repo_root, &actions, &topics)?;
+    let (deleted, merged) = memory::apply_compact_actions(repo_root, &repo, &actions, &topics)?;
 
     println!("Rebuilding memory index...");
     memory::rebuild_index(repo_root)?;
@@ -95,12 +97,8 @@ pub fn run(repo_root: &Path) -> Result<()> {
     let pr_body = format!(
         "Compacted memory: {deleted} files deleted, {merged} files merged.\n\n---\n*Created by engram compact*"
     );
-    let pr_url = crate::github::create_pr(
-        &resolve_repo(repo_root)?,
-        "engram: compact memory",
-        &pr_body,
-        "engram-learned",
-    )?;
+    let pr_url =
+        crate::github::create_pr(&repo, "engram: compact memory", &pr_body, "engram-learned")?;
 
     println!("PR created: {}", pr_url.trim());
     Ok(())

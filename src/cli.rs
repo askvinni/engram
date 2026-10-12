@@ -69,6 +69,17 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: KataCommands,
     },
+    /// Memory file maintenance
+    Memory {
+        #[command(subcommand)]
+        subcommand: MemoryCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MemoryCommands {
+    /// Rewrite all memory files into OKF v0.2 typed frontmatter
+    Migrate,
 }
 
 #[derive(Subcommand)]

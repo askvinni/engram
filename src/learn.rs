@@ -70,7 +70,7 @@ pub fn write_memory(
 
     println!("Writing {} learning(s)...", items.len());
     for item in &items {
-        memory::write_topic_file(repo_root, item, issue_number)?;
+        memory::write_topic_file(repo_root, repo, item, issue_number)?;
         println!("  [{}] {} — {}", item.category, item.slug, item.title);
     }
 

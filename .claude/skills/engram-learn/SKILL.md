@@ -35,7 +35,7 @@ If either check fails, `engram plan learn` will exit with an error message. Fix 
 6. Loads `.engram/prompt-hooks/*.md` (excluding `README.md`) to inject repo-specific synthesis rules
 7. Invokes `claude -p` **from `std::env::temp_dir()`** — not from the repo root — to prevent Claude Code from loading the repo's CLAUDE.md as agent context
 8. Strips markdown code fences from the response, parses a JSON array of `LearningItem`s
-9. For each item: writes to `.engram/memory/<category>/<slug>.md`, accumulating `source_issues` if the file already exists
+9. For each item: writes to `.engram/memory/<category>/<slug>.md`, accumulating `sources` if the file already exists
 10. Rebuilds `.engram/memory/index.md`
 11. Updates the `<!-- engram:start --> ... <!-- engram:end -->` section in CLAUDE.md
 12. Creates branch `engram/learn-<N>`, commits, pushes, opens a PR labeled `engram-learned`
