@@ -2,22 +2,6 @@
 
 Plan-based agentic development helper. CLI tool that wraps GitHub issues, Claude, and git into a structured learn/remember workflow.
 
-## Project layout
-
-```
-src/
-  main.rs          — command dispatch and all cmd_* handlers
-  cli.rs           — clap struct and Commands enum
-  config.rs        — Config struct, find_repo_root()
-  github.rs        — all gh CLI wrappers (issues, PRs, labels)
-  claude.rs        — claude -p invocations and JSON parsing
-  memory.rs        — .engram/memory/ file I/O, index, CLAUDE.md section
-  learn.rs         — learn workflow (fetch issue → synthesize → commit → PR)
-  compact.rs       — compact workflow (audit memory → prune → commit → PR)
-```
-
-No `lib.rs` — this is a pure binary crate. All modules are internal.
-
 ## Error handling
 
 Use `anyhow::Result` and `anyhow::Error` everywhere. Never introduce `unwrap()` or `expect()` in non-test code.
