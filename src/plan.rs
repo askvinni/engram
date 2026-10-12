@@ -9,6 +9,7 @@ pub fn new(
     title: &str,
     body: Option<&str>,
     conversation: Option<&str>,
+    tracker: &kata::TrackerMeta,
     no_kata: bool,
 ) -> Result<()> {
     let cfg = config::Config::load(repo_root)?;
@@ -33,7 +34,13 @@ pub fn new(
     if !no_kata && kata::kata_available() {
         let kata_body = format!("GitHub: {url}\n\n{body}");
         let idempotency_key = format!("engram-plan-{issue_number}");
-        match kata::create(title, &kata_body, &idempotency_key, None) {
+        let meta = kata::TrackerMeta::resolve(
+            tracker.jira.as_deref(),
+            tracker.kind.as_deref(),
+            title,
+            body,
+        );
+        match kata::create(title, &kata_body, &idempotency_key, None, &meta) {
             Ok(kata_ref) => {
                 let updated_body = format!("{body}\nKata: {kata_ref}");
                 if let Err(e) = github::update_issue_body(&repo, issue_number, &updated_body) {
