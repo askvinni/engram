@@ -22,6 +22,10 @@ fn okf_type_for(category: &str) -> &'static str {
         .unwrap_or("pattern")
 }
 
+fn generator() -> String {
+    format!("engram/{}", env!("CARGO_PKG_VERSION"))
+}
+
 fn capitalize(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
@@ -99,7 +103,7 @@ impl Frontmatter {
         if self.generated.is_none() {
             let at = self.last_updated.clone().unwrap_or_else(today_iso);
             self.generated = Some(Generated {
-                by: format!("engram/{}", env!("CARGO_PKG_VERSION")),
+                by: generator(),
                 at,
             });
         }
@@ -116,6 +120,14 @@ impl Frontmatter {
         }
         self.last_updated = None;
         self.legacy_source_issues = None;
+    }
+
+    /// Stamps `generated` with this binary and today's date; call on every content rewrite.
+    pub fn touch(&mut self) {
+        self.generated = Some(Generated {
+            by: generator(),
+            at: today_iso(),
+        });
     }
 
     /// Adds a source for `issue_number`, deduping on `id`.
@@ -247,6 +259,7 @@ pub fn apply_compact_actions(
     let memory_dir = repo_root.join(".engram/memory");
     let mut deleted = 0;
     let mut merged = 0;
+    let mut merged_sources = std::collections::HashSet::new();
 
     // First pass: update merge targets before deleting sources
     for action in actions {
@@ -278,20 +291,36 @@ pub fn apply_compact_actions(
         }
 
         let existing = std::fs::read_to_string(&target_path)?;
-        let (mut fm, existing_body) = split_frontmatter(&existing)?;
+        let (mut fm, existing_body) = match split_frontmatter(&existing) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                eprintln!(
+                    "warning: not merging {}/{} — target {} is malformed: {e:#}",
+                    action.category,
+                    action.slug,
+                    target_path.display()
+                );
+                continue;
+            }
+        };
         fm.normalize(target_cat, repo);
         fm.merge_sources(source_entries);
+        fm.touch();
         let body = action
             .target_updated_body
             .as_deref()
             .unwrap_or(&existing_body);
         let updated = render(&fm, body)?;
         std::fs::write(&target_path, updated)?;
+        merged_sources.insert((action.category.as_str(), action.slug.as_str()));
     }
 
-    // Second pass: delete files (deletes and merge sources)
+    // Second pass: delete files. A merge source is only deleted once its
+    // merge landed, so a missing or malformed target never loses content.
     for action in actions {
-        if action.action == "delete" || action.action == "merge_into" {
+        let merge_landed = action.action == "merge_into"
+            && merged_sources.contains(&(action.category.as_str(), action.slug.as_str()));
+        if action.action == "delete" || merge_landed {
             let path = memory_dir
                 .join(&action.category)
                 .join(format!("{}.md", action.slug));
@@ -349,7 +378,13 @@ pub fn write_topic_file(
                 fm.normalize(category, repo);
                 fm
             }
-            Err(_) => Frontmatter::new(category, &item.title),
+            Err(e) => {
+                eprintln!(
+                    "warning: {} has malformed frontmatter ({e:#}); rewriting it and dropping its previous sources",
+                    path.display()
+                );
+                Frontmatter::new(category, &item.title)
+            }
         }
     } else {
         Frontmatter::new(category, &item.title)
@@ -366,6 +401,7 @@ pub fn write_topic_file(
         })
         .collect();
     fm.add_source(repo, issue_number);
+    fm.touch();
 
     let content = render(&fm, &item.body)?;
     std::fs::write(path, content)?;
@@ -433,6 +469,7 @@ pub fn rebuild_index(repo_root: &Path) -> Result<()> {
             } else {
                 format!(" - Read when: {}", read_when.join("; "))
             };
+            let title = title.replace('[', "\\[").replace(']', "\\]");
             entries.push(format!("* [{title}](./{category}/{slug}.md){suffix}"));
         }
 
@@ -614,9 +651,95 @@ mod tests {
         let (mut fm, body) = split_frontmatter(content).unwrap();
         fm.normalize("patterns", REPO);
         let rendered = render(&fm, &body).unwrap();
+        let (reparsed, _) = split_frontmatter(&rendered).unwrap();
+        assert_eq!(
+            reparsed.extra.get("custom_field"),
+            Some(&serde_yaml_ng::Value::String("keep me".to_string()))
+        );
+    }
+
+    fn compact_action(
+        slug: &str,
+        target: &str,
+        body: Option<&str>,
+    ) -> crate::claude::CompactAction {
+        crate::claude::CompactAction {
+            action: "merge_into".to_string(),
+            category: "patterns".to_string(),
+            slug: slug.to_string(),
+            reason: None,
+            target_category: Some("patterns".to_string()),
+            target_slug: Some(target.to_string()),
+            target_updated_body: body.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn compact_merge_combines_sources_refreshes_date_and_deletes_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cat_dir = root.join(".engram/memory/patterns");
+        std::fs::create_dir_all(&cat_dir).unwrap();
+        std::fs::write(
+            cat_dir.join("target.md"),
+            "---\ntitle: \"Target\"\nread_when: []\ntripwires: []\nlast_updated: \"2024-01-01\"\nsource_issues: [1]\n---\n\nOld body.\n",
+        )
+        .unwrap();
+        write_topic_file(root, REPO, &make_item("patterns", "dupe", "Dupe", &[]), 2).unwrap();
+
+        let topics = list_all_topics(root).unwrap();
+        let actions = [compact_action("dupe", "target", Some("Merged body."))];
+        let (deleted, merged) = apply_compact_actions(root, REPO, &actions, &topics).unwrap();
+        assert_eq!((deleted, merged), (0, 1));
+        assert!(!cat_dir.join("dupe.md").exists());
+
+        let (fm, body) =
+            split_frontmatter(&std::fs::read_to_string(cat_dir.join("target.md")).unwrap())
+                .unwrap();
+        let ids: Vec<_> = fm.sources.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["1", "2"]);
+        assert_eq!(fm.generated.unwrap().at, today_iso());
+        assert_eq!(body.trim(), "Merged body.");
+    }
+
+    #[test]
+    fn compact_merge_into_malformed_target_keeps_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cat_dir = root.join(".engram/memory/patterns");
+        std::fs::create_dir_all(&cat_dir).unwrap();
+        std::fs::write(cat_dir.join("target.md"), "not frontmatter\n").unwrap();
+        write_topic_file(root, REPO, &make_item("patterns", "dupe", "Dupe", &[]), 2).unwrap();
+
+        let topics = list_all_topics(root).unwrap();
+        let actions = [
+            compact_action("dupe", "target", None),
+            compact_action("dupe", "missing", None),
+        ];
+        let (_, merged) = apply_compact_actions(root, REPO, &actions, &topics).unwrap();
+        assert_eq!(merged, 0);
+        assert!(cat_dir.join("dupe.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(cat_dir.join("target.md")).unwrap(),
+            "not frontmatter\n"
+        );
+    }
+
+    #[test]
+    fn index_escapes_brackets_in_titles() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let item = make_item(
+            "patterns",
+            "brackets",
+            "Use features = [\"bundled\" ] or ]",
+            &[],
+        );
+        write_topic_file(root, REPO, &item, 1).unwrap();
+        rebuild_index(root).unwrap();
+        let index = std::fs::read_to_string(root.join(".engram/memory/index.md")).unwrap();
         assert!(
-            rendered.contains("custom_field: keep me")
-                || rendered.contains("custom_field: \"keep me\"")
+            index.contains("* [Use features = \\[\"bundled\" \\] or \\]](./patterns/brackets.md)")
         );
     }
 
@@ -682,6 +805,7 @@ mod tests {
         let content =
             std::fs::read_to_string(root.join(".engram/memory/patterns/my-slug.md")).unwrap();
         let (fm, _) = split_frontmatter(&content).unwrap();
+        assert_eq!(fm.generated.as_ref().unwrap().at, today_iso());
         assert_eq!(fm.sources.len(), 2);
         assert!(fm.sources.iter().any(|s| s.id == "1"));
         assert!(fm.sources.iter().any(|s| s.id == "2"));
