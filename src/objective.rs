@@ -186,7 +186,13 @@ fn extract_section<'a>(body: &'a str, heading: &str) -> Option<&'a str> {
     Some(&content[..section_end])
 }
 
-pub fn new(repo: &str, title: &str, body: &str, no_kata: bool) -> Result<()> {
+pub fn new(
+    repo: &str,
+    title: &str,
+    body: &str,
+    tracker: &kata::TrackerMeta,
+    no_kata: bool,
+) -> Result<()> {
     let roadmap_text = extract_section(body, "Roadmap")
         .ok_or_else(|| anyhow::anyhow!("body must contain a ## Roadmap section"))?;
 
@@ -209,7 +215,13 @@ pub fn new(repo: &str, title: &str, body: &str, no_kata: bool) -> Result<()> {
             .with_context(|| format!("could not parse issue number from URL: {url}"))?;
         let kata_body = format!("GitHub: {url}\n\n{issue_body}");
         let idempotency_key = format!("engram-objective-{issue_number}");
-        match kata::create(title, &kata_body, &idempotency_key, None) {
+        let meta = kata::TrackerMeta::resolve(
+            tracker.jira.as_deref(),
+            tracker.kind.as_deref(),
+            title,
+            body,
+        );
+        match kata::create(title, &kata_body, &idempotency_key, None, &meta) {
             Ok(kata_ref) => {
                 let updated_body = format!("{issue_body}\nKata: {kata_ref}");
                 if let Err(e) = github::update_issue_body(repo, issue_number, &updated_body) {
@@ -295,6 +307,7 @@ fn create_plan_for_node(
     nodes: &mut [ObjectiveNode],
     node_idx: usize,
     body: Option<&str>,
+    tracker: &kata::TrackerMeta,
     no_kata: bool,
 ) -> Result<String> {
     let node_id = nodes[node_idx].id.clone();
@@ -342,6 +355,14 @@ fn create_plan_for_node(
 
     if !no_kata && kata::kata_available() {
         let kata_parent = kata::parse_ref(obj_body);
+        let meta = node_tracker_meta(
+            tracker,
+            &plan_title,
+            &plan_body,
+            obj_title,
+            obj_body,
+            kata_parent.as_deref(),
+        );
         let kata_body = format!("GitHub: {plan_url}\n\n{plan_body}");
         let idempotency_key = format!("engram-plan-{plan_issue_number}");
         match kata::create(
@@ -349,6 +370,7 @@ fn create_plan_for_node(
             &kata_body,
             &idempotency_key,
             kata_parent.as_deref(),
+            &meta,
         ) {
             Ok(kata_ref) => {
                 let updated_body = format!("{plan_body}\nKata: {kata_ref}");
@@ -365,12 +387,42 @@ fn create_plan_for_node(
     Ok(plan_url)
 }
 
+/// A node plan's own Jira key/type (flags, then its body/title) win; anything
+/// missing is inherited from the objective's GitHub issue, then its kata mirror.
+fn node_tracker_meta(
+    tracker: &kata::TrackerMeta,
+    plan_title: &str,
+    plan_body: &str,
+    obj_title: &str,
+    obj_body: &str,
+    kata_parent: Option<&str>,
+) -> kata::TrackerMeta {
+    let meta = kata::TrackerMeta::resolve(
+        tracker.jira.as_deref(),
+        tracker.kind.as_deref(),
+        plan_title,
+        plan_body,
+    )
+    .or(kata::TrackerMeta::resolve(None, None, obj_title, obj_body));
+    match kata_parent {
+        Some(parent) if !meta.is_complete() => match kata::tracker_meta_of(parent) {
+            Ok(parent_meta) => meta.or(parent_meta),
+            Err(e) => {
+                eprintln!("warning: could not read kata metadata of {parent}: {e:#}");
+                meta
+            }
+        },
+        _ => meta,
+    }
+}
+
 pub fn plan(
     repo: &str,
     objective_number: u64,
     node_id: Option<&str>,
     all_unblocked: bool,
     body: Option<&str>,
+    tracker: &kata::TrackerMeta,
     no_kata: bool,
 ) -> Result<()> {
     let obj_issue =
@@ -403,6 +455,7 @@ pub fn plan(
                 &mut nodes,
                 idx,
                 None,
+                tracker,
                 no_kata,
             ) {
                 Ok(url) => {
@@ -442,6 +495,7 @@ pub fn plan(
             &mut nodes,
             node_idx,
             body,
+            tracker,
             no_kata,
         )?;
 

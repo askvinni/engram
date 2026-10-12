@@ -10,6 +10,156 @@ const KATA_REF_PREFIX: &str = "Kata: ";
 const GITHUB_PREFIX: &str = "GitHub: ";
 const SYNC_META_KEY: &str = "engram.sync";
 const CONFLICT_LABEL: &str = "kata-sync-conflict";
+const JIRA_META_KEY: &str = "jira";
+const TYPE_META_KEY: &str = "type";
+const CHANGE_TYPES: &[&str] = &[
+    "feat", "fix", "chore", "docs", "refactor", "test", "perf", "build", "ci", "style", "revert",
+];
+
+/// Ticket metadata that kdispatch's branch/PR-title templates read from kata
+/// (`{meta[jira]}`, `{meta[type]}`). Absent fields are never written — no placeholders.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TrackerMeta {
+    pub jira: Option<String>,
+    pub kind: Option<String>,
+}
+
+impl TrackerMeta {
+    /// Explicit flags win; otherwise read `Jira:` / `Type:` lines from the body,
+    /// then fall back to the title (`[KEY-12] ...`, `KEY-12: ...`, `feat: ...`).
+    pub fn resolve(
+        jira_flag: Option<&str>,
+        type_flag: Option<&str>,
+        title: &str,
+        body: &str,
+    ) -> Self {
+        let jira = jira_flag
+            .map(|s| s.to_string())
+            .or_else(|| body_field(body, "jira").and_then(jira_key_from_value))
+            .or_else(|| jira_key_from_title(title));
+        let kind = type_flag
+            .map(|s| s.to_string())
+            .or_else(|| body_field(body, "type").and_then(change_type))
+            .or_else(|| change_type_from_title(title));
+        TrackerMeta { jira, kind }
+    }
+
+    /// Fill any missing field from `fallback` (e.g. a child inheriting its objective's key).
+    pub fn or(self, fallback: TrackerMeta) -> Self {
+        TrackerMeta {
+            jira: self.jira.or(fallback.jira),
+            kind: self.kind.or(fallback.kind),
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.jira.is_some() && self.kind.is_some()
+    }
+
+    fn from_metadata(metadata: &serde_json::Value) -> Self {
+        let field = |key: &str| {
+            metadata
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        };
+        TrackerMeta {
+            jira: field(JIRA_META_KEY),
+            kind: field(TYPE_META_KEY),
+        }
+    }
+
+    /// `key=value` pairs for `kata create --meta`.
+    fn create_meta_args(&self) -> Vec<String> {
+        let mut pairs = Vec::new();
+        if let Some(j) = &self.jira {
+            pairs.push(format!("{JIRA_META_KEY}={j}"));
+        }
+        if let Some(t) = &self.kind {
+            pairs.push(format!("{TYPE_META_KEY}={t}"));
+        }
+        pairs
+    }
+}
+
+/// clap value parser for `--jira`: accepts `KEY-123` (any case) or a browse URL.
+pub fn parse_jira_arg(s: &str) -> std::result::Result<String, String> {
+    jira_key_from_value(&s.trim().to_uppercase())
+        .ok_or_else(|| format!("`{s}` is not a Jira key (expected e.g. ABC-123)"))
+}
+
+/// clap value parser for `--type`: one of the conventional-commit change types.
+pub fn parse_type_arg(s: &str) -> std::result::Result<String, String> {
+    change_type(&s.trim().to_lowercase()).ok_or_else(|| {
+        format!(
+            "`{s}` is not a change type (one of {})",
+            CHANGE_TYPES.join(", ")
+        )
+    })
+}
+
+/// Read the kdispatch metadata already set on a kata issue.
+pub fn tracker_meta_of(kata_ref: &str) -> Result<TrackerMeta> {
+    Ok(TrackerMeta::from_metadata(&show(kata_ref)?.metadata))
+}
+
+/// Value of a `Name: value` line (case-insensitive name, optional list bullet / bold).
+fn body_field<'a>(body: &'a str, name: &str) -> Option<&'a str> {
+    body.lines().find_map(|line| {
+        let line = line.trim().trim_start_matches(['-', '*', ' ']);
+        let (key, value) = line.split_once(':')?;
+        key.trim_matches(['*', ' '])
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim_matches(['*', ' ']))
+    })
+}
+
+fn is_jira_key(s: &str) -> bool {
+    let Some((project, number)) = s.split_once('-') else {
+        return false;
+    };
+    let mut chars = project.chars();
+    chars.next().is_some_and(|c| c.is_ascii_uppercase())
+        && project.len() >= 2
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && !number.is_empty()
+        && number.chars().all(|c| c.is_ascii_digit())
+}
+
+/// A bare key, or the last path segment of a Jira browse URL.
+fn jira_key_from_value(value: &str) -> Option<String> {
+    let token = value.split_whitespace().next()?;
+    let candidate = token.trim_end_matches('/').rsplit('/').next()?;
+    is_jira_key(candidate).then(|| candidate.to_string())
+}
+
+/// Only keys in deliberate positions count — a bracketed `[KEY-12]` anywhere or a
+/// leading `KEY-12` token — so words like `UTF-8` mid-title are not mistaken for keys.
+fn jira_key_from_title(title: &str) -> Option<String> {
+    let bracketed = title
+        .split('[')
+        .skip(1)
+        .filter_map(|s| s.split_once(']').map(|(inner, _)| inner.trim()))
+        .find(|inner| is_jira_key(inner));
+    let leading = title
+        .split_whitespace()
+        .next()
+        .map(|t| t.trim_end_matches(':'))
+        .filter(|t| is_jira_key(t));
+    bracketed.or(leading).map(|s| s.to_string())
+}
+
+fn change_type(value: &str) -> Option<String> {
+    let token = value.split_whitespace().next()?;
+    CHANGE_TYPES.contains(&token).then(|| token.to_string())
+}
+
+/// Conventional-commit prefix: `feat: ...`, `fix(scope): ...`, `chore!: ...`.
+fn change_type_from_title(title: &str) -> Option<String> {
+    let (prefix, _) = title.trim().split_once(':')?;
+    let base = prefix.split('(').next()?.trim_end_matches('!');
+    change_type(base)
+}
 
 #[allow(dead_code)]
 static KATA_AVAILABLE: OnceLock<bool> = OnceLock::new();
@@ -38,12 +188,15 @@ fn detect() -> bool {
 /// Create a kata issue and return its short ref (e.g. "abc4").
 /// The idempotency key ensures retries after partial failure don't duplicate the issue.
 /// `parent`, when given, links the new issue under that kata ref (containment only).
+/// `meta` fields that are set become initial kata metadata (`jira`, `type`).
 pub fn create(
     title: &str,
     body: &str,
     idempotency_key: &str,
     parent: Option<&str>,
+    meta: &TrackerMeta,
 ) -> Result<String> {
+    let meta_args = meta.create_meta_args();
     let mut args = vec![
         "create",
         title,
@@ -55,6 +208,10 @@ pub fn create(
     if let Some(p) = parent {
         args.push("--parent");
         args.push(p);
+    }
+    for pair in &meta_args {
+        args.push("--meta");
+        args.push(pair);
     }
     args.push("--json");
 
@@ -815,6 +972,81 @@ mod tests {
     fn kata_available_returns_bool() {
         // Just verify it runs without panicking; actual value depends on the environment.
         let _ = kata_available();
+    }
+
+    fn meta(jira: Option<&str>, kind: Option<&str>) -> TrackerMeta {
+        TrackerMeta {
+            jira: jira.map(String::from),
+            kind: kind.map(String::from),
+        }
+    }
+
+    #[test]
+    fn tracker_meta_flags_win_over_body_and_title() {
+        let m = TrackerMeta::resolve(
+            Some("WASP-1"),
+            Some("fix"),
+            "[WASP-2] feat: thing",
+            "Jira: WASP-3\nType: chore",
+        );
+        assert_eq!(m, meta(Some("WASP-1"), Some("fix")));
+    }
+
+    #[test]
+    fn tracker_meta_reads_body_lines() {
+        let body = "## Why\n- **Jira:** https://acme.atlassian.net/browse/WASP-42\ntype: feat\n";
+        let m = TrackerMeta::resolve(None, None, "Some title", body);
+        assert_eq!(m, meta(Some("WASP-42"), Some("feat")));
+    }
+
+    #[test]
+    fn tracker_meta_reads_title() {
+        assert_eq!(
+            TrackerMeta::resolve(None, None, "[1.1] [WASP-7] add thing", ""),
+            meta(Some("WASP-7"), None)
+        );
+        assert_eq!(
+            TrackerMeta::resolve(None, None, "WASP-8: fix(api): thing", ""),
+            meta(Some("WASP-8"), None)
+        );
+        assert_eq!(
+            TrackerMeta::resolve(None, None, "fix(api)!: thing", ""),
+            meta(None, Some("fix"))
+        );
+    }
+
+    #[test]
+    fn tracker_meta_empty_without_ticket() {
+        let m = TrackerMeta::resolve(
+            None,
+            None,
+            "Handle UTF-8 and SHA-256 in [1.2]",
+            "## Why\nNo ticket here. Typed: nope\nType: banana",
+        );
+        assert_eq!(m, TrackerMeta::default());
+        assert!(m.create_meta_args().is_empty());
+    }
+
+    #[test]
+    fn tracker_meta_or_fills_only_missing_fields() {
+        let m = meta(None, Some("fix")).or(meta(Some("WASP-1"), Some("feat")));
+        assert_eq!(m, meta(Some("WASP-1"), Some("fix")));
+        assert_eq!(m.create_meta_args(), vec!["jira=WASP-1", "type=fix"]);
+    }
+
+    #[test]
+    fn tracker_meta_from_kata_metadata() {
+        let md = serde_json::json!({"jira": "WASP-9", "engram.sync": {}});
+        assert_eq!(TrackerMeta::from_metadata(&md), meta(Some("WASP-9"), None));
+    }
+
+    #[test]
+    fn jira_and_type_args_normalize_and_reject() {
+        assert_eq!(parse_jira_arg("wasp-12"), Ok("WASP-12".to_string()));
+        assert!(parse_jira_arg("WASP").is_err());
+        assert!(parse_jira_arg("12-WASP").is_err());
+        assert_eq!(parse_type_arg("Feat"), Ok("feat".to_string()));
+        assert!(parse_type_arg("feature").is_err());
     }
 
     #[test]
