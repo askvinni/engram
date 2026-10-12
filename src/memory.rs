@@ -26,12 +26,8 @@ fn generator() -> String {
     format!("engram/{}", env!("CARGO_PKG_VERSION"))
 }
 
-fn capitalize(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-    }
+fn table_cell(s: &str) -> String {
+    s.replace('|', "\\|").replace('\n', " ")
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
@@ -448,42 +444,36 @@ pub fn rebuild_index(repo_root: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let mut sections = Vec::new();
+    let mut rows = Vec::new();
 
     for (category, cat_dir) in category_dirs(&memory_dir) {
-        let files = sorted_md_files(&cat_dir)?;
-        if files.is_empty() {
-            continue;
-        }
-
-        let mut entries = Vec::new();
-        for path in &files {
-            let content = std::fs::read_to_string(path)?;
-            let slug = slug_of(path);
+        for path in sorted_md_files(&cat_dir)? {
+            let content = std::fs::read_to_string(&path)?;
+            let slug = slug_of(&path);
             let (title, read_when) = match split_frontmatter(&content) {
                 Ok((fm, _)) => (fm.title, fm.read_when),
                 Err(_) => (slug.clone(), Vec::new()),
             };
-            let suffix = if read_when.is_empty() {
-                String::new()
+            let read_when = if read_when.is_empty() {
+                "—".to_string()
             } else {
-                format!(" - Read when: {}", read_when.join("; "))
+                read_when.join("; ")
             };
-            let title = title.replace('[', "\\[").replace(']', "\\]");
-            entries.push(format!("* [{title}](./{category}/{slug}.md){suffix}"));
+            rows.push(format!(
+                "| [{category}/{slug}.md](./{category}/{slug}.md) | {} | {} |",
+                table_cell(&title),
+                table_cell(&read_when)
+            ));
         }
-
-        sections.push(format!(
-            "## {}\n\n{}\n",
-            capitalize(category),
-            entries.join("\n")
-        ));
     }
 
-    let body = if sections.is_empty() {
+    let body = if rows.is_empty() {
         "_No learnings yet._\n".to_string()
     } else {
-        sections.join("\n")
+        format!(
+            "| File | Title | Read when |\n|------|-------|-----------|\n{}\n",
+            rows.join("\n")
+        )
     };
 
     let content = format!(
@@ -636,12 +626,12 @@ mod tests {
             .unwrap()
             .contains("No learnings yet"));
 
-        write_topic_file(root, REPO, &item("b", "Use [x] or ]"), 1).unwrap();
+        write_topic_file(root, REPO, &item("b", "Use a | b"), 1).unwrap();
         rebuild_index(root).unwrap();
         let index = std::fs::read_to_string(&index_path).unwrap();
         assert!(index.starts_with("---\nokf_version: \"0.2\"\n---"));
         assert!(!index.contains('@'));
-        assert!(index.contains("* [Use \\[x\\] or \\]](./patterns/b.md) - Read when: when doing X"));
+        assert!(index.contains("| [patterns/b.md](./patterns/b.md) | Use a \\| b | when doing X |"));
     }
 
     #[test]
