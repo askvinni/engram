@@ -21,6 +21,22 @@ pub struct Capture {
     pub extra: BTreeMap<String, serde_yaml_ng::Value>,
 }
 
+impl Capture {
+    /// Tags this entry as a mid-session observation (`origin: session`) so
+    /// `compact` can tell it apart from `learn`-synthesized memory.
+    pub fn mark_session(&mut self) {
+        self.extra.insert(
+            memory::ORIGIN_KEY.to_string(),
+            serde_yaml_ng::Value::String(memory::ORIGIN_SESSION.to_string()),
+        );
+    }
+
+    /// The `origin` marker, if one was set.
+    pub fn origin(&self) -> Option<&str> {
+        self.extra.get(memory::ORIGIN_KEY).and_then(|v| v.as_str())
+    }
+}
+
 /// Lowercase, ASCII-alphanumeric words joined by `-`.
 pub fn slugify(s: &str) -> String {
     s.split(|c: char| !c.is_ascii_alphanumeric())
@@ -138,6 +154,10 @@ mod tests {
         }
     }
 
+    fn origin_of(fm: &memory::Frontmatter) -> Option<&str> {
+        fm.extra.get(memory::ORIGIN_KEY).and_then(|v| v.as_str())
+    }
+
     #[test]
     fn slugify_normalizes_titles() {
         assert_eq!(slugify("Don't mock the DB!"), "don-t-mock-the-db");
@@ -184,6 +204,48 @@ mod tests {
         assert!(std::fs::read_to_string(root.join("CLAUDE.md"))
             .unwrap()
             .contains("@.engram/memory/index.md"));
+    }
+
+    #[test]
+    fn session_capture_is_marked_unlike_plain_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let plain = write(root, &capture("patterns", "plain")).unwrap();
+        let mut c = capture("patterns", "observed");
+        c.mark_session();
+        let session = write(root, &c).unwrap();
+
+        let raw = std::fs::read_to_string(&session).unwrap();
+        assert!(raw.contains("origin: session"), "{raw}");
+        let fm_of = |p: &Path| {
+            memory::split_frontmatter(&std::fs::read_to_string(p).unwrap())
+                .unwrap()
+                .0
+        };
+        assert_eq!(origin_of(&fm_of(&session)), Some(memory::ORIGIN_SESSION));
+        assert_eq!(origin_of(&fm_of(&plain)), None);
+    }
+
+    #[test]
+    fn learn_rewrite_clears_session_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut c = capture("patterns", "observed");
+        c.mark_session();
+        let path = write(root, &c).unwrap();
+
+        let item = crate::claude::LearningItem {
+            category: "patterns".to_string(),
+            slug: "observed".to_string(),
+            title: "Synthesized".to_string(),
+            read_when: vec![],
+            tripwires: vec![],
+            body: "New body.".to_string(),
+        };
+        memory::write_topic_file(root, "acme/widgets", &item, 7).unwrap();
+        let (fm, _) = memory::split_frontmatter(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(origin_of(&fm), None);
+        assert_eq!(fm.sources.len(), 1);
     }
 
     #[test]

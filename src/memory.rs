@@ -14,6 +14,12 @@ pub const CATEGORIES: &[(&str, &str)] = &[
     ("testing", "testing"),
 ];
 
+/// Frontmatter key marking how a topic file was written. Absent on
+/// `learn`-synthesized files; `compact` sees it in the raw file content.
+pub const ORIGIN_KEY: &str = "origin";
+/// `origin` value for observations an agent recorded mid-session.
+pub const ORIGIN_SESSION: &str = "session";
+
 fn okf_type_for(category: &str) -> &'static str {
     CATEGORIES
         .iter()
@@ -410,6 +416,8 @@ pub fn write_topic_file(
         })
         .collect();
     fm.add_source(repo, issue_number);
+    // The body is now learn-synthesized, so any capture-time marker no longer applies.
+    fm.extra.remove(ORIGIN_KEY);
     fm.touch();
 
     let content = render(&fm, &item.body)?;

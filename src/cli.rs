@@ -89,6 +89,9 @@ pub enum Commands {
         /// Markdown body; read from stdin if omitted
         #[arg(long)]
         body: Option<String>,
+        /// Mark as a mid-session observation (`origin: session`) for later consolidation by `compact`
+        #[arg(long)]
+        session: bool,
     },
     /// Memory file maintenance
     Memory {
