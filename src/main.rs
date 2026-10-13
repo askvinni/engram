@@ -39,6 +39,8 @@ struct CaptureResultJson {
     path: String,
     category: String,
     slug: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
 }
 
 static SKILLS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/.claude/skills");
@@ -64,21 +66,23 @@ fn main() -> Result<()> {
             read_when,
             tripwires,
             body,
+            session,
         } => {
             let slug = slug.unwrap_or_else(|| capture::slugify(&title));
             let body = capture::resolve_body(body)?;
-            cmd_capture(
-                mode,
-                capture::Capture {
-                    category,
-                    slug,
-                    title,
-                    read_when,
-                    tripwires,
-                    body,
-                    ..Default::default()
-                },
-            )
+            let mut entry = capture::Capture {
+                category,
+                slug,
+                title,
+                read_when,
+                tripwires,
+                body,
+                ..Default::default()
+            };
+            if session {
+                entry.mark_session();
+            }
+            cmd_capture(mode, entry)
         }
     }
 }
@@ -87,16 +91,21 @@ fn cmd_capture(mode: OutputMode, entry: capture::Capture) -> Result<()> {
     let repo_root = config::find_repo_root()?;
     capture::write(&repo_root, &entry)?;
     let rel = format!("{}/{}.md", entry.category, entry.slug);
+    let origin = entry.origin().map(str::to_string);
     match mode {
         OutputMode::Json => {
             let out = CaptureResultJson {
                 path: format!(".engram/memory/{rel}"),
                 category: entry.category,
                 slug: entry.slug,
+                origin,
             };
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
-        OutputMode::Agent => println!("OK capture path=.engram/memory/{rel}"),
+        OutputMode::Agent => match origin {
+            Some(o) => println!("OK capture path=.engram/memory/{rel} origin={o}"),
+            None => println!("OK capture path=.engram/memory/{rel}"),
+        },
         OutputMode::Human => println!("Captured .engram/memory/{rel} — {}", entry.title),
     }
     Ok(())

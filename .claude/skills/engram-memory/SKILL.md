@@ -63,6 +63,8 @@ sources:
 
 `sources` lets you trace a memory file back to its originating issue(s) and diff. If a learning seems wrong, check the linked issue for context. `title`, `read_when`, and `tripwires` are engram extension keys the OKF spec explicitly permits; `type`, `generated`, and `sources` map to the OKF v0.2 schema.
 
+Files written by `engram capture --session` also carry `origin: session`. It marks an unreviewed, mid-session observation rather than a `learn`-synthesized learning, so weigh it accordingly during compaction. The marker is dropped if `learn` later rewrites the same file.
+
 Files written before this schema existed used `last_updated`/`source_issues` instead of `generated`/`sources`. The reader still accepts that legacy shape; run `engram memory migrate` to rewrite everything into the current shape (idempotent — safe to run repeatedly).
 
 ## Running `engram compact`
@@ -88,6 +90,17 @@ Run compact when:
 - Source code has been refactored and old learnings now describe behavior that no longer exists
 
 Do not run compact immediately after `engram plan learn` — wait until several learn cycles have accumulated so compact has enough material to reason about relationships between files.
+
+## Recording observations mid-session
+
+When you notice something worth remembering during a session, record it right away instead of waiting for `plan land`:
+
+```
+engram capture --session --category tripwires --title "Short title" \
+  --read-when "when this applies" --body "What you observed and why it matters"
+```
+
+No issue or PR is needed. Use `--slug` if the derived filename already exists. Session files are consolidated later by `engram compact`.
 
 ## Manual maintenance
 
