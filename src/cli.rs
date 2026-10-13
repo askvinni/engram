@@ -69,6 +69,27 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: KataCommands,
     },
+    /// Write a memory file directly, without an issue, PR, or Claude synthesis
+    Capture {
+        /// Memory category: patterns, tripwires, architecture, or testing
+        #[arg(long)]
+        category: String,
+        /// Title for the memory file's frontmatter
+        #[arg(long)]
+        title: String,
+        /// Filename stem; derived from the title if omitted
+        #[arg(long)]
+        slug: Option<String>,
+        /// Condition under which an agent should load this file (repeatable)
+        #[arg(long = "read-when")]
+        read_when: Vec<String>,
+        /// Tripwire as `ACTION::WARNING` (repeatable)
+        #[arg(long = "tripwire", value_parser = crate::capture::parse_tripwire)]
+        tripwires: Vec<crate::memory::Tripwire>,
+        /// Markdown body; read from stdin if omitted
+        #[arg(long)]
+        body: Option<String>,
+    },
     /// Memory file maintenance
     Memory {
         #[command(subcommand)]

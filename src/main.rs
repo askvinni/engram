@@ -1,3 +1,4 @@
+mod capture;
 mod claude;
 mod cli;
 mod compact;
@@ -32,6 +33,14 @@ struct ReadResultJson {
     content: String,
 }
 
+/// JSON schema for `engram capture --json`
+#[derive(Serialize)]
+struct CaptureResultJson {
+    path: String,
+    category: String,
+    slug: String,
+}
+
 static SKILLS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/.claude/skills");
 static ISSUE_TEMPLATES_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/.github/ISSUE_TEMPLATE");
 
@@ -48,7 +57,49 @@ fn main() -> Result<()> {
         Commands::Read { permalink } => cmd_read(&permalink, mode),
         Commands::Kata { subcommand } => cmd_kata(subcommand),
         Commands::Memory { subcommand } => cmd_memory(subcommand),
+        Commands::Capture {
+            category,
+            title,
+            slug,
+            read_when,
+            tripwires,
+            body,
+        } => {
+            let slug = slug.unwrap_or_else(|| capture::slugify(&title));
+            let body = capture::resolve_body(body)?;
+            cmd_capture(
+                mode,
+                capture::Capture {
+                    category,
+                    slug,
+                    title,
+                    read_when,
+                    tripwires,
+                    body,
+                    ..Default::default()
+                },
+            )
+        }
     }
+}
+
+fn cmd_capture(mode: OutputMode, entry: capture::Capture) -> Result<()> {
+    let repo_root = config::find_repo_root()?;
+    capture::write(&repo_root, &entry)?;
+    let rel = format!("{}/{}.md", entry.category, entry.slug);
+    match mode {
+        OutputMode::Json => {
+            let out = CaptureResultJson {
+                path: format!(".engram/memory/{rel}"),
+                category: entry.category,
+                slug: entry.slug,
+            };
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        OutputMode::Agent => println!("OK capture path=.engram/memory/{rel}"),
+        OutputMode::Human => println!("Captured .engram/memory/{rel} — {}", entry.title),
+    }
+    Ok(())
 }
 
 fn cmd_init() -> Result<()> {
