@@ -86,6 +86,8 @@ When a plan that was created via an objective lands, engram automatically marks 
 - [`gh`](https://cli.github.com/) authenticated with `gh auth login`
 - [Claude Code](https://claude.ai/code) installed and authenticated
 
+`gh` and a GitHub remote are only needed for the GitHub-backed commands (`plan`, `objective`, `compact`, `memory migrate`). `engram init` works in a local-only repo — no `origin` remote, no `gh` — and skips the GitHub label setup; the GitHub-backed commands then fail with a clear "this command requires GitHub" error.
+
 ## Installation
 
 Requires Rust (stable):

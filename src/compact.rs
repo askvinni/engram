@@ -5,7 +5,8 @@ use std::process::Command;
 use crate::{claude, memory};
 
 pub fn run(repo_root: &Path) -> Result<()> {
-    let repo = resolve_repo(repo_root)?;
+    let cfg = crate::config::Config::load(repo_root)?;
+    let repo = crate::config::resolve_repo(&cfg, repo_root)?;
 
     println!("Reading memory files...");
     let topics = memory::list_all_topics(repo_root)?;
@@ -113,26 +114,4 @@ fn git(repo_root: &Path, args: &[&str]) -> Result<()> {
         anyhow::bail!("git {} failed", args.join(" "));
     }
     Ok(())
-}
-
-fn resolve_repo(repo_root: &Path) -> Result<String> {
-    let cfg = crate::config::Config::load(repo_root)?;
-    if let Some(repo) = cfg.repo() {
-        return Ok(repo.to_string());
-    }
-    let output = Command::new("gh")
-        .args([
-            "repo",
-            "view",
-            "--json",
-            "nameWithOwner",
-            "-q",
-            ".nameWithOwner",
-        ])
-        .current_dir(repo_root)
-        .output()?;
-    if output.status.success() {
-        return Ok(String::from_utf8(output.stdout)?.trim().to_string());
-    }
-    anyhow::bail!("could not determine GitHub repo")
 }

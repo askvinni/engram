@@ -116,7 +116,7 @@ fn cmd_init() -> Result<()> {
     let mut cfg = config::Config::load(&repo_root)?;
 
     if cfg.github.repo.is_none() {
-        cfg.github.repo = infer_repo(&repo_root);
+        cfg.github.repo = config::infer_repo(&repo_root);
     }
 
     cfg.save(&repo_root)?;
@@ -139,26 +139,35 @@ fn cmd_init() -> Result<()> {
     install_skills(&repo_root)?;
     install_issue_templates(&repo_root)?;
 
-    if let Some(repo) = cfg.repo() {
-        github::ensure_label(
-            repo,
-            "engram-plan",
-            "0075ca",
-            "Plan issue created by engram",
-        )?;
-        github::ensure_label(
-            repo,
-            "engram-learned",
-            "e4e669",
-            "Learning PR created by engram",
-        )?;
-        github::ensure_label(
-            repo,
-            "engram-objective",
-            "5319e7",
-            "Objective issue created by engram",
-        )?;
-        println!("GitHub labels ensured: engram-plan, engram-learned, engram-objective");
+    // GitHub setup is optional: local-only repos (no remote, or no `gh`) skip it
+    // and still get a fully working memory directory.
+    match cfg.repo() {
+        Some(repo) if config::gh_available() => {
+            github::ensure_label(
+                repo,
+                "engram-plan",
+                "0075ca",
+                "Plan issue created by engram",
+            )?;
+            github::ensure_label(
+                repo,
+                "engram-learned",
+                "e4e669",
+                "Learning PR created by engram",
+            )?;
+            github::ensure_label(
+                repo,
+                "engram-objective",
+                "5319e7",
+                "Objective issue created by engram",
+            )?;
+            println!("GitHub labels ensured: engram-plan, engram-learned, engram-objective");
+        }
+        Some(_) => println!("Skipped GitHub labels: `gh` CLI not found."),
+        None => println!(
+            "No GitHub repo detected — local-only mode. Memory capture works; \
+             `plan`/`learn`/`objective` require GitHub."
+        ),
     }
 
     println!("engram initialized.");
@@ -611,29 +620,6 @@ fn skills_current(repo_root: &std::path::Path) -> bool {
                 .map(|bytes| bytes == embedded.contents())
                 .unwrap_or(false)
         })
-}
-
-fn infer_repo(repo_root: &std::path::Path) -> Option<String> {
-    let output = Command::new("gh")
-        .args([
-            "repo",
-            "view",
-            "--json",
-            "nameWithOwner",
-            "-q",
-            ".nameWithOwner",
-        ])
-        .current_dir(repo_root)
-        .output()
-        .ok()?;
-    if output.status.success() {
-        String::from_utf8(output.stdout)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    } else {
-        None
-    }
 }
 
 pub(crate) fn days_ago(iso: &str) -> String {
