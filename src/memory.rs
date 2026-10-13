@@ -22,6 +22,18 @@ fn okf_type_for(category: &str) -> &'static str {
         .unwrap_or("pattern")
 }
 
+/// Rejects categories outside `CATEGORIES`; files written elsewhere are never indexed or read.
+pub fn validate_category(category: &str) -> Result<()> {
+    if CATEGORIES.iter().any(|(c, _)| *c == category) {
+        return Ok(());
+    }
+    let allowed: Vec<_> = CATEGORIES.iter().map(|(c, _)| *c).collect();
+    anyhow::bail!(
+        "unknown memory category {category:?} (expected one of: {})",
+        allowed.join(", ")
+    )
+}
+
 fn generator() -> String {
     format!("engram/{}", env!("CARGO_PKG_VERSION"))
 }
@@ -362,6 +374,7 @@ pub fn write_topic_file(
 ) -> Result<()> {
     let category = &item.category;
     let slug = &item.slug;
+    validate_category(category)?;
     let cat_dir = repo_root.join(format!(".engram/memory/{category}"));
     std::fs::create_dir_all(&cat_dir)?;
 
