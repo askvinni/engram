@@ -87,28 +87,39 @@ pub fn get_issue(repo: &str, number: u64) -> Result<Issue> {
     serde_json::from_str(&out).context("parsing issue JSON")
 }
 
+/// Find the merged PR that delivered an issue.
+///
+/// Prefers the PR that closed the issue. When the issue was closed by hand — e.g. a
+/// stacked PR merged into a non-default base, where closing keywords don't fire —
+/// falls back to the most recent merged PR in the same repo that references the
+/// issue, preferring ones whose body carries a closing keyword.
 pub fn find_linked_pr(repo: &str, issue_number: u64) -> Result<Option<PullRequest>> {
     let (owner, name) = repo
         .split_once('/')
         .ok_or_else(|| anyhow::anyhow!("repo must be owner/name, got: {repo}"))?;
 
     let query = r#"
+        fragment Pr on PullRequest {
+          number
+          title
+          body
+          headRefName
+          state
+          mergeCommit { oid }
+          repository { nameWithOwner }
+        }
         query($owner: String!, $repo: String!, $number: Int!) {
           repository(owner: $owner, name: $repo) {
             issue(number: $number) {
-              timelineItems(itemTypes: [CLOSED_EVENT], last: 1) {
+              timelineItems(itemTypes: [CLOSED_EVENT, CROSS_REFERENCED_EVENT], last: 100) {
                 nodes {
+                  __typename
                   ... on ClosedEvent {
-                    closer {
-                      ... on PullRequest {
-                        number
-                        title
-                        body
-                        headRefName
-                        state
-                        mergeCommit { oid }
-                      }
-                    }
+                    closer { __typename ...Pr }
+                  }
+                  ... on CrossReferencedEvent {
+                    willCloseTarget
+                    source { __typename ...Pr }
                   }
                 }
               }
@@ -149,47 +160,110 @@ pub fn find_linked_pr(repo: &str, issue_number: u64) -> Result<Option<PullReques
     }
     #[derive(Deserialize)]
     struct TimelineItems {
-        nodes: Vec<ClosedEventNode>,
-    }
-    #[derive(Deserialize)]
-    struct ClosedEventNode {
-        closer: Option<PrFields>,
-    }
-    #[derive(Deserialize)]
-    struct PrFields {
-        number: u64,
-        title: String,
-        body: Option<String>,
-        #[serde(rename = "headRefName", default)]
-        head_ref_name: Option<String>,
-        state: String,
-        #[serde(rename = "mergeCommit", default)]
-        merge_commit: Option<MergeCommit>,
-    }
-    #[derive(Deserialize)]
-    struct MergeCommit {
-        oid: String,
+        nodes: Vec<TimelineNode>,
     }
 
     let resp: Response = serde_json::from_str(&out).context("parsing GraphQL response")?;
-    let closer = resp
-        .data
-        .repository
-        .issue
-        .timeline_items
-        .nodes
-        .into_iter()
-        .next()
-        .and_then(|n| n.closer)
-        .filter(|pr| pr.state == "MERGED");
+    Ok(pick_linked_pr(
+        resp.data.repository.issue.timeline_items.nodes,
+        repo,
+    ))
+}
 
-    Ok(closer.map(|pr| PullRequest {
+#[derive(Debug, Deserialize)]
+#[serde(tag = "__typename")]
+enum TimelineNode {
+    ClosedEvent {
+        closer: Option<Subject>,
+    },
+    CrossReferencedEvent {
+        #[serde(rename = "willCloseTarget", default)]
+        will_close_target: bool,
+        source: Subject,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "__typename")]
+enum Subject {
+    PullRequest(PrFields),
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrFields {
+    number: u64,
+    title: String,
+    body: Option<String>,
+    #[serde(rename = "headRefName", default)]
+    head_ref_name: Option<String>,
+    state: String,
+    #[serde(rename = "mergeCommit", default)]
+    merge_commit: Option<MergeCommit>,
+    #[serde(default)]
+    repository: Option<PrRepo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MergeCommit {
+    oid: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PrRepo {
+    #[serde(rename = "nameWithOwner")]
+    name_with_owner: String,
+}
+
+/// Timeline nodes arrive oldest first.
+fn pick_linked_pr(nodes: Vec<TimelineNode>, repo: &str) -> Option<PullRequest> {
+    let mut closer = None;
+    let mut referencing = Vec::new();
+    for node in nodes {
+        match node {
+            TimelineNode::ClosedEvent { closer: c } => {
+                closer = match c {
+                    Some(Subject::PullRequest(pr)) => Some(pr),
+                    _ => None,
+                }
+            }
+            TimelineNode::CrossReferencedEvent {
+                will_close_target,
+                source: Subject::PullRequest(pr),
+            } => referencing.push((will_close_target, pr)),
+            _ => {}
+        }
+    }
+
+    let merged = |pr: &PrFields| pr.state == "MERGED";
+    let same_repo = |pr: &PrFields| {
+        pr.repository
+            .as_ref()
+            .is_some_and(|r| r.name_with_owner.eq_ignore_ascii_case(repo))
+    };
+
+    let pr = match closer.filter(merged) {
+        Some(pr) => pr,
+        None => {
+            referencing.retain(|(_, pr)| merged(pr) && same_repo(pr));
+            // max_by_key keeps the last maximum, i.e. the most recent reference
+            referencing
+                .into_iter()
+                .max_by_key(|(will_close, _)| *will_close)
+                .map(|(_, pr)| pr)?
+        }
+    };
+
+    Some(PullRequest {
         number: pr.number,
         title: pr.title,
         body: pr.body,
         head_ref_name: pr.head_ref_name,
         merge_commit_sha: pr.merge_commit.map(|m| m.oid),
-    }))
+    })
 }
 
 pub fn get_pr_diff(repo: &str, pr_number: u64) -> Result<String> {
@@ -483,4 +557,104 @@ pub fn list_unlearned_plans(repo: &str) -> Result<Vec<PlanIssue>> {
             created_at: i.created_at,
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REPO: &str = "owner/repo";
+
+    fn pick(nodes_json: &str) -> Option<u64> {
+        let nodes: Vec<TimelineNode> = serde_json::from_str(nodes_json).unwrap();
+        pick_linked_pr(nodes, REPO).map(|pr| pr.number)
+    }
+
+    fn pr(number: u64, state: &str, repo: &str) -> String {
+        format!(
+            r#"{{"__typename":"PullRequest","number":{number},"title":"t","body":"b","headRefName":"h","state":"{state}","mergeCommit":null,"repository":{{"nameWithOwner":"{repo}"}}}}"#
+        )
+    }
+
+    fn closed(closer: &str) -> String {
+        format!(r#"{{"__typename":"ClosedEvent","closer":{closer}}}"#)
+    }
+
+    fn xref(will_close: bool, source: &str) -> String {
+        format!(
+            r#"{{"__typename":"CrossReferencedEvent","willCloseTarget":{will_close},"source":{source}}}"#
+        )
+    }
+
+    const ISSUE_SOURCE: &str = r#"{"__typename":"Issue"}"#;
+
+    #[test]
+    fn prefers_merged_closer() {
+        let nodes = format!(
+            "[{},{}]",
+            xref(true, &pr(2, "MERGED", REPO)),
+            closed(&pr(1, "MERGED", REPO))
+        );
+        assert_eq!(pick(&nodes), Some(1));
+    }
+
+    #[test]
+    fn manual_close_falls_back_to_referencing_pr() {
+        let nodes = format!(
+            "[{},{},{}]",
+            xref(false, ISSUE_SOURCE),
+            xref(true, &pr(7, "MERGED", REPO)),
+            closed("null")
+        );
+        assert_eq!(pick(&nodes), Some(7));
+    }
+
+    #[test]
+    fn commit_closer_falls_back_to_referencing_pr() {
+        let nodes = format!(
+            "[{},{}]",
+            xref(false, &pr(7, "MERGED", REPO)),
+            closed(r#"{"__typename":"Commit"}"#)
+        );
+        assert_eq!(pick(&nodes), Some(7));
+    }
+
+    #[test]
+    fn fallback_prefers_closing_keyword_then_most_recent() {
+        let nodes = format!(
+            "[{},{},{},{}]",
+            xref(true, &pr(3, "MERGED", REPO)),
+            xref(true, &pr(4, "MERGED", REPO)),
+            xref(false, &pr(5, "MERGED", REPO)),
+            closed("null")
+        );
+        assert_eq!(pick(&nodes), Some(4));
+    }
+
+    #[test]
+    fn fallback_ignores_unmerged_and_other_repos() {
+        let nodes = format!(
+            "[{},{},{}]",
+            xref(true, &pr(3, "OPEN", REPO)),
+            xref(true, &pr(4, "MERGED", "someone/else")),
+            closed("null")
+        );
+        assert_eq!(pick(&nodes), None);
+    }
+
+    #[test]
+    fn unmerged_closer_falls_back() {
+        let nodes = format!(
+            "[{},{}]",
+            xref(false, &pr(9, "MERGED", "Owner/Repo")),
+            closed(&pr(1, "CLOSED", REPO))
+        );
+        assert_eq!(pick(&nodes), Some(9));
+    }
+
+    #[test]
+    fn uses_latest_close_event() {
+        let nodes = format!("[{},{}]", closed(&pr(1, "MERGED", REPO)), closed("null"));
+        assert_eq!(pick(&nodes), None);
+    }
 }
