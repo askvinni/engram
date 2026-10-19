@@ -113,6 +113,7 @@ engram doctor                              Verify all dependencies and configura
 engram compact                             Prune and merge stale memory files
 engram memory migrate                      Rewrite memory files into OKF v0.2 frontmatter
 engram capture --category <c> --title <t>  Write a memory file directly (body via --body or stdin)
+engram capture ... --session               Same, marked `origin: session` as a mid-session observation
 
 engram plan new <title> [--body <body>]    Create a GitHub issue as a plan
 engram plan learn <issue> [--all]          Synthesize learnings from a closed issue+PR
