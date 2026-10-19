@@ -112,6 +112,7 @@ engram init                                Initialize in this repo; install Clau
 engram doctor                              Verify all dependencies and configuration
 engram compact                             Prune and merge stale memory files
 engram memory migrate                      Rewrite memory files into OKF v0.2 frontmatter
+engram capture --category <c> --title <t>  Write a memory file directly (body via --body or stdin)
 
 engram plan new <title> [--body <body>]    Create a GitHub issue as a plan
 engram plan learn <issue> [--all]          Synthesize learnings from a closed issue+PR
