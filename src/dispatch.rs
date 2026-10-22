@@ -3,12 +3,13 @@
 //! Dispatch is the only engram command that needs kwt, tmux and kata, so it
 //! checks for them up front (`preflight`) instead of degrading silently.
 //!
-//! It plans without mutating anything, confirms, then executes.
+//! Plans and objectives share one pipeline: gather items, plan each without
+//! mutating anything, confirm, then execute one at a time.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::cell::OnceCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::github::{self, OpenPr, PrWithBody};
 use crate::kata;
-use crate::objective;
+use crate::objective::{self, NodeStatus, ObjectiveNode};
 
 /// kwt is often only a shell alias to the copy bundled with Ghosthub, which
 /// `Command::new("kwt")` can't see.
@@ -271,17 +272,83 @@ pub struct DispatchOptions {
     pub no_launch: bool,
 }
 
-/// Refuse anything but an open plan issue (plan label), including plain kata
-/// issues.
-fn check_kind(number: u64, issue: &github::Issue) -> Result<()> {
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Work {
+    Plan(u64),
+    NewPlan { objective: u64, node_id: String },
+}
+
+#[derive(Debug)]
+struct Item {
+    work: Work,
+}
+
+impl Item {
+    fn name(&self) -> String {
+        match &self.work {
+            Work::Plan(n) => format!("#{n}"),
+            Work::NewPlan { objective, node_id } => format!("node {node_id} of #{objective}"),
+        }
+    }
+}
+
+/// A plan's pushed branch and PR URL, set once both exist.
+type Placed = (String, String);
+
+#[derive(Debug)]
+struct ObjectiveArg {
+    title: String,
+    body: String,
+    nodes: Vec<ObjectiveNode>,
+}
+
+/// Refuse anything but an open plan (plan label) or objective (node list; the
+/// objective label alone is an error), including plain kata issues.
+fn check_kind(number: u64, issue: &github::Issue, has_nodes: bool) -> Result<()> {
     let state = &issue.state;
     if !state.eq_ignore_ascii_case("open") {
         anyhow::bail!("#{number} is not open (state: {state})");
     }
-    if !issue.has_label(PLAN_LABEL) {
-        anyhow::bail!("#{number} is not an engram-plan issue (no `{PLAN_LABEL}` label)");
+    if !has_nodes && issue.has_label(OBJECTIVE_LABEL) {
+        anyhow::bail!(
+            "#{number} is an engram-objective without a node list — \
+             was it created with `engram objective new`?"
+        );
+    }
+    if !has_nodes && !issue.has_label(PLAN_LABEL) {
+        anyhow::bail!(
+            "#{number} is neither an engram-plan nor an engram-objective issue \
+             (no `{PLAN_LABEL}` label and no objective node list)"
+        );
     }
     Ok(())
+}
+
+/// Unfinished nodes that wait on nothing. `in_progress` counts: creating a
+/// plan marks its node in progress, and the reuse checks (open PR, worktree,
+/// running Claude, ready PR) keep a re-run from launching twice.
+fn dispatch_candidates(nodes: &[ObjectiveNode]) -> Vec<&ObjectiveNode> {
+    nodes
+        .iter()
+        .filter(|n| n.status != NodeStatus::Done && objective::blocked_by(n, nodes).is_empty())
+        .collect()
+}
+
+fn blocked_report(nodes: &[ObjectiveNode]) -> Vec<(String, Vec<&str>)> {
+    nodes
+        .iter()
+        .filter(|n| n.status != NodeStatus::Done)
+        .map(|n| (n.id.clone(), objective::blocked_by(n, nodes)))
+        .filter(|(_, b)| !b.is_empty())
+        .collect()
+}
+
+fn dedup_candidates(items: Vec<Item>) -> Vec<Item> {
+    let mut seen = BTreeSet::new();
+    items
+        .into_iter()
+        .filter(|i| seen.insert(i.work.clone()))
+        .collect()
 }
 
 fn confirm() -> Result<bool> {
@@ -325,6 +392,8 @@ struct Target {
     /// replace the templates'.
     pr_link: Option<String>,
     worktree: Option<PathBuf>,
+    /// `(objective, node ID)` when the plan's marker names an existing node.
+    objective_node: Option<(u64, String)>,
 }
 
 impl Target {
@@ -419,6 +488,54 @@ fn needs_claim(owner: Option<&str>, me: &str, kata_ref: &str) -> Result<bool> {
     }
 }
 
+/// Record missing plan issues and mark nodes in progress (done stays done;
+/// unknown IDs are skipped). Returns the IDs that changed, each once.
+fn apply_node_updates(nodes: &mut [ObjectiveNode], updates: &[(String, u64)]) -> Vec<String> {
+    let mut changed: Vec<String> = Vec::new();
+    for (id, plan) in updates {
+        let Some(node) = nodes.iter_mut().find(|n| &n.id == id) else {
+            continue;
+        };
+        let mut this = node.plan_issue.is_none();
+        node.plan_issue.get_or_insert(*plan);
+        if node.status == NodeStatus::Pending {
+            node.status = NodeStatus::InProgress;
+            this = true;
+        }
+        if this && !changed.contains(id) {
+            changed.push(id.clone());
+        }
+    }
+    changed
+}
+
+/// Re-fetch the objective right before writing and apply only node status and
+/// plan-issue changes, so edits made since the run started aren't overwritten.
+fn write_node_updates(repo: &str, number: u64, updates: &[(String, u64)]) -> Result<()> {
+    let body = github::get_issue(repo, number)
+        .context("re-fetching objective")?
+        .body
+        .unwrap_or_default();
+    let Some(mut nodes) = objective::parse_nodes_from_comment(&body) else {
+        eprintln!("warning: objective #{number} no longer has a node list; not updating it");
+        return Ok(());
+    };
+    let changed = apply_node_updates(&mut nodes, updates);
+    if changed.is_empty() {
+        return Ok(());
+    }
+    github::update_issue_body(
+        repo,
+        number,
+        &objective::build_objective_body(&body, &nodes),
+    )?;
+    println!(
+        "Objective #{number}: recorded node(s) {} as in progress",
+        changed.join(", ")
+    );
+    Ok(())
+}
+
 /// The kata actor, resolved like kata does: the first non-empty of
 /// `KATA_AUTHOR` and `USER`, else git's `user.name` (only asked when needed).
 fn pick_actor(
@@ -442,6 +559,18 @@ fn check_mirror_open(number: u64, kata_ref: &str, status: &str) -> Result<()> {
     Ok(())
 }
 
+fn node_work(objective: u64, n: &ObjectiveNode) -> Work {
+    match n.plan_issue {
+        Some(plan) => Work::Plan(plan),
+        None => Work::NewPlan {
+            objective,
+            node_id: n.id.clone(),
+        },
+    }
+}
+
+type Updates = BTreeMap<u64, Vec<(String, u64)>>;
+
 struct Ctx<'a> {
     root: &'a Path,
     repo: &'a str,
@@ -461,13 +590,15 @@ fn cached<T>(cell: &OnceCell<T>, init: impl FnOnce() -> Result<T>) -> Result<&T>
     Ok(cell.get_or_init(|| v))
 }
 
-/// Plan, confirm and execute `engram dispatch` for plan issue `number`.
+/// Plan, confirm and execute `engram dispatch` for any mix of plan and
+/// objective issues. A failure is reported and the rest continue; the command
+/// fails at the end if any did.
 pub fn dispatch(
     repo_root: &Path,
     repo: &str,
     cfg: &Config,
     tools: &Toolchain,
-    number: u64,
+    issues: &[u64],
     opts: DispatchOptions,
 ) -> Result<()> {
     let cx = Ctx {
@@ -480,16 +611,81 @@ pub fn dispatch(
         default: OnceCell::new(),
         actor: OnceCell::new(),
     };
-    // Planning: no mutations.
-    let mut t = cx.plan_target(number)?;
-    print!("{}", describe(&t, opts.no_launch));
-    if opts.dry_run {
+    let mut seen = BTreeSet::new();
+    let issues: Vec<u64> = issues.iter().copied().filter(|n| seen.insert(*n)).collect();
+    let mut objectives = BTreeMap::new();
+    let items = cx.gather(&issues, &mut objectives)?;
+    if items.is_empty() {
+        println!("Nothing to dispatch.");
         return Ok(());
     }
-    if !opts.yes && !confirm()? {
-        anyhow::bail!("dispatch cancelled");
+
+    // Planning: no mutations.
+    let mut failed = 0usize;
+    let mut planned: Vec<(Item, Option<Target>)> = Vec::new();
+    for item in items {
+        let target = match &item.work {
+            Work::NewPlan { objective, node_id } => {
+                println!(
+                    "Would create a plan issue for node {node_id} of objective #{objective}, \
+                     then dispatch it"
+                );
+                None
+            }
+            Work::Plan(number) => match cx.plan_target(*number) {
+                Ok(t) => {
+                    print!("{}", describe(&t, opts.no_launch));
+                    Some(t)
+                }
+                Err(e) => {
+                    eprintln!("error: #{number}: {e:#}");
+                    failed += 1;
+                    continue;
+                }
+            },
+        };
+        planned.push((item, target));
     }
-    cx.execute(&mut t)
+    if planned.is_empty() {
+        anyhow::bail!("nothing to dispatch \u{2014} see errors above");
+    }
+
+    if !opts.dry_run {
+        if !opts.yes && !confirm()? {
+            anyhow::bail!("dispatch cancelled");
+        }
+
+        let mut updates = Updates::new();
+        let mut summary = Vec::new();
+        for (item, target) in planned {
+            let name = item.name();
+            match cx.run_item(&mut objectives, item.work, target, &mut updates) {
+                Ok(outcome) => summary.push(format!("{name}: {outcome}")),
+                Err(e) => {
+                    eprintln!("error: {name}: {e:#}");
+                    summary.push(format!("{name}: failed"));
+                    failed += 1;
+                }
+            }
+        }
+        for (number, ups) in &updates {
+            if let Err(e) = write_node_updates(repo, *number, ups) {
+                eprintln!("error: updating objective #{number}: {e:#}");
+                failed += 1;
+            }
+        }
+        if summary.len() > 1 {
+            println!("Summary:");
+            for line in &summary {
+                println!("  {line}");
+            }
+        }
+    }
+    anyhow::ensure!(
+        failed == 0,
+        "{failed} dispatch(es) failed — see errors above"
+    );
+    Ok(())
 }
 
 impl Ctx<'_> {
@@ -524,6 +720,48 @@ impl Ctx<'_> {
             )
         })
         .map(String::as_str)
+    }
+
+    fn fetch_arg(&self, number: u64) -> Result<(github::Issue, Option<Vec<ObjectiveNode>>)> {
+        let issue = github::get_issue(self.repo, number)
+            .with_context(|| format!("fetching issue #{number}"))?;
+        let nodes = objective::parse_nodes_from_comment(issue.body.as_deref().unwrap_or(""));
+        check_kind(number, &issue, nodes.is_some())?;
+        Ok((issue, nodes))
+    }
+
+    fn gather(
+        &self,
+        issues: &[u64],
+        objectives: &mut BTreeMap<u64, ObjectiveArg>,
+    ) -> Result<Vec<Item>> {
+        let mut items = Vec::new();
+        for &number in issues {
+            let (issue, nodes) = self.fetch_arg(number)?;
+            let Some(nodes) = nodes else {
+                items.push(Item {
+                    work: Work::Plan(number),
+                });
+                continue;
+            };
+            let blocked = blocked_report(&nodes);
+            if !blocked.is_empty() {
+                println!("Objective #{number}: blocked nodes");
+                for (id, blockers) in &blocked {
+                    println!("  {id}  waits on {}", blockers.join(", "));
+                }
+            }
+            let candidates = dispatch_candidates(&nodes);
+            if candidates.is_empty() {
+                println!("Objective #{number}: no unblocked nodes to dispatch");
+            }
+            items.extend(candidates.into_iter().map(|n| Item {
+                work: node_work(number, n),
+            }));
+            let (title, body) = (issue.title, issue.body.unwrap_or_default());
+            objectives.insert(number, ObjectiveArg { title, body, nodes });
+        }
+        Ok(dedup_candidates(items))
     }
 
     /// For a plan with an `Objective: #N (node X)` marker: the objective's
@@ -578,7 +816,7 @@ impl Ctx<'_> {
         if issue.has_label(OBJECTIVE_LABEL) {
             anyhow::bail!("#{number} is an engram-objective, not a plan issue");
         }
-        check_kind(number, &issue)?;
+        check_kind(number, &issue, false)?;
         let body = issue.body.unwrap_or_default();
         let objective = self.objective_of(number, &body)?;
         let (mut meta, mut parent) = (kata::TrackerMeta::default(), None);
@@ -627,6 +865,7 @@ impl Ctx<'_> {
             pr: None,
             pr_link: None,
             worktree: None,
+            objective_node: objective.map(|(o, id, ..)| (o, id)),
         };
         let vars = t.vars(t.kata_ref.clone(), meta_map);
         let branch_pending;
@@ -722,9 +961,84 @@ impl Ctx<'_> {
         Ok(())
     }
 
+    /// Execute one planned item, creating its plan first for a new node. Once
+    /// the branch and PR exist, the objective node is queued to be marked in
+    /// progress, even if a later step fails.
+    fn run_item(
+        &self,
+        objectives: &mut BTreeMap<u64, ObjectiveArg>,
+        work: Work,
+        target: Option<Target>,
+        updates: &mut Updates,
+    ) -> Result<String> {
+        let (mut t, created) = match (target, work) {
+            (Some(t), _) => (t, None),
+            (None, Work::NewPlan { objective, node_id }) => {
+                let number = self.create_node_plan(objectives, objective, &node_id)?;
+                (self.plan_target(number)?, Some(number))
+            }
+            (None, Work::Plan(n)) => anyhow::bail!("#{n} was not planned"),
+        };
+        if created.is_some() {
+            print!("{}", describe(&t, self.opts.no_launch));
+        }
+        let mut placed = None;
+        let result = self.execute(&mut t, &mut placed);
+        if let (Some(_), Some((objective, node_id))) = (placed, &t.objective_node) {
+            updates
+                .entry(*objective)
+                .or_default()
+                .push((node_id.clone(), t.number));
+        }
+        let outcome = result?;
+        Ok(match created {
+            Some(n) => format!("created #{n}; {outcome}"),
+            None => outcome,
+        })
+    }
+
+    /// Create the plan issue for an objective node through the same path as
+    /// `engram objective plan`, and record it on the objective right away so an
+    /// interrupted run can't orphan it or create a duplicate next time.
+    fn create_node_plan(
+        &self,
+        objectives: &mut BTreeMap<u64, ObjectiveArg>,
+        objective: u64,
+        node_id: &str,
+    ) -> Result<u64> {
+        let obj = objectives
+            .get_mut(&objective)
+            .with_context(|| format!("objective #{objective} was not loaded"))?;
+        let idx = obj
+            .nodes
+            .iter()
+            .position(|n| n.id == node_id)
+            .with_context(|| format!("node {node_id} not found in objective #{objective}"))?;
+        eprintln!("plan: generating a plan issue for node {node_id} (this calls Claude)");
+        let url = objective::create_plan_for_node(
+            self.repo,
+            objective,
+            &obj.title,
+            &obj.body,
+            &mut obj.nodes,
+            idx,
+            None,
+            &kata::TrackerMeta::default(),
+            false,
+        )?;
+        eprintln!("plan: created {url}");
+        let number = obj.nodes[idx]
+            .plan_issue
+            .with_context(|| format!("node {node_id} has no plan issue after creating {url}"))?;
+        write_node_updates(self.repo, objective, &[(node_id.to_string(), number)]).with_context(|| {
+            format!("created #{number} but could not record it on objective #{objective}; not dispatching it")
+        })?;
+        Ok(number)
+    }
+
     /// Carry out a confirmed target and print its report. Every step looks up
     /// existing state first, so a re-run after a partial failure resumes.
-    fn execute(&self, t: &mut Target) -> Result<()> {
+    fn execute(&self, t: &mut Target, placed: &mut Option<Placed>) -> Result<String> {
         let (kata_ref, claimed_by_me, created) = match &t.kata_ref {
             Some(r) => (r.clone(), t.claimed_by_me, false),
             // Same idempotency key as `plan new`, so the two paths can't
@@ -792,6 +1106,7 @@ impl Ctx<'_> {
                 url
             }
         };
+        *placed = Some((t.branch.clone(), pr_url.clone()));
 
         let worktree = match &t.worktree {
             Some(path) => {
@@ -832,7 +1147,11 @@ impl Ctx<'_> {
             t.base,
             worktree.display()
         );
-        Ok(())
+        Ok(if launch == LAUNCHED {
+            "newly launched".to_string()
+        } else {
+            format!("reused ({launch})")
+        })
     }
 
     /// Create the branch without checking anything out, so the user's checkout
@@ -1111,6 +1430,7 @@ fn run(cmd: &mut Command) -> Result<String> {
 mod tests {
     use super::*;
     use rstest::rstest;
+    use NodeStatus::*;
 
     fn vars(kata_ref: Option<&str>) -> TemplateVars {
         TemplateVars {
@@ -1270,6 +1590,7 @@ mod tests {
             pr: None,
             pr_link: None,
             worktree: None,
+            objective_node: Some((141, "5.2".into())),
         }
     }
 
@@ -1353,13 +1674,16 @@ mod tests {
     }
 
     #[rstest]
-    #[case::open_plan("OPEN", &[PLAN_LABEL], Ok(()))]
-    #[case::unlabelled("OPEN", &[], Err("not an engram-plan issue"))]
-    #[case::objective("OPEN", &[OBJECTIVE_LABEL], Err("not an engram-plan issue"))]
-    #[case::closed("CLOSED", &[PLAN_LABEL], Err("not open"))]
+    #[case::objective("OPEN", &[OBJECTIVE_LABEL], true, Ok(()))]
+    #[case::node_list_wins_without_label("OPEN", &[], true, Ok(()))]
+    #[case::plan("OPEN", &[PLAN_LABEL], false, Ok(()))]
+    #[case::objective_without_nodes("OPEN", &[OBJECTIVE_LABEL], false, Err("without a node list"))]
+    #[case::unlabelled("OPEN", &[], false, Err("neither"))]
+    #[case::closed("CLOSED", &[PLAN_LABEL], false, Err("not open"))]
     fn check_kind_refuses_closed_and_unlabelled_issues(
         #[case] state: &str,
         #[case] labels: &[&str],
+        #[case] has_nodes: bool,
         #[case] want: Want<()>,
     ) {
         let labels = labels.iter().map(|l| github::Label { name: (*l).into() });
@@ -1369,7 +1693,91 @@ mod tests {
             state: state.into(),
             labels: labels.collect(),
         };
-        assert_result(check_kind(1, &issue), want);
+        assert_result(check_kind(1, &issue, has_nodes), want);
+    }
+
+    fn node(id: &str, status: NodeStatus, deps: &[&str]) -> ObjectiveNode {
+        ObjectiveNode {
+            id: id.into(),
+            description: id.into(),
+            status,
+            plan_issue: None,
+            pr_url: None,
+            depends_on: deps.iter().map(|d| d.to_string()).collect(),
+        }
+    }
+
+    fn planned(id: &str, status: NodeStatus, deps: &[&str], plan: u64) -> ObjectiveNode {
+        ObjectiveNode {
+            plan_issue: Some(plan),
+            ..node(id, status, deps)
+        }
+    }
+
+    #[test]
+    fn objective_node_sets() {
+        let nodes = vec![
+            node("1", Done, &[]),
+            planned("2", InProgress, &["1"], 20),
+            node("3", Pending, &["1", "2"]),
+            node("4", Pending, &["2", "3", "9.9"]),
+            node("5", Pending, &["9.9"]),
+            planned("6", Done, &["3"], 60),
+        ];
+        // In-progress 2 counts; 5's unknown dependency doesn't block; done never qualifies.
+        let picked: Vec<&str> = dispatch_candidates(&nodes)
+            .iter()
+            .map(|n| n.id.as_str())
+            .collect();
+        assert_eq!(picked, ["2", "5"]);
+        assert_eq!(
+            blocked_report(&nodes),
+            vec![
+                ("3".to_string(), vec!["2"]),
+                ("4".to_string(), vec!["2", "3"])
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_node_updates_records_plan_and_progress_only() {
+        let mut nodes = vec![
+            node("1", Pending, &[]),
+            planned("2", InProgress, &[], 20),
+            planned("3", Done, &[], 30),
+        ];
+        let up = |id: &str, plan: u64| (id.to_string(), plan);
+        let updates =
+            [("1", 10), ("1", 10), ("2", 99), ("3", 30), ("9.9", 1)].map(|(id, n)| up(id, n));
+        let changed = apply_node_updates(&mut nodes, &updates);
+        assert_eq!(changed, vec!["1"]);
+        assert_eq!(nodes[0].status, InProgress);
+        assert_eq!(nodes[0].plan_issue, Some(10));
+        // An existing plan issue is never replaced; done stays done.
+        assert_eq!(nodes[1].plan_issue, Some(20));
+        assert_eq!(nodes[2].status, Done);
+        assert!(apply_node_updates(&mut nodes, &[up("1", 10), up("2", 20)]).is_empty());
+    }
+
+    #[test]
+    fn dedup_candidates_keeps_first_of_each() {
+        let new = |id: &str| Work::NewPlan {
+            objective: 141,
+            node_id: id.into(),
+        };
+        let works = [
+            Work::Plan(142),
+            new("5.2"),
+            Work::Plan(150),
+            Work::Plan(142),
+            new("5.2"),
+        ];
+        let items = works.map(|work| Item { work }).into_iter().collect();
+        let out: Vec<Work> = dedup_candidates(items)
+            .into_iter()
+            .map(|i| i.work)
+            .collect();
+        assert_eq!(out, [Work::Plan(142), new("5.2"), Work::Plan(150)]);
     }
 
     #[rstest]
