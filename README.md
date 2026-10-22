@@ -195,24 +195,24 @@ Replace legacy session tokens with JWTs across all services.
 - Do not change the public API shape during migration
 
 ## Roadmap
-- 1: Extract token validation into auth module
-- 2: Migrate session storage (depends: 1)
-- 3: Remove legacy token code (depends: 2)
+- 1.1: Extract token validation into auth module
+- 1.2: Migrate session storage (depends: 1.1)
+- 1.3: Remove legacy token code (depends: 1.2)
 "
 ```
 
-This creates a GitHub issue tagged `engram-objective` with a rendered roadmap table and a hidden machine-readable node graph. Nodes accept `(depends: 1, 2)` syntax for ordering. Roadmap IDs are just local labels for `depends`: once the issue exists (say #42), engram renumbers the nodes to `42.1`, `42.2`, `42.3` in list order and rewrites the dependencies to match. Add a node later with `engram objective append 42 --description "..." [--depends 42.2]`; the next ID (`42.4`) is assigned automatically unless you pass `--id`.
+This creates a GitHub issue tagged `engram-objective` with a rendered roadmap table and a hidden machine-readable node graph. Node IDs are free-form labels you choose (e.g. `1.1` or just `1`), used verbatim; nodes accept `(depends: 1.1, 1.2)` syntax for ordering.
 
 ### Start work on a node
 
 ```
-engram objective plan 42 --node 42.1
+engram objective plan 42 --node 1.1
 ```
 
-Creates an `engram-plan` issue for node 42.1 and marks it `in_progress` in the objective. If you omit `--body`, Claude generates the plan body from the node description and objective context. You can also provide one explicitly:
+Creates an `engram-plan` issue for node 1.1 and marks it `in_progress` in the objective. If you omit `--body`, Claude generates the plan body from the node description and objective context. You can also provide one explicitly:
 
 ```
-engram objective plan 42 --node 42.1 --body "**Why**\n..."
+engram objective plan 42 --node 1.1 --body "**Why**\n..."
 ```
 
 ### Track progress

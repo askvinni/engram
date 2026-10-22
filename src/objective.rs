@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::process::Command;
 
 use crate::{github, kata};
@@ -41,11 +40,9 @@ pub struct ObjectiveNode {
 
 /// Parse bullet-list node definitions from a Roadmap section body.
 /// Accepts lines like:
-///   - 1: Description
-///   - 2: Description (depends: 1)
-///   - 3: Description (depends: 1, 2)
-///
-/// IDs are local labels; `new` renumbers them via `renumber_nodes`.
+///   - 1.1: Description
+///   - 1.2: Description (depends: 1.1)
+///   - 1.3: Description (depends: 1.1, 1.2)
 pub fn parse_nodes_from_roadmap_input(text: &str) -> Vec<ObjectiveNode> {
     let mut nodes = Vec::new();
     for line in text.lines() {
@@ -189,73 +186,6 @@ fn extract_section<'a>(body: &'a str, heading: &str) -> Option<&'a str> {
     Some(&content[..section_end])
 }
 
-/// Renumber roadmap nodes to `<objective_number>.<k>` (k = 1-based position),
-/// remapping every `depends_on` through the same old→new mapping. Roadmap IDs
-/// are treated as local labels. Errors on duplicate labels or a dependency
-/// that references an unknown label.
-pub fn renumber_nodes(
-    nodes: &[ObjectiveNode],
-    objective_number: u64,
-) -> Result<Vec<ObjectiveNode>> {
-    let mut mapping: HashMap<&str, String> = HashMap::new();
-    for (i, node) in nodes.iter().enumerate() {
-        let new_id = format!("{objective_number}.{}", i + 1);
-        if mapping.insert(node.id.as_str(), new_id).is_some() {
-            anyhow::bail!("duplicate node ID `{}` in ## Roadmap", node.id);
-        }
-    }
-    nodes
-        .iter()
-        .map(|node| {
-            let depends_on = node
-                .depends_on
-                .iter()
-                .map(|dep| {
-                    mapping.get(dep.as_str()).cloned().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "node `{}` depends on unknown node `{dep}` in ## Roadmap",
-                            node.id
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let id = mapping
-                .get(node.id.as_str())
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("node `{}` missing from ID mapping", node.id))?;
-            Ok(ObjectiveNode {
-                id,
-                depends_on,
-                ..node.clone()
-            })
-        })
-        .collect()
-}
-
-/// Next auto-assigned node ID for `append`: `<number>.<max seq + 1>` over the
-/// existing IDs of the form `<number>.<int>`; when none match (e.g. an
-/// objective whose IDs predate auto-numbering), `<number>.<node count + 1>`.
-pub fn next_node_id(nodes: &[ObjectiveNode], objective_number: u64) -> String {
-    let prefix = format!("{objective_number}.");
-    let max_seq = nodes
-        .iter()
-        .filter_map(|n| n.id.strip_prefix(prefix.as_str()))
-        .filter_map(|seq| seq.parse::<u64>().ok())
-        .max();
-    let next = match max_seq {
-        Some(max) => max + 1,
-        None => nodes.len() as u64 + 1,
-    };
-    format!("{objective_number}.{next}")
-}
-
-fn parse_issue_number_from_url(url: &str) -> Result<u64> {
-    url.rsplit('/')
-        .next()
-        .and_then(|s| s.parse::<u64>().ok())
-        .with_context(|| format!("could not parse issue number from URL: {url}"))
-}
-
 pub fn new(
     repo: &str,
     title: &str,
@@ -269,23 +199,20 @@ pub fn new(
     let nodes = parse_nodes_from_roadmap_input(roadmap_text);
     if nodes.is_empty() {
         anyhow::bail!(
-            "## Roadmap section contains no nodes — expected lines like `- 1: Description`"
+            "## Roadmap section contains no nodes — expected lines like `- 1.1: Description`"
         );
     }
-    // Validate labels before creating anything; the placeholder number is
-    // irrelevant, only the duplicate/unknown-dep checks matter here.
-    renumber_nodes(&nodes, 0).context("validating ## Roadmap nodes")?;
 
-    let initial_body = build_objective_body(body, &nodes);
-    let url = github::create_issue(repo, title, &initial_body, "engram-objective")?;
-    let url = url.trim().to_string();
-    let issue_number = parse_issue_number_from_url(&url)?;
-
-    let nodes = renumber_nodes(&nodes, issue_number)?;
     let issue_body = build_objective_body(body, &nodes);
+    let url = github::create_issue(repo, title, &issue_body, "engram-objective")?;
+    let url = url.trim().to_string();
 
-    let mut final_body = issue_body.clone();
     if !no_kata && kata::kata_available() {
+        let issue_number = url
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .with_context(|| format!("could not parse issue number from URL: {url}"))?;
         let kata_body = format!("GitHub: {url}\n\n{issue_body}");
         let idempotency_key = format!("engram-objective-{issue_number}");
         let meta = kata::TrackerMeta::resolve(
@@ -295,16 +222,15 @@ pub fn new(
             body,
         );
         match kata::create(title, &kata_body, &idempotency_key, None, &meta) {
-            Ok(kata_ref) => final_body = format!("{issue_body}\nKata: {kata_ref}"),
-            Err(e) => eprintln!("warning: kata create failed (continuing): {e:#}"),
-        }
-    }
-
-    if final_body != initial_body {
-        if let Err(e) = github::update_issue_body(repo, issue_number, &final_body) {
-            eprintln!(
-                "warning: could not write renumbered roadmap to objective #{issue_number}: {e:#}"
-            );
+            Ok(kata_ref) => {
+                let updated_body = format!("{issue_body}\nKata: {kata_ref}");
+                if let Err(e) = github::update_issue_body(repo, issue_number, &updated_body) {
+                    eprintln!("warning: could not append Kata ref to GitHub issue: {e:#}");
+                }
+            }
+            Err(e) => {
+                eprintln!("warning: kata create failed (continuing): {e:#}");
+            }
         }
     }
 
@@ -734,7 +660,7 @@ pub fn land(repo_root: &std::path::Path, repo: &str, objective_number: u64) -> R
 pub fn append(
     repo: &str,
     number: u64,
-    id: Option<&str>,
+    id: &str,
     description: &str,
     depends: Option<&str>,
 ) -> Result<()> {
@@ -748,10 +674,6 @@ pub fn append(
         )
     })?;
 
-    let id = match id {
-        Some(id) => id.to_string(),
-        None => next_node_id(&nodes, number),
-    };
     if nodes.iter().any(|n| n.id == id) {
         anyhow::bail!("node {id} already exists in objective #{number}");
     }
@@ -772,7 +694,7 @@ pub fn append(
     }
 
     nodes.push(ObjectiveNode {
-        id: id.clone(),
+        id: id.to_string(),
         description: description.to_string(),
         status: NodeStatus::Pending,
         plan_issue: None,
@@ -1167,85 +1089,5 @@ mod tests {
             !nodes.iter().any(|n| n.id == "9.9"),
             "unknown dep should be caught"
         );
-    }
-
-    // --- renumbering ---
-
-    fn ids(nodes: &[ObjectiveNode]) -> Vec<&str> {
-        nodes.iter().map(|n| n.id.as_str()).collect()
-    }
-
-    #[test]
-    fn renumber_nodes_sequential_and_remaps_deps() {
-        let nodes = parse_nodes_from_roadmap_input(
-            "- 5.1: First\n- 5.2: Second (depends: 5.1)\n- 5.3: Third (depends: 5.1, 5.2)\n",
-        );
-        let out = renumber_nodes(&nodes, 141).unwrap();
-        assert_eq!(ids(&out), vec!["141.1", "141.2", "141.3"]);
-        assert!(out[0].depends_on.is_empty());
-        assert_eq!(out[1].depends_on, vec!["141.1"]);
-        assert_eq!(out[2].depends_on, vec!["141.1", "141.2"]);
-        assert_eq!(out[2].description, "Third");
-    }
-
-    #[test]
-    fn renumber_nodes_accepts_arbitrary_labels() {
-        let nodes = parse_nodes_from_roadmap_input(
-            "- a: First\n- 1: Second (depends: a)\n- z: Third (depends: 1)\n",
-        );
-        let out = renumber_nodes(&nodes, 7).unwrap();
-        assert_eq!(ids(&out), vec!["7.1", "7.2", "7.3"]);
-        assert_eq!(out[1].depends_on, vec!["7.1"]);
-        assert_eq!(out[2].depends_on, vec!["7.2"]);
-    }
-
-    #[test]
-    fn renumber_nodes_forward_dependency_is_remapped() {
-        let nodes = parse_nodes_from_roadmap_input("- 1: First (depends: 2)\n- 2: Second\n");
-        let out = renumber_nodes(&nodes, 3).unwrap();
-        assert_eq!(out[0].depends_on, vec!["3.2"]);
-    }
-
-    #[test]
-    fn renumber_nodes_rejects_duplicate_id() {
-        let nodes = parse_nodes_from_roadmap_input("- 1: First\n- 1: Again\n");
-        let err = renumber_nodes(&nodes, 9).unwrap_err();
-        assert!(format!("{err:#}").contains("duplicate node ID `1`"));
-    }
-
-    #[test]
-    fn renumber_nodes_rejects_unknown_dep() {
-        let nodes = parse_nodes_from_roadmap_input("- 1: First\n- 2: Second (depends: 3)\n");
-        let err = renumber_nodes(&nodes, 9).unwrap_err();
-        assert!(format!("{err:#}").contains("unknown node `3`"));
-    }
-
-    // --- append auto-ID ---
-
-    #[test]
-    fn next_node_id_uses_max_matching_sequence() {
-        let nodes = vec![
-            node("42.1", NodeStatus::Done, &[]),
-            node("42.3", NodeStatus::Pending, &[]),
-            node("42.x", NodeStatus::Pending, &[]),
-            node("7.9", NodeStatus::Pending, &[]),
-        ];
-        assert_eq!(next_node_id(&nodes, 42), "42.4");
-    }
-
-    #[test]
-    fn next_node_id_falls_back_to_count_when_no_match() {
-        let nodes = vec![
-            node("5.1", NodeStatus::Done, &[]),
-            node("5.2", NodeStatus::Pending, &[]),
-        ];
-        assert_eq!(next_node_id(&nodes, 141), "141.3");
-        assert_eq!(next_node_id(&[], 141), "141.1");
-    }
-
-    #[test]
-    fn next_node_id_does_not_match_longer_prefix() {
-        let nodes = vec![node("142.5", NodeStatus::Pending, &[])];
-        assert_eq!(next_node_id(&nodes, 14), "14.2");
     }
 }
