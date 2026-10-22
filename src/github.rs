@@ -1,6 +1,6 @@
+use crate::config;
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::process::Command;
 
 #[derive(Debug, Deserialize)]
 pub struct Issue {
@@ -85,7 +85,7 @@ pub struct PlanIssue {
 }
 
 fn gh(args: &[&str]) -> Result<String> {
-    let output = Command::new("gh")
+    let output = config::gh_command()?
         .args(args)
         .output()
         .context("running gh CLI (is it installed and authenticated?)")?;
@@ -97,7 +97,7 @@ fn gh(args: &[&str]) -> Result<String> {
 }
 
 pub fn ensure_label(repo: &str, name: &str, color: &str, description: &str) -> Result<()> {
-    let output = Command::new("gh")
+    let output = config::gh_command()?
         .args([
             "label",
             "create",
@@ -509,7 +509,7 @@ pub fn list_prs_with_body(repo: &str, state: &str) -> Result<Vec<PrWithBody>> {
 /// `gh stack <args>` for `repo`. gh-stack can't map an SSH host-alias remote
 /// (`git@github-personal:...`) to GitHub, so the repo is named via `GH_REPO`.
 pub fn gh_stack(repo_root: &std::path::Path, repo: &str, args: &[&str]) -> Result<()> {
-    let output = Command::new("gh")
+    let output = config::gh_command()?
         .arg("stack")
         .args(args)
         .env("GH_REPO", repo)
@@ -604,7 +604,7 @@ pub fn update_issue(
 }
 
 pub fn reopen_issue(repo: &str, number: u64) -> Result<()> {
-    let output = Command::new("gh")
+    let output = config::gh_command()?
         .args(["issue", "reopen", &number.to_string(), "--repo", repo])
         .output()
         .context("running gh CLI")?;
@@ -741,7 +741,7 @@ pub fn get_issue_comments(repo: &str, number: u64) -> Result<Vec<IssueComment>> 
 }
 
 pub fn close_issue(repo: &str, number: u64) -> Result<()> {
-    let output = Command::new("gh")
+    let output = config::gh_command()?
         .args(["issue", "close", &number.to_string(), "--repo", repo])
         .output()
         .context("running gh CLI")?;

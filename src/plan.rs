@@ -151,7 +151,7 @@ pub fn land(repo_root: &Path, issue: u64, no_kata: bool) -> Result<()> {
 
     let gh_issue = github::get_issue(&repo, issue)?;
     if gh_issue.state != "CLOSED" {
-        Command::new("gh")
+        config::gh_command()?
             .args(["issue", "close", &issue.to_string(), "--repo", &repo])
             .status()?;
         println!("Closed issue #{issue}.");

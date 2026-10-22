@@ -82,8 +82,10 @@ Native kata mirroring for issue *creation* is implemented: `plan new`, `objectiv
 - `--start-session` is the only `kwt open` mode that never attaches the terminal; it fails transiently ("fork failed") and is idempotent, so it is retried (`KWT_OPEN_ATTEMPTS`).
 - The launch command starts with `cd <worktree> &&` (the pane may sit in a deleted directory), is only typed into a pane running a shell, and counts as launched only once Claude has taken the pane over and is still there after `LAUNCH_SETTLE`.
 - kwt falls back to the `GHOSTHUB_KWT` path, since it is often only a shell alias. Worktrees are found by exact branch in `kwt list --json`; `kwt get` matches fuzzily.
-- The prompt file lives under `$XDG_STATE_HOME/engram/dispatch/`, outside every worktree. `ENGRAM_DISPATCH_CLAUDE` (tests) replaces only the resolved claude path; the flags and prompt are always appended.
+- The prompt file lives under `$XDG_STATE_HOME/engram/dispatch/`, outside every worktree. The claude command is `ENGRAM_DISPATCH_CLAUDE` (tests), else `[dispatch] claude`, else the resolved claude path; the flags and prompt are always appended.
 - Branches are made with `git commit-tree` + `git branch` on the fetched `origin/<base>`, never by checkout. `gh stack` runs with `GH_REPO`, since gh-stack can't map SSH host aliases.
+
+**Plain command line.** `engram dispatch <args>` must work exactly as typed: auto mode only honours the narrow `Bash(engram dispatch:*)` rule `engram init` installs, and denies command lines that configure an agent or pass a credential. Configuration goes in `.engram/config.toml` or git config (`engram.githubUser`). GitHub-facing `gh` calls and `git` calls that talk to `origin` (`git_remote`) go through `config::gh_command()`/`with_github_identity`; the pane resolves its own token with `GH_TOKEN="$(gh auth token --user …)" && export GH_TOKEN && …` so a failed lookup never starts Claude. Never write a token into keystrokes, prompt files, logs or errors.
 
 **Idempotency.** Every `carry_out` step looks up existing state first, so a re-run resumes. Keep `Closes #N` in the draft PR body: GitHub never links stacked PRs, so re-runs find them by that line. Never steal another actor's kata claim.
 
