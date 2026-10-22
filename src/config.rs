@@ -8,6 +8,8 @@ use std::sync::OnceLock;
 pub struct Config {
     pub github: GitHubConfig,
     pub memory: MemoryConfig,
+    #[serde(default)]
+    pub dispatch: DispatchConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -32,6 +34,27 @@ impl Default for MemoryConfig {
         }
     }
 }
+
+/// `[dispatch]`: templates for the branches and draft PRs `engram dispatch`
+/// creates (see `dispatch::render` for the placeholders).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DispatchConfig {
+    pub branch: String,
+    pub pr_title: String,
+}
+
+impl Default for DispatchConfig {
+    fn default() -> Self {
+        Self {
+            branch: DEFAULT_BRANCH_TEMPLATE.into(),
+            pr_title: DEFAULT_PR_TITLE_TEMPLATE.into(),
+        }
+    }
+}
+
+const DEFAULT_BRANCH_TEMPLATE: &str = "{number}-{slug}";
+const DEFAULT_PR_TITLE_TEMPLATE: &str = "{title}";
 
 impl Config {
     pub fn load(repo_root: &Path) -> Result<Self> {
@@ -166,6 +189,7 @@ pub fn resolve_repo(cfg: &Config, repo_root: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     fn git(dir: &Path, args: &[&str]) {
         let status = Command::new("git")
@@ -228,5 +252,21 @@ mod tests {
     fn unavailable_reason_configured_repo_needs_no_remote() {
         assert_eq!(github_unavailable_reason(true, true, false), None);
         assert_eq!(github_unavailable_reason(true, false, true), None);
+    }
+
+    #[rstest]
+    #[case::defaults("", "{number}-{slug}", "{title}")]
+    #[case::partial("[dispatch]\nbranch = \"{slug}\"\n", "{slug}", "{title}")]
+    fn dispatch_section_fills_in_defaults(
+        #[case] section: &str,
+        #[case] branch: &str,
+        #[case] pr_title: &str,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".engram")).unwrap();
+        let text = format!("[github]\n\n[memory]\ndefault_categories = []\n{section}");
+        std::fs::write(dir.path().join(".engram/config.toml"), text).unwrap();
+        let d = Config::load(dir.path()).unwrap().dispatch;
+        assert_eq!((d.branch.as_str(), d.pr_title.as_str()), (branch, pr_title));
     }
 }
