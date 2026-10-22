@@ -53,7 +53,7 @@ After exploration, draft the complete body internally. Produce the whole thing a
 ```
 
 Rules for nodes:
-- IDs must be `<objective-number>.<sequence>` — use `1.1`, `1.2`, `1.3`, … until the objective issue number is known, then suggest the user update them after creation if needed
+- IDs are free-form labels you choose (e.g. `1`, `2`, `3` or `1.1`, `1.2`); they are used verbatim as node IDs and referenced by `(depends: ...)`
 - Every node must complete in one PR — split large nodes further
 - `depends_on` must reference only IDs that exist in the same list
 - Start simple: 3–6 nodes covers most goals. More nodes are fine if each is genuinely independent.
@@ -143,7 +143,7 @@ Which source files or subsystems change. Call out explicitly what does **not** c
 
 ## Node ID conventions
 
-Node IDs use the format `<objective-number>.<sequence>` (e.g. `1.1`, `1.2`, `1.3`). Before the issue is created, the objective number is unknown — use a placeholder like `N.1`, `N.2` or simply `1.1`, `1.2` and note in the confirm step that the user should verify the IDs after creation if the issue number matters for cross-references.
+Node IDs are free-form labels chosen by the author (e.g. `1`, `2`, `3` or `1.1`, `1.2`, `1.3`). engram uses them verbatim as node IDs: `(depends: ...)` references them, and `engram objective plan --node <id>` / `engram objective append --id <id>` take them. There is no required `<objective-number>.<sequence>` format and no need to update IDs after the issue is created.
 
 The `plan_issue` and `pr_url` fields in the hidden JSON are `null` until `engram objective plan` populates them. The skill does not set these — the CLI handles it.
 

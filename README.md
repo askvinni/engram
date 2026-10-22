@@ -201,7 +201,7 @@ Replace legacy session tokens with JWTs across all services.
 "
 ```
 
-This creates a GitHub issue tagged `engram-objective` with a rendered roadmap table and a hidden machine-readable node graph. Nodes accept `(depends: 1.1, 1.2)` syntax for ordering.
+This creates a GitHub issue tagged `engram-objective` with a rendered roadmap table and a hidden machine-readable node graph. Node IDs are free-form labels you choose (e.g. `1.1` or just `1`), used verbatim; nodes accept `(depends: 1.1, 1.2)` syntax for ordering.
 
 ### Start work on a node
 
