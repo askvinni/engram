@@ -272,11 +272,28 @@ engram dispatch --stack 41         # an objective's dependency chains as stacked
 [dispatch]
 branch = "{meta[type]}/{meta[jira]}/{slug}"   # default "{number}-{slug}"
 pr_title = "[{meta[jira]}] {title}"           # default "{title}"
+claude = "claude --model opus"                # default: claude from PATH
 ```
 
 Placeholders: `{number}` (plan issue), `{kata_ref}` (the mirror's short ref, shown as `<kata-ref>` in a dry run until it exists), `{title}`, `{slug}` (lowercase and dashes, at most 40 characters, cut at a word, a leading `[5.1]` dropped) and `{meta[key]}` (kata metadata, e.g. `jira`, `type`, set by `plan new`/`objective plan` from `--jira`/`--type`, a body line or the title). `{{`/`}}` are literal braces. A missing key fails at planning with the fix (`kata meta set <kata-ref> jira ENG-1234`), and the branch name is checked with `git check-ref-format`. The old Python dispatcher's git-config templates are not read: move them here (`prTitle` → `pr_title`, `{short_id}` → `{kata_ref}`; the old default was `{short_id}-{slug}`).
 
-Claude is launched as `claude --permission-mode auto "$(cat <prompt>)"`, and the prompt file lives under `$XDG_STATE_HOME/engram/dispatch/`, outside every worktree. `ENGRAM_DISPATCH_CLAUDE` replaces the `claude` command, for tests.
+`claude` is used verbatim; ` --permission-mode auto "$(cat <prompt>)"` is appended either way, and the prompt file lives under `$XDG_STATE_HOME/engram/dispatch/`, outside every worktree. `ENGRAM_DISPATCH_CLAUDE` overrides it, for tests.
+
+**Multiple GitHub accounts.** If your active `gh` account can't see the repo, set `git config engram.githubUser <login>` (git config, since the identity is yours, not the repo's). Unless `GH_TOKEN` or `GITHUB_TOKEN` is already set, engram then passes `gh auth token --user <login>` as `GH_TOKEN` to its `gh` calls and to dispatch's `git` fetch/push/ls-remote, and never runs `gh auth switch`; an account that isn't logged in fails with a `gh auth login` hint (`engram doctor` shows it too). tmux panes don't inherit engram's environment, so the pane resolves the token itself: `cd <worktree> && GH_TOKEN="$(gh auth token --user '<login>')" && export GH_TOKEN && claude …`. The token never appears in keystrokes or scrollback, and a failed lookup leaves the pane at the shell (reported as a failed launch) instead of starting Claude as the wrong account. The pane's shell must accept POSIX assignments (not fish).
+
+### From an auto-mode Claude session
+
+`engram init` adds `Bash(engram dispatch:*)` to `.claude/settings.json` unless it (or `Bash(engram dispatch *)`) is already there, re-serialising the file with key order kept; a file it can't read, parse (e.g. JSONC) or write is left untouched with a warning, and init carries on. `engram doctor` reports whether `.claude/settings.json` or `.claude/settings.local.json` has the rule. The `engram-dispatch` skill dry-runs, confirms with you, then dispatches. The rule only matches commands that *start* with `engram dispatch`, so run it from the repo root with nothing in front (`cd … &&` or `GH_TOKEN=…` won't match); that is what `engram.githubUser` and `[dispatch] claude` are for. If the classifier still denies it, add an exception to your **user** `~/.claude/settings.json` (project settings can't carry `autoMode`):
+
+```json
+{
+  "autoMode": {
+    "allow": [
+      "Running `engram dispatch` to start Claude sessions in kwt worktrees for engram plan issues is allowed when the user asked to dispatch them"
+    ]
+  }
+}
+```
 
 ---
 
@@ -299,7 +316,7 @@ kata create "<same title as the GitHub issue>" \
 
 ## Claude Code skills
 
-`engram init` installs three skills into `.claude/skills/`. These are invocable as slash commands in Claude Code:
+`engram init` installs its skills into `.claude/skills/`. They are invocable as slash commands in Claude Code, among them:
 
 ### `/engram-plan <title>`
 
@@ -316,6 +333,10 @@ Explains the learn/land workflow, what gets written to memory, and how to review
 ### `/engram-memory`
 
 Helps you navigate, evaluate, and manually maintain `.engram/memory/`. Use it when deciding whether a file is worth keeping, or when running `engram compact`.
+
+### `/engram-dispatch <issues>`
+
+Dispatches plans or objectives from a Claude session, including one in auto mode: runs `engram dispatch <issues> --dry-run`, shows you the plan and confirms, then runs it with `--yes` and relays the summary. See [From an auto-mode Claude session](#from-an-auto-mode-claude-session).
 
 ---
 
