@@ -18,7 +18,7 @@ const CHANGE_TYPES: &[&str] = &[
     "feat", "fix", "chore", "docs", "refactor", "test", "perf", "build", "ci", "style", "revert",
 ];
 
-/// Ticket metadata that kdispatch's branch/PR-title templates read from kata
+/// Ticket metadata that `engram dispatch`'s `[dispatch]` branch/PR-title templates read from kata
 /// (`{meta[jira]}`, `{meta[type]}`). Absent fields are never written — no placeholders.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TrackerMeta {
@@ -134,7 +134,7 @@ pub fn with_ref_line(gh_body: &str, kata_ref: &str) -> String {
     format!("{gh_body}\n{KATA_REF_PREFIX}{kata_ref}")
 }
 
-/// Read the kdispatch metadata already set on a kata issue.
+/// Read the tracker metadata (`jira`, `type`) already set on a kata issue.
 pub fn tracker_meta_of(kata_ref: &str) -> Result<TrackerMeta> {
     Ok(TrackerMeta::from_metadata(&show(kata_ref)?.metadata))
 }

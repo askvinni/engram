@@ -86,7 +86,7 @@ When a plan that was created via an objective lands, engram automatically marks 
 - [`gh`](https://cli.github.com/) authenticated with `gh auth login`
 - [Claude Code](https://claude.ai/code) installed and authenticated
 
-`gh` and a GitHub remote are only needed for the GitHub-backed commands (`plan`, `objective`, `compact`, `memory migrate`). `engram init` works in a local-only repo — no `origin` remote, no `gh` — and skips the GitHub label setup; the GitHub-backed commands then fail with a clear "this command requires GitHub" error.
+`gh` and a GitHub remote are only needed for the GitHub-backed commands (`plan`, `objective`, `compact`, `memory migrate`, `dispatch`). See [Dispatch](#dispatch) for its extra tools (kwt, tmux, kata, claude). `engram init` works in a local-only repo — no `origin` remote, no `gh` — and skips the GitHub label setup; the GitHub-backed commands then fail with a clear "this command requires GitHub" error.
 
 ## Installation
 
@@ -127,6 +127,10 @@ engram objective new <title> --body <body>         Create a multi-plan objective
 engram objective plan <number> --node <id>         Create a plan for one node
 engram objective view <number>                     Show objective and node statuses
 engram objective list                              List open objectives
+
+engram dispatch <issue>... [--dry-run] [--yes] [--no-launch]
+                                           Start plans (or an objective's unblocked nodes) in background Claude sessions
+engram dispatch --stack <objective>        Dispatch an objective's dependency chains as stacked PRs
 ```
 
 ---
@@ -227,6 +231,52 @@ engram objective list
 ### Automatic status updates
 
 When you run `engram plan land <plan>` or `engram plan learn <plan>` on a plan that was created via `objective plan`, engram automatically marks the corresponding node as `done` in the objective issue. No manual update needed.
+
+---
+
+## Dispatch
+
+`engram dispatch` hands plan issues to background Claude sessions. Each plan gets its own branch, draft PR, kwt worktree and tmux workspace, and Claude starts there in auto mode with the plan as its prompt. The sessions show up in Ghosthub without taking over your terminal.
+
+```
+engram dispatch 42                 # one plan
+engram dispatch 42 43 44           # several plans, each based on the default branch
+engram dispatch 41                 # an objective: its unblocked nodes
+engram dispatch 41 50              # any mix of plans and objectives
+engram dispatch --stack 41         # an objective's dependency chains as stacked PRs
+```
+
+| Flag | Effect |
+|------|--------|
+| `--dry-run` | Print what would happen (kata ref, branch and base, PR title, PR, worktree, launch) and change nothing |
+| `-y`, `--yes` | Skip the confirmation. Required without a terminal |
+| `--no-launch` | Do everything except start Claude; the pane stays at a shell |
+| `--stack` | Stacked dispatch of exactly one objective |
+
+**Tools.** Dispatch is the only command that needs `kwt`, `tmux` and `kata` (with the repo bound by `kata init`), on top of `gh` and `claude`. It checks them all up front and names every problem; `engram doctor` reports the same as a non-failing line. If `kwt` is only a shell alias, the copy bundled at `/Applications/Ghosthub.app/Contents/Helpers/kwt` is used. `--stack` links PRs with the optional gh-stack extension.
+
+**What one dispatch does**, after you confirm:
+
+1. **kata**: find the plan's mirror (or create it with the same idempotency key as `plan new`) and claim it; only then append `Kata: <ref>` to a just-mirrored GitHub issue. A mirror claimed by someone else stops that plan before anything changes.
+2. **Branch** from `origin/<base>` with one empty `wip: #N <title>` commit, without checking anything out, then push it and open a **draft PR** ending in `Closes #N`.
+3. **Worktree**: `kwt add <branch> --no-launch`, then `kwt open --start-session` (detached).
+4. **Launch** `claude --permission-mode auto` in the pane with a prompt built from the plan, the PR and how to finish (push, then `gh pr ready` with a summary). Dispatch waits until Claude has taken over the pane and reports it if Claude exits straight away.
+
+**Modes.** A plan that belongs to an objective (`Objective: #N (node X)`) is refused while node X waits on unfinished nodes, or if that objective or node can't be found. An objective dispatches every node that isn't `done` and waits on nothing, creating missing plan issues first (as `engram objective plan` does) and marking dispatched nodes `in_progress`; blocked nodes are listed, and a node whose plan is already closed fails the plan checks (land it with `engram plan land`). `--stack` takes every unfinished node, dependencies first, each based on its unfinished dependency's branch (or, with several, on the one that depends on all the others; otherwise it is skipped as a *diamond*, with its dependents). Nodes whose PR is ready for review are only used as bases. Linear chains are linked with `gh stack link` (run with `GH_REPO`, since gh-stack can't resolve SSH host aliases); without gh-stack the PRs are still chained by their bases. A failed node skips its dependents. To dispatch only some of an objective's nodes, pass their plan numbers instead.
+
+**Re-running is safe.** Every step looks up what exists first: mirror and claim, branch (or tracks `origin`'s), PR (through GitHub's closing link, else `Closes #N` in an open PR's body, which is how stacked PRs are found), worktree and session. A retitled plan or changed template doesn't start a second branch, a reused PR keeps its base (with a warning if it differs), Claude only launches into a pane at a shell prompt and not once the PR is ready for review, and a branch whose PR already merged is refused.
+
+### Configuration
+
+```toml
+[dispatch]
+branch = "{meta[type]}/{meta[jira]}/{slug}"   # default "{number}-{slug}"
+pr_title = "[{meta[jira]}] {title}"           # default "{title}"
+```
+
+Placeholders: `{number}` (plan issue), `{kata_ref}` (the mirror's short ref, shown as `<kata-ref>` in a dry run until it exists), `{title}`, `{slug}` (lowercase and dashes, at most 40 characters, cut at a word, a leading `[5.1]` dropped) and `{meta[key]}` (kata metadata, e.g. `jira`, `type`, set by `plan new`/`objective plan` from `--jira`/`--type`, a body line or the title). `{{`/`}}` are literal braces. A missing key fails at planning with the fix (`kata meta set <kata-ref> jira ENG-1234`), and the branch name is checked with `git check-ref-format`. The old Python dispatcher's git-config templates are not read: move them here (`prTitle` → `pr_title`, `{short_id}` → `{kata_ref}`; the old default was `{short_id}-{slug}`).
+
+Claude is launched as `claude --permission-mode auto "$(cat <prompt>)"`, and the prompt file lives under `$XDG_STATE_HOME/engram/dispatch/`, outside every worktree. `ENGRAM_DISPATCH_CLAUDE` replaces the `claude` command, for tests.
 
 ---
 
