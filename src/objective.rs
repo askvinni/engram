@@ -268,6 +268,32 @@ pub fn view(repo: &str, number: u64) -> Result<()> {
     Ok(())
 }
 
+/// IDs of the unfinished nodes `node_id` depends on, directly or through
+/// other unfinished nodes. A done node's work is already on the default
+/// branch, so the walk stops there: it doesn't put its own dependencies on
+/// any branch. Unknown IDs are skipped; cycles are safe.
+pub fn unfinished_ancestors(
+    node_id: &str,
+    all_nodes: &[ObjectiveNode],
+) -> std::collections::BTreeSet<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut stack = vec![node_id];
+    while let Some(id) = stack.pop() {
+        let Some(node) = all_nodes.iter().find(|n| n.id == id) else {
+            continue;
+        };
+        for dep in &node.depends_on {
+            let unfinished = all_nodes
+                .iter()
+                .any(|n| &n.id == dep && n.status != NodeStatus::Done);
+            if unfinished && seen.insert(dep.clone()) {
+                stack.push(dep);
+            }
+        }
+    }
+    seen
+}
+
 /// Returns true only when the list is non-empty and every node has status Done.
 pub fn all_nodes_done(nodes: &[ObjectiveNode]) -> bool {
     !nodes.is_empty() && nodes.iter().all(|n| n.status == NodeStatus::Done)
@@ -756,6 +782,7 @@ Return ONLY the plan body text."#
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     #[test]
     fn parse_nodes_basic() {
@@ -834,6 +861,29 @@ mod tests {
         ];
         let blocked = blocked_by(&nodes[1], &nodes);
         assert_eq!(blocked, vec!["1.1"]);
+    }
+
+    #[rstest]
+    // Unknown x and done d are skipped, and so is e behind d.
+    #[case::stops_at_done_and_unknown("c", &["a", "b"])]
+    #[case::root("a", &[])]
+    #[case::cycle("y", &["y", "z"])]
+    fn unfinished_ancestors_stops_at_done_nodes_and_survives_cycles(
+        #[case] id: &str,
+        #[case] want: &[&str],
+    ) {
+        use NodeStatus::*;
+        let nodes = [
+            node("a", Pending, &[]),
+            node("b", InProgress, &["a"]),
+            node("c", Pending, &["b", "x", "d"]),
+            node("d", Done, &["e"]),
+            node("e", Pending, &[]),
+            node("y", Pending, &["z"]),
+            node("z", Pending, &["y"]),
+        ];
+        let got: Vec<String> = unfinished_ancestors(id, &nodes).into_iter().collect();
+        assert_eq!(got, want);
     }
 
     #[test]

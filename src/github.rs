@@ -506,6 +506,22 @@ pub fn list_prs_with_body(repo: &str, state: &str) -> Result<Vec<PrWithBody>> {
     serde_json::from_str(&out).context("parsing PR list JSON")
 }
 
+/// `gh stack <args>` for `repo`. gh-stack can't map an SSH host-alias remote
+/// (`git@github-personal:...`) to GitHub, so the repo is named via `GH_REPO`.
+pub fn gh_stack(repo_root: &std::path::Path, repo: &str, args: &[&str]) -> Result<()> {
+    let output = Command::new("gh")
+        .arg("stack")
+        .args(args)
+        .env("GH_REPO", repo)
+        .current_dir(repo_root)
+        .output()
+        .context("running gh stack (is the gh-stack extension installed?)")?;
+    if !output.status.success() {
+        anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(())
+}
+
 /// Open a draft PR from `head` into `base` and return its URL.
 pub fn create_draft_pr(
     repo: &str,
