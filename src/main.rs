@@ -527,7 +527,13 @@ fn cmd_objective(subcmd: cli::ObjectiveCommands) -> Result<()> {
             id,
             description,
             depends,
-        } => objective::append(&repo, number, &id, &description, depends.as_deref()),
+        } => objective::append(
+            &repo,
+            number,
+            id.as_deref(),
+            &description,
+            depends.as_deref(),
+        ),
     }
 }
 

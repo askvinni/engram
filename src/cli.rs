@@ -228,9 +228,9 @@ pub enum ObjectiveCommands {
     Append {
         /// Objective issue number
         number: u64,
-        /// Node ID (e.g. 1.3)
+        /// Node ID (e.g. 42.4); defaults to `<number>.<next sequence>`
         #[arg(long)]
-        id: String,
+        id: Option<String>,
         /// Node description
         #[arg(long)]
         description: String,

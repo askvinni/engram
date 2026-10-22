@@ -47,15 +47,15 @@ After exploration, draft the complete body internally. Produce the whole thing a
 
 **Node bullet format for `## Roadmap`:**
 ```
-- 1.1: Description of first node
-- 1.2: Description of second node (depends: 1.1)
-- 1.3: Description of third node (depends: 1.1, 1.2)
+- 1: Description of first node
+- 2: Description of second node (depends: 1)
+- 3: Description of third node (depends: 1, 2)
 ```
 
 Rules for nodes:
-- IDs must be `<objective-number>.<sequence>` — use `1.1`, `1.2`, `1.3`, … until the objective issue number is known, then suggest the user update them after creation if needed
+- IDs are local labels used only for `depends` — `1`, `2`, `3` is simplest. `engram objective new` renumbers every node to `<issue-number>.<n>` (in list order) once the issue exists, rewriting `depends` to match
+- Labels must be unique and `depends` must reference labels in the same list, or `objective new` refuses before creating anything
 - Every node must complete in one PR — split large nodes further
-- `depends_on` must reference only IDs that exist in the same list
 - Start simple: 3–6 nodes covers most goals. More nodes are fine if each is genuinely independent.
 - Prefer a linear chain over a wide fan-out unless parallelism is real
 
@@ -64,16 +64,16 @@ Rules for nodes:
 Show the complete draft body. Render a preview roadmap table as Markdown so the user can scan it easily:
 
 ```
-| ID  | Description           | Depends On |
-|-----|-----------------------|------------|
-| 1.1 | First node            |            |
-| 1.2 | Second node           | 1.1        |
+| ID | Description           | Depends On |
+|----|-----------------------|------------|
+| 1  | First node            |            |
+| 2  | Second node           | 1          |
 ```
 
 Then explicitly flag any weak section:
 
 - *"Roadmap only has 1 node — is this really a multi-node objective, or should this be a plan issue instead?"*
-- *"Node 1.3 depends on both 1.1 and 1.2 — is that intentional or should it only depend on 1.2?"*
+- *"Node 3 depends on both 1 and 2 — is that intentional or should it only depend on 2?"*
 - *"Acceptance criteria is empty — how will we know the objective is complete?"*
 
 Do not proceed until the user has confirmed the draft or made corrections.
@@ -128,8 +128,8 @@ One paragraph. What does the completed objective achieve? Must be falsifiable �
 ### **Roadmap**
 Bullet list of nodes, one per line. Format:
 ```
-- 1.1: Description
-- 1.2: Description (depends: 1.1)
+- 1: Description
+- 2: Description (depends: 1)
 ```
 This section is parsed by `parse_nodes_from_roadmap_input` in `src/objective.rs`. The `engram objective new` command converts it to a rendered Markdown table plus the hidden `<!-- engram:nodes [...] -->` state comment. Do **not** write the table or the JSON manually — the CLI generates them.
 
@@ -143,7 +143,9 @@ Which source files or subsystems change. Call out explicitly what does **not** c
 
 ## Node ID conventions
 
-Node IDs use the format `<objective-number>.<sequence>` (e.g. `1.1`, `1.2`, `1.3`). Before the issue is created, the objective number is unknown — use a placeholder like `N.1`, `N.2` or simply `1.1`, `1.2` and note in the confirm step that the user should verify the IDs after creation if the issue number matters for cross-references.
+engram assigns node IDs: once `engram objective new` has created the issue, it renumbers every node to `<issue-number>.<n>` (n = 1-based position in the roadmap list) and rewrites each `depends` to the new IDs. The IDs you write in `## Roadmap` are only local labels for expressing `depends` — any unique token works (`1`, `a`, or the older `1.1` style). Do not try to guess the issue number. Use the assigned IDs (e.g. `42.1`) with `engram objective plan --node`.
+
+`engram objective append <issue>` assigns the next ID (`<issue>.<max + 1>`) when `--id` is omitted.
 
 The `plan_issue` and `pr_url` fields in the hidden JSON are `null` until `engram objective plan` populates them. The skill does not set these — the CLI handles it.
 
