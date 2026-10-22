@@ -61,7 +61,7 @@ fn main() -> Result<()> {
         Commands::Read { permalink } => cmd_read(&permalink, mode),
         Commands::Kata { subcommand } => cmd_kata(subcommand),
         Commands::Memory { subcommand } => cmd_memory(subcommand),
-        Commands::Dispatch { issue, opts } => cmd_dispatch(issue, opts, mode),
+        Commands::Dispatch { issues, opts } => cmd_dispatch(&issues, opts, mode),
         Commands::Capture {
             category,
             title,
@@ -541,7 +541,7 @@ fn cmd_objective(subcmd: cli::ObjectiveCommands) -> Result<()> {
     }
 }
 
-fn cmd_dispatch(issue: u64, opts: dispatch::DispatchOptions, mode: OutputMode) -> Result<()> {
+fn cmd_dispatch(issues: &[u64], opts: dispatch::DispatchOptions, mode: OutputMode) -> Result<()> {
     if mode != OutputMode::Human {
         eprintln!("warning: --json/--agent are ignored; dispatch output is human-readable only");
     }
@@ -549,7 +549,7 @@ fn cmd_dispatch(issue: u64, opts: dispatch::DispatchOptions, mode: OutputMode) -
     let toolchain = dispatch::preflight(&repo_root)?;
     let cfg = config::Config::load(&repo_root)?;
     let repo = config::resolve_repo(&cfg, &repo_root)?;
-    dispatch::dispatch(&repo_root, &repo, &cfg, &toolchain, issue, opts)
+    dispatch::dispatch(&repo_root, &repo, &cfg, &toolchain, issues, opts)
 }
 
 fn cmd_kata(subcmd: cli::KataCommands) -> Result<()> {

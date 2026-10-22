@@ -299,7 +299,7 @@ pub fn unblocked_nodes(nodes: &[ObjectiveNode]) -> Vec<usize> {
 /// InProgress status, and return the plan issue URL. Does not update the
 /// objective issue body — callers are responsible for that.
 #[allow(clippy::too_many_arguments)]
-fn create_plan_for_node(
+pub(crate) fn create_plan_for_node(
     repo: &str,
     objective_number: u64,
     obj_title: &str,

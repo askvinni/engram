@@ -93,11 +93,14 @@ pub enum Commands {
         #[arg(long)]
         session: bool,
     },
-    /// Start work on a plan issue: claim its kata mirror, push a branch, open
-    /// a draft PR, create a kwt worktree and launch Claude in its tmux session
+    /// Start work on plan issues (or an objective's unblocked nodes): claim each
+    /// kata mirror, push a branch, open a draft PR, create a kwt worktree and
+    /// launch Claude in its tmux session
     Dispatch {
-        /// engram-plan issue number
-        issue: u64,
+        /// engram-plan and/or engram-objective issue numbers; an objective
+        /// dispatches its unblocked nodes, creating missing plan issues
+        #[arg(required = true)]
+        issues: Vec<u64>,
         #[command(flatten)]
         opts: crate::dispatch::DispatchOptions,
     },
