@@ -36,12 +36,17 @@ impl Default for MemoryConfig {
 }
 
 /// `[dispatch]`: templates for the branches and draft PRs `engram dispatch`
-/// creates (see `dispatch::render` for the placeholders).
+/// creates (see `dispatch::render` for the placeholders), and the command it
+/// launches in each workspace.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct DispatchConfig {
     pub branch: String,
     pub pr_title: String,
+    /// Shell command that starts Claude in the pane, used verbatim (it may
+    /// carry flags). Unset means the `claude` dispatch resolved on PATH.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude: Option<String>,
 }
 
 impl Default for DispatchConfig {
@@ -49,6 +54,7 @@ impl Default for DispatchConfig {
         Self {
             branch: DEFAULT_BRANCH_TEMPLATE.into(),
             pr_title: DEFAULT_PR_TITLE_TEMPLATE.into(),
+            claude: None,
         }
     }
 }
@@ -118,14 +124,116 @@ pub fn has_remote(repo_root: &Path) -> bool {
         .is_ok_and(|o| o.status.success() && !o.stdout.trim_ascii().is_empty())
 }
 
+/// Per-clone git config naming the GitHub account engram's `gh` calls (and the
+/// sessions dispatch launches) act as. It belongs to the person, not the repo,
+/// so it lives in git config rather than the committed `.engram/config.toml`.
+pub const GITHUB_USER_KEY: &str = "engram.githubUser";
+
+static GITHUB_USER: OnceLock<Option<String>> = OnceLock::new();
+
+/// `git config engram.githubUser` for the current repo, if set. Cached.
+pub fn github_user() -> Option<String> {
+    GITHUB_USER
+        .get_or_init(|| {
+            let output = Command::new("git")
+                .args(["config", "--get", GITHUB_USER_KEY])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            String::from_utf8(output.stdout)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .clone()
+}
+
+/// Environment variables gh reads a token from, in its own precedence order.
+/// When either is set, gh already has an identity and engram leaves it alone.
+const GH_TOKEN_ENVS: &[&str] = &["GH_TOKEN", "GITHUB_TOKEN"];
+
+/// The configured user whose token engram must resolve: none when a token
+/// env var is set, since an existing one always wins.
+fn token_user_to_resolve<'a>(
+    env_tokens: &[Option<&str>],
+    user: Option<&'a str>,
+) -> Option<&'a str> {
+    user.filter(|_| env_tokens.iter().flatten().all(|t| t.is_empty()))
+}
+
+/// Why the configured account's token couldn't be looked up. Carries gh's
+/// stderr only: the token itself never goes into a message.
+fn token_lookup_error(user: &str, stderr: &str) -> String {
+    format!(
+        "{GITHUB_USER_KEY} is {user:?} but `gh auth token --user {user}` failed ({}). \
+         Log in as {user} with `gh auth login`, or unset it with \
+         `git config --unset {GITHUB_USER_KEY}`",
+        stderr.trim()
+    )
+}
+
+/// `GH_TOKEN` to set on `gh` subprocesses, resolved once per process. The
+/// error is kept as a string so the cached value can be cloned to callers.
+static GH_TOKEN: OnceLock<std::result::Result<Option<String>, String>> = OnceLock::new();
+
+fn gh_token() -> Result<Option<String>> {
+    GH_TOKEN
+        .get_or_init(|| {
+            let env_tokens: Vec<Option<String>> = GH_TOKEN_ENVS
+                .iter()
+                .map(|v| std::env::var(v).ok())
+                .collect();
+            let env_tokens: Vec<Option<&str>> = env_tokens.iter().map(Option::as_deref).collect();
+            let user = github_user();
+            let Some(user) = token_user_to_resolve(&env_tokens, user.as_deref()) else {
+                return Ok(None);
+            };
+            // Never `gh auth switch`: that would change the user's active account.
+            let output = Command::new("gh")
+                .args(["auth", "token", "--user", user])
+                .output()
+                .map_err(|e| format!("running gh auth token: {e}"))?;
+            let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !output.status.success() || token.is_empty() {
+                return Err(token_lookup_error(
+                    user,
+                    &String::from_utf8_lossy(&output.stderr),
+                ));
+            }
+            Ok(Some(token))
+        })
+        .clone()
+        .map_err(anyhow::Error::msg)
+}
+
+/// Applies the configured GitHub identity (`engram.githubUser`) to a `gh`
+/// command. Every `gh` call that talks to GitHub goes through this.
+pub fn with_github_identity(cmd: &mut Command) -> Result<&mut Command> {
+    if let Some(token) = gh_token()? {
+        cmd.env("GH_TOKEN", token);
+    }
+    Ok(cmd)
+}
+
+/// `gh` with the configured GitHub identity applied.
+pub fn gh_command() -> Result<Command> {
+    let mut cmd = Command::new("gh");
+    with_github_identity(&mut cmd)?;
+    Ok(cmd)
+}
+
 /// Best-effort `owner/name` lookup via `gh repo view`. Returns `None` — without
 /// shelling out to `gh` — when the repo has no remote or `gh` is unavailable,
-/// so local-only repos never touch GitHub.
-pub fn infer_repo(repo_root: &Path) -> Option<String> {
+/// so local-only repos never touch GitHub. Fails only when the configured
+/// `engram.githubUser` has no usable token, which must not pass silently as
+/// "no GitHub repo".
+pub fn infer_repo(repo_root: &Path) -> Result<Option<String>> {
     if !has_remote(repo_root) || !gh_available() {
-        return None;
+        return Ok(None);
     }
-    let output = Command::new("gh")
+    let Ok(output) = gh_command()?
         .args([
             "repo",
             "view",
@@ -136,15 +244,16 @@ pub fn infer_repo(repo_root: &Path) -> Option<String> {
         ])
         .current_dir(repo_root)
         .output()
-        .ok()?;
-    if output.status.success() {
-        String::from_utf8(output.stdout)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    } else {
-        None
+    else {
+        return Ok(None);
+    };
+    if !output.status.success() {
+        return Ok(None);
     }
+    Ok(String::from_utf8(output.stdout)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty()))
 }
 
 /// Explains why GitHub is unusable, or `None` when the prerequisites are met.
@@ -175,10 +284,13 @@ pub fn resolve_repo(cfg: &Config, repo_root: &Path) -> Result<String> {
              add a GitHub remote (or set `github.repo` in .engram/config.toml) and install `gh` to use it"
         );
     }
+    // Surface a bad `engram.githubUser` now, with its own message, instead of
+    // as a confusing failure of the first `gh` call.
+    gh_token()?;
     if let Some(repo) = configured {
         return Ok(repo.to_string());
     }
-    infer_repo(repo_root).ok_or_else(|| {
+    infer_repo(repo_root)?.ok_or_else(|| {
         anyhow::anyhow!(
             "{REQUIRES_GITHUB}: could not resolve a GitHub repo from the git remote \
              (is `gh` authenticated?). Set `github.repo` in .engram/config.toml or run `engram init`"
@@ -223,7 +335,7 @@ mod tests {
     fn infer_repo_none_without_remote() {
         let dir = tempfile::tempdir().unwrap();
         git(dir.path(), &["init", "-q"]);
-        assert_eq!(infer_repo(dir.path()), None);
+        assert_eq!(infer_repo(dir.path()).unwrap(), None);
     }
 
     #[test]
@@ -255,18 +367,42 @@ mod tests {
     }
 
     #[rstest]
-    #[case::defaults("", "{number}-{slug}", "{title}")]
-    #[case::partial("[dispatch]\nbranch = \"{slug}\"\n", "{slug}", "{title}")]
+    #[case::defaults("", "{number}-{slug}", "{title}", None)]
+    #[case::partial(
+        "[dispatch]\nbranch = \"{slug}\"\nclaude = \"claude --model opus\"\n",
+        "{slug}",
+        "{title}",
+        Some("claude --model opus")
+    )]
     fn dispatch_section_fills_in_defaults(
         #[case] section: &str,
         #[case] branch: &str,
         #[case] pr_title: &str,
+        #[case] claude: Option<&str>,
     ) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".engram")).unwrap();
         let text = format!("[github]\n\n[memory]\ndefault_categories = []\n{section}");
         std::fs::write(dir.path().join(".engram/config.toml"), text).unwrap();
         let d = Config::load(dir.path()).unwrap().dispatch;
-        assert_eq!((d.branch.as_str(), d.pr_title.as_str()), (branch, pr_title));
+        assert_eq!(
+            (d.branch.as_str(), d.pr_title.as_str(), d.claude.as_deref()),
+            (branch, pr_title, claude)
+        );
+    }
+
+    #[rstest]
+    #[case::gh_token_set([Some("tok"), None], Some("me"), None)]
+    #[case::github_token_set([None, Some("tok")], Some("me"), None)]
+    #[case::blank_gh_token_ignored([Some(""), Some("tok")], Some("me"), None)]
+    #[case::no_env_token([None, None], Some("me"), Some("me"))]
+    #[case::blank_env_tokens([Some(""), Some("")], Some("me"), Some("me"))]
+    #[case::no_user([None, None], None, None)]
+    fn github_user_token_is_resolved_only_without_an_env_token(
+        #[case] env: [Option<&str>; 2],
+        #[case] user: Option<&str>,
+        #[case] want: Option<&str>,
+    ) {
+        assert_eq!(token_user_to_resolve(&env, user), want);
     }
 }

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::github::{self, OpenPr, PrWithBody};
 use crate::kata;
 use crate::objective::{self, NodeStatus, ObjectiveNode};
@@ -44,7 +44,7 @@ const LAUNCH_POLL: Duration = Duration::from_millis(500);
 /// `kwt open --start-session` attempts; backoff is 1s, then 2s.
 const KWT_OPEN_ATTEMPTS: u64 = 3;
 const PANE_TAIL_LINES: usize = 5;
-/// Replaces the launched `claude` command, verbatim (for tests).
+/// Overrides the launched command above `[dispatch] claude` (verbatim; for tests).
 const CLAUDE_OVERRIDE_ENV: &str = "ENGRAM_DISPATCH_CLAUDE";
 /// Prompt files live under `$XDG_STATE_HOME/<PROMPT_SUBDIR>`, outside every worktree.
 const PROMPT_SUBDIR: &str = "engram/dispatch";
@@ -1313,7 +1313,7 @@ impl Ctx<'_> {
             &format!("refs/heads/{b}"),
         ]))
         .is_ok();
-        let output = git(self.root)
+        let output = git_remote(self.root)?
             .args([
                 "ls-remote",
                 "--exit-code",
@@ -1489,12 +1489,12 @@ impl Ctx<'_> {
             eprintln!("branch: rendered {} with kata {kata_ref}", t.branch);
         }
 
-        run(git(self.root).args(["fetch", "origin", &t.base]))?;
+        run(git_remote(self.root)?.args(["fetch", "origin", &t.base]))?;
         self.ensure_branch(t)?;
         if t.remote {
             eprintln!("push: skipped, origin already has {}", t.branch);
         } else {
-            run(git(self.root).args(["push", "-u", "origin", &t.branch]))?;
+            run(git_remote(self.root)?.args(["push", "-u", "origin", &t.branch]))?;
             eprintln!("push: pushed {} to origin", t.branch);
         }
 
@@ -1570,7 +1570,7 @@ impl Ctx<'_> {
             // Dispatched from another machine: track the remote branch rather
             // than creating a divergent wip commit.
             let refspec = format!("refs/heads/{b}:refs/remotes/origin/{b}");
-            run(git(self.root).args(["fetch", "origin", &refspec]))?;
+            run(git_remote(self.root)?.args(["fetch", "origin", &refspec]))?;
             run(git(self.root).args(["branch", "--track", b, &format!("origin/{b}")]))?;
             eprintln!("branch: {b} tracks origin/{b}");
         } else {
@@ -1669,8 +1669,13 @@ impl Ctx<'_> {
         std::fs::write(&prompt_file, prompt)
             .with_context(|| format!("writing {}", prompt_file.display()))?;
 
-        let claude = claude_command(std::env::var(CLAUDE_OVERRIDE_ENV).ok(), &self.tools.claude);
-        let cmd = launch_command(&claude, worktree, &prompt_file);
+        let claude = claude_command(
+            std::env::var(CLAUDE_OVERRIDE_ENV).ok(),
+            self.cfg.dispatch.claude.as_deref(),
+            &self.tools.claude,
+        );
+        let user = config::github_user();
+        let cmd = launch_command(&claude, user.as_deref(), worktree, &prompt_file);
         tmux(&["send-keys", "-t", session, "-l", &cmd])?;
         tmux(&["send-keys", "-t", session, "Enter"])?;
 
@@ -1796,20 +1801,43 @@ fn prompt_path(
         .join(format!("{}-{number}.md", repo.replace('/', "-"))))
 }
 
-/// `ENGRAM_DISPATCH_CLAUDE` (verbatim), else the resolved `claude` path.
-fn claude_command(env_override: Option<String>, resolved: &Path) -> String {
+/// `ENGRAM_DISPATCH_CLAUDE`, else `[dispatch] claude` (both verbatim), else
+/// the resolved `claude` path.
+fn claude_command(
+    env_override: Option<String>,
+    configured: Option<&str>,
+    resolved: &Path,
+) -> String {
     env_override
         .filter(|c| !c.is_empty())
+        .or_else(|| configured.filter(|c| !c.is_empty()).map(str::to_string))
         .unwrap_or_else(|| shell_quote(&resolved.to_string_lossy()))
 }
 
-fn launch_command(claude: &str, worktree: &Path, prompt_file: &Path) -> String {
+fn launch_command(
+    claude: &str,
+    github_user: Option<&str>,
+    worktree: &Path,
+    prompt_file: &Path,
+) -> String {
     // The pane's shell can start outside the worktree: it inherits the tmux
     // server's cwd, which may be a since-deleted directory, and Claude refuses
     // to start there. cd explicitly rather than trusting the pane.
     let cd = format!("cd {} && ", shell_quote(&worktree.to_string_lossy()));
+    // The pane's shell resolves the token itself (tmux panes don't inherit
+    // engram's env), so it never appears in the keystrokes, the scrollback, or
+    // engram's own command line. A plain assignment chained with && (not a
+    // `VAR=… claude` prefix) gates the launch on the lookup: a failure leaves
+    // the pane at the shell, which launch verification reports, instead of
+    // starting Claude as the active gh account.
+    let token = github_user
+        .map(|u| {
+            let quoted = format!("'{}'", u.replace('\'', r#"'"'"'"#));
+            format!("GH_TOKEN=\"$(gh auth token --user {quoted})\" && export GH_TOKEN && ")
+        })
+        .unwrap_or_default();
     format!(
-        "{cd}{claude} --permission-mode auto \"$(cat {})\"",
+        "{cd}{token}{claude} --permission-mode auto \"$(cat {})\"",
         shell_quote(&prompt_file.to_string_lossy()),
     )
 }
@@ -1818,6 +1846,15 @@ fn git(repo_root: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(repo_root);
     cmd
+}
+
+/// `git` for commands that talk to `origin`, with the configured GitHub
+/// identity applied: an HTTPS remote using gh as credential helper would
+/// otherwise authenticate as the active gh account.
+fn git_remote(repo_root: &Path) -> Result<Command> {
+    let mut cmd = git(repo_root);
+    config::with_github_identity(&mut cmd)?;
+    Ok(cmd)
 }
 
 fn run(cmd: &mut Command) -> Result<String> {
@@ -2380,25 +2417,49 @@ mod tests {
         assert_eq!(shell_quote(raw), quoted);
     }
 
-    #[test]
-    fn launch_command_cds_into_the_quoted_worktree() {
-        assert_eq!(
-            launch_command(
-                "'/Apps/My Claude/claude'",
-                Path::new("/wt/my tree"),
-                Path::new("/p.md")
-            ),
-            "cd '/wt/my tree' && '/Apps/My Claude/claude' --permission-mode auto \"$(cat /p.md)\""
-        );
+    #[rstest]
+    #[case::quoted_worktree(
+        "'/Apps/My Claude/claude'",
+        None,
+        "/wt/my tree",
+        "cd '/wt/my tree' && '/Apps/My Claude/claude' --permission-mode auto \"$(cat /p.md)\""
+    )]
+    #[case::token_for_user(
+        "claude",
+        Some("askvinni"),
+        "/wt",
+        "cd /wt && GH_TOKEN=\"$(gh auth token --user 'askvinni')\" && export GH_TOKEN \
+         && claude --permission-mode auto \"$(cat /p.md)\""
+    )]
+    #[case::quoted_user(
+        "claude",
+        Some("a b"),
+        "/wt",
+        "cd /wt && GH_TOKEN=\"$(gh auth token --user 'a b')\" && export GH_TOKEN \
+         && claude --permission-mode auto \"$(cat /p.md)\""
+    )]
+    fn launch_command_quotes_paths_and_gates_the_token(
+        #[case] claude: &str,
+        #[case] token_user: Option<&str>,
+        #[case] worktree: &str,
+        #[case] want: &str,
+    ) {
+        let got = launch_command(claude, token_user, Path::new(worktree), Path::new("/p.md"));
+        assert_eq!(got, want);
     }
 
     #[rstest]
-    #[case::env_override(Some("fake"), "fake")]
-    #[case::blank_env_ignored(Some(""), "'/Apps/My Claude/claude'")]
-    #[case::resolved_path_quoted(None, "'/Apps/My Claude/claude'")]
-    fn claude_command_precedence(#[case] env: Option<&str>, #[case] want: &str) {
+    #[case::env_wins(Some("fake"), Some("claude --x"), "fake")]
+    #[case::blank_env_falls_to_config(Some(""), Some("claude --x"), "claude --x")]
+    #[case::blank_config_falls_to_resolved(None, Some(""), "'/Apps/My Claude/claude'")]
+    #[case::resolved_path_quoted(None, None, "'/Apps/My Claude/claude'")]
+    fn claude_command_precedence(
+        #[case] env: Option<&str>,
+        #[case] config: Option<&str>,
+        #[case] want: &str,
+    ) {
         let resolved = Path::new("/Apps/My Claude/claude");
-        assert_eq!(claude_command(env.map(Into::into), resolved), want);
+        assert_eq!(claude_command(env.map(Into::into), config, resolved), want);
     }
 
     #[rstest]
