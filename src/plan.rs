@@ -32,8 +32,8 @@ pub fn new(
         .with_context(|| format!("could not parse issue number from URL: {url}"))?;
 
     if !no_kata && kata::kata_available() {
-        let kata_body = format!("GitHub: {url}\n\n{body}");
-        let idempotency_key = format!("engram-plan-{issue_number}");
+        let kata_body = kata::mirror_body(url, body);
+        let idempotency_key = kata::plan_idempotency_key(issue_number);
         let meta = kata::TrackerMeta::resolve(
             tracker.jira.as_deref(),
             tracker.kind.as_deref(),
@@ -42,7 +42,7 @@ pub fn new(
         );
         match kata::create(title, &kata_body, &idempotency_key, None, &meta) {
             Ok(kata_ref) => {
-                let updated_body = format!("{body}\nKata: {kata_ref}");
+                let updated_body = kata::with_ref_line(body, &kata_ref);
                 if let Err(e) = github::update_issue_body(&repo, issue_number, &updated_body) {
                     eprintln!("warning: could not append Kata ref to GitHub issue: {e:#}");
                 }

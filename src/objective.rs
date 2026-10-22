@@ -213,8 +213,8 @@ pub fn new(
             .next()
             .and_then(|s| s.parse::<u64>().ok())
             .with_context(|| format!("could not parse issue number from URL: {url}"))?;
-        let kata_body = format!("GitHub: {url}\n\n{issue_body}");
-        let idempotency_key = format!("engram-objective-{issue_number}");
+        let kata_body = kata::mirror_body(&url, &issue_body);
+        let idempotency_key = kata::objective_idempotency_key(issue_number);
         let meta = kata::TrackerMeta::resolve(
             tracker.jira.as_deref(),
             tracker.kind.as_deref(),
@@ -223,7 +223,7 @@ pub fn new(
         );
         match kata::create(title, &kata_body, &idempotency_key, None, &meta) {
             Ok(kata_ref) => {
-                let updated_body = format!("{issue_body}\nKata: {kata_ref}");
+                let updated_body = kata::with_ref_line(&issue_body, &kata_ref);
                 if let Err(e) = github::update_issue_body(repo, issue_number, &updated_body) {
                     eprintln!("warning: could not append Kata ref to GitHub issue: {e:#}");
                 }
@@ -363,8 +363,8 @@ fn create_plan_for_node(
             obj_body,
             kata_parent.as_deref(),
         );
-        let kata_body = format!("GitHub: {plan_url}\n\n{plan_body}");
-        let idempotency_key = format!("engram-plan-{plan_issue_number}");
+        let kata_body = kata::mirror_body(&plan_url, &plan_body);
+        let idempotency_key = kata::plan_idempotency_key(plan_issue_number);
         match kata::create(
             &plan_title,
             &kata_body,
@@ -373,7 +373,7 @@ fn create_plan_for_node(
             &meta,
         ) {
             Ok(kata_ref) => {
-                let updated_body = format!("{plan_body}\nKata: {kata_ref}");
+                let updated_body = kata::with_ref_line(&plan_body, &kata_ref);
                 if let Err(e) = github::update_issue_body(repo, plan_issue_number, &updated_body) {
                     eprintln!("warning: could not append Kata ref to GitHub issue: {e:#}");
                 }
@@ -389,7 +389,7 @@ fn create_plan_for_node(
 
 /// A node plan's own Jira key/type (flags, then its body/title) win; anything
 /// missing is inherited from the objective's GitHub issue, then its kata mirror.
-fn node_tracker_meta(
+pub(crate) fn node_tracker_meta(
     tracker: &kata::TrackerMeta,
     plan_title: &str,
     plan_body: &str,
