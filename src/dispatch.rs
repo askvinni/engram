@@ -343,7 +343,12 @@ fn require_plan_or_objective(number: u64, issue: &github::Issue, has_nodes: bool
     }
     let state = &issue.state;
     if !state.eq_ignore_ascii_case("open") {
-        anyhow::bail!("#{number} is not open (state: {state})");
+        let hint = if issue.has_label(PLAN_LABEL) {
+            format!("; if its work merged, run `engram plan land {number}`")
+        } else {
+            String::new()
+        };
+        anyhow::bail!("#{number} is not open (state: {state}){hint}");
     }
     if !has_nodes && issue.has_label(OBJECTIVE_LABEL) {
         anyhow::bail!(
@@ -2200,7 +2205,11 @@ mod tests {
     #[case::plan("OPEN", &[PLAN_LABEL], false, Ok(()))]
     #[case::objective_without_nodes("OPEN", &[OBJECTIVE_LABEL], false, Err("without a node list"))]
     #[case::unlabelled("OPEN", &[], false, Err("neither"))]
-    #[case::closed("CLOSED", &[PLAN_LABEL], false, Err("not open"))]
+    #[case::closed_plan(
+        "CLOSED", &[PLAN_LABEL], false,
+        Err("#1 is not open (state: CLOSED); if its work merged, run `engram plan land 1`")
+    )]
+    #[case::closed_objective("CLOSED", &[OBJECTIVE_LABEL], true, Err("not open (state: CLOSED)"))]
     fn require_plan_or_objective_refuses_closed_and_unlabelled_issues(
         #[case] state: &str,
         #[case] labels: &[&str],
