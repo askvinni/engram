@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{BufRead, IsTerminal, Write};
@@ -48,6 +48,8 @@ const CLAUDE_OVERRIDE_ENV: &str = "ENGRAM_DISPATCH_CLAUDE";
 const PROMPT_SUBDIR: &str = "engram/dispatch";
 const READY_NO_RELAUNCH: &str = "PR is ready for review \u{2014} not relaunching";
 const LAUNCHED: &str = "launched";
+/// Outcome of a dispatch that started a new Claude session.
+const NEWLY_LAUNCHED: &str = "newly launched";
 /// `git ls-remote --exit-code` exits 2 when the ref is absent.
 const LS_REMOTE_NO_MATCH: i32 = 2;
 
@@ -536,6 +538,21 @@ fn write_node_updates(repo: &str, number: u64, updates: &[(String, u64)]) -> Res
 
 /// The kata actor, resolved like kata does: the first non-empty of
 /// `KATA_AUTHOR` and `USER`, else git's `user.name` (only asked when needed).
+/// The line printed once planning is done: how many plans will be dispatched,
+/// how many of those are reused as already ready, and how many failed to plan.
+fn count_line(planned: usize, ready: usize, failed: usize, no_launch: bool) -> String {
+    let launches = if no_launch { 0 } else { planned - ready };
+    let failed = if failed > 0 {
+        format!("; {failed} failed to plan")
+    } else {
+        String::new()
+    };
+    format!(
+        "{planned} plan(s) to dispatch ({ready} already ready for review, not relaunched); \
+         up to {launches} Claude session(s) will start{failed}"
+    )
+}
+
 fn pick_actor(
     env: [Option<String>; 2],
     git_name: impl FnOnce() -> Option<String>,
@@ -591,6 +608,8 @@ struct Run<'a> {
     open_prs: OnceCell<Vec<PrWithBody>>,
     default: OnceCell<String>,
     actor: OnceCell<String>,
+    /// Objective issues' (title, body), fetched at most once per run.
+    objective_issues: RefCell<BTreeMap<u64, (String, String)>>,
 }
 
 fn cached<T>(cell: &OnceCell<T>, init: impl FnOnce() -> Result<T>) -> Result<&T> {
@@ -621,6 +640,7 @@ pub fn dispatch(
         open_prs: OnceCell::new(),
         default: OnceCell::new(),
         actor: OnceCell::new(),
+        objective_issues: RefCell::new(BTreeMap::new()),
     };
     let mut seen = BTreeSet::new();
     let issues: Vec<u64> = issues.iter().copied().filter(|n| seen.insert(*n)).collect();
@@ -660,6 +680,14 @@ pub fn dispatch(
     if planned.is_empty() {
         anyhow::bail!("nothing to dispatch \u{2014} see errors above");
     }
+    let ready = planned
+        .iter()
+        .filter(|(_, t)| t.as_ref().is_some_and(DispatchPlan::ready))
+        .count();
+    println!(
+        "{}",
+        count_line(planned.len(), ready, failed, opts.no_launch)
+    );
 
     if !opts.dry_run {
         if !opts.yes && !confirm()? {
@@ -668,17 +696,26 @@ pub fn dispatch(
 
         let mut updates = Updates::new();
         let mut summary = Vec::new();
+        let (mut launched, mut reused, mut run_failed) = (0usize, 0usize, 0usize);
         for (item, target) in planned {
             let name = item.name();
             match run.run_item(&mut objectives, item.work, target, &mut updates) {
-                Ok(outcome) => summary.push(format!("{name}: {outcome}")),
+                Ok(outcome) => {
+                    if outcome.ends_with(NEWLY_LAUNCHED) {
+                        launched += 1;
+                    } else {
+                        reused += 1;
+                    }
+                    summary.push(format!("{name}: {outcome}"));
+                }
                 Err(e) => {
                     eprintln!("error: {name}: {e:#}");
                     summary.push(format!("{name}: failed"));
-                    failed += 1;
+                    run_failed += 1;
                 }
             }
         }
+        failed += run_failed;
         for (number, ups) in &updates {
             if let Err(e) = write_node_updates(repo, *number, ups) {
                 eprintln!("error: updating objective #{number}: {e:#}");
@@ -691,6 +728,10 @@ pub fn dispatch(
                 println!("  {line}");
             }
         }
+        println!(
+            "Dispatched {} plan(s): {launched} {NEWLY_LAUNCHED}, {reused} reused, {run_failed} failed",
+            launched + reused
+        );
     }
     anyhow::ensure!(
         failed == 0,
@@ -780,6 +821,9 @@ impl Run<'_> {
                 work: node_work(number, n),
             }));
             let (title, body) = (issue.title, issue.body.unwrap_or_default());
+            self.objective_issues
+                .borrow_mut()
+                .insert(number, (title.clone(), body.clone()));
             objectives.insert(number, ObjectiveArg { title, body, nodes });
         }
         Ok(dedup_candidates(items))
@@ -796,10 +840,18 @@ impl Run<'_> {
         let Some((obj, node_id)) = objective::parse_objective_marker(plan_body) else {
             return Ok(None);
         };
-        let issue = github::get_issue(self.repo, obj).with_context(|| {
-            format!("reading objective #{obj} of plan #{number} (node {node_id})")
-        })?;
-        let body = issue.body.unwrap_or_default();
+        let cached = self.objective_issues.borrow().get(&obj).cloned();
+        let (title, body) = match cached {
+            Some(v) => v,
+            None => {
+                let issue = github::get_issue(self.repo, obj).with_context(|| {
+                    format!("reading objective #{obj} of plan #{number} (node {node_id})")
+                })?;
+                let v = (issue.title, issue.body.unwrap_or_default());
+                self.objective_issues.borrow_mut().insert(obj, v.clone());
+                v
+            }
+        };
         let nodes = objective::parse_nodes_from_comment(&body).unwrap_or_default();
         let node = nodes.iter().find(|n| n.id == node_id).with_context(|| {
             format!(
@@ -814,7 +866,7 @@ impl Run<'_> {
                 blockers.join(", ")
             );
         }
-        Ok(Some((obj, node_id, issue.title, body)))
+        Ok(Some((obj, node_id, title, body)))
     }
 
     fn mirror_claimed_by_me(
@@ -1192,7 +1244,7 @@ impl Run<'_> {
             worktree.display()
         );
         Ok(if launch == LAUNCHED {
-            "newly launched".to_string()
+            NEWLY_LAUNCHED.to_string()
         } else {
             format!("reused ({launch})")
         })
@@ -1880,6 +1932,20 @@ mod tests {
             check_kind(147, &pr, has_nodes),
             Err("#147 is a pull request, not an"),
         );
+    }
+
+    #[rstest]
+    #[case::fresh(3, 0, 0, false, "3 plan(s) to dispatch (0 already ready for review, not relaunched); up to 3 Claude session(s) will start")]
+    #[case::ready_and_failed(3, 1, 2, false, "3 plan(s) to dispatch (1 already ready for review, not relaunched); up to 2 Claude session(s) will start; 2 failed to plan")]
+    #[case::no_launch(2, 0, 0, true, "2 plan(s) to dispatch (0 already ready for review, not relaunched); up to 0 Claude session(s) will start")]
+    fn count_line_cases(
+        #[case] planned: usize,
+        #[case] ready: usize,
+        #[case] failed: usize,
+        #[case] no_launch: bool,
+        #[case] want: &str,
+    ) {
+        assert_eq!(count_line(planned, ready, failed, no_launch), want);
     }
 
     #[rstest]
