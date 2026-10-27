@@ -218,20 +218,34 @@ fn fill_template(template: &str, plan: &PlanFields) -> Result<String> {
     }
     out.push_str(rest);
     if !missing_meta.is_empty() {
-        let kata_ref = plan.kata_ref.as_deref().unwrap_or("<kata-ref>");
-        let keys: Vec<String> = missing_meta.iter().map(|k| format!("'{k}'")).collect();
-        let hints: Vec<String> = missing_meta
-            .iter()
-            .map(|k| format!("kata meta set {kata_ref} {k} <value>"))
-            .collect();
-        return Err(bad(format!(
-            "plan #{} has no kata metadata {} ({})",
-            plan.number,
-            keys.join(", "),
-            hints.join("; ")
-        )));
+        return Err(bad(missing_meta_hint(plan, &missing_meta)));
     }
     Ok(out)
+}
+
+/// Which metadata keys plan #N lacks, and how to supply each: kata metadata
+/// on an existing mirror, else (the mirror doesn't exist yet) a line in the
+/// plan body, which only `jira` and `type` can come from.
+fn missing_meta_hint(plan: &PlanFields, keys: &[&str]) -> String {
+    let quoted: Vec<String> = keys.iter().map(|k| format!("'{k}'")).collect();
+    let hints: Vec<String> = keys
+        .iter()
+        .map(|&key| match (plan.kata_ref.as_deref(), key) {
+            (Some(r), _) => format!("kata meta set {r} {key} <value>"),
+            (None, kata::JIRA_META_KEY) => "add a `Jira: KEY-1` line to the plan issue body".into(),
+            (None, kata::TYPE_META_KEY) => "add a `Type: feat` line to the plan issue body".into(),
+            (None, _) => format!(
+                "'{key}' only comes from kata metadata: mirror the plan in kata, then \
+                 `kata meta set <kata-ref> {key} <value>`"
+            ),
+        })
+        .collect();
+    format!(
+        "plan #{} has no metadata {} ({})",
+        plan.number,
+        quoted.join(", "),
+        hints.join("; ")
+    )
 }
 
 /// The value of a non-meta placeholder, or `None` if `name` isn't one.
@@ -242,6 +256,19 @@ fn placeholder_value(name: &str, plan: &PlanFields) -> Option<String> {
         "slug" => Some(slugify(&plan.title)),
         _ => None,
     }
+}
+
+/// `fill_template` for `[dispatch] pr_title`, refusing a blank title that
+/// `gh pr create` would only reject after the branch was pushed.
+fn fill_pr_title(template: &str, plan: &PlanFields) -> Result<String> {
+    let title = fill_template(template, plan)?;
+    if title.trim().is_empty() {
+        anyhow::bail!(
+            "[dispatch] pr_title `{template}` renders an empty PR title for plan #{}",
+            plan.number
+        );
+    }
+    Ok(title)
 }
 
 #[derive(Debug, Clone, Copy, clap::Args)]
@@ -260,6 +287,12 @@ pub struct DispatchOptions {
 /// Refuse anything but an open plan issue (plan label), including plain kata
 /// issues.
 fn check_kind(number: u64, issue: &github::Issue) -> Result<()> {
+    if issue.is_pull_request() {
+        anyhow::bail!("#{number} is a pull request, not an engram-plan issue");
+    }
+    if issue.has_label(OBJECTIVE_LABEL) {
+        anyhow::bail!("#{number} is an engram-objective, not a plan issue");
+    }
     let state = &issue.state;
     if !state.eq_ignore_ascii_case("open") {
         anyhow::bail!("#{number} is not open (state: {state})");
@@ -317,6 +350,7 @@ impl Target {
     fn vars(&self, kata_ref: Option<String>, meta: BTreeMap<String, String>) -> TemplateVars {
         TemplateVars {
             number: self.number,
+            has_mirror: kata_ref.is_some(),
             kata_ref,
             title: self.title.clone(),
             meta,
@@ -354,19 +388,14 @@ fn describe(t: &Target, no_launch: bool) -> String {
         (false, true) => "track existing origin branch",
         (false, false) => "create from origin with an empty wip commit",
     };
-    let (branch_note, title_note) = if t.pr_link.is_some() {
-        (
-            format!("reused from the existing PR; {state}"),
-            " (existing PR)",
-        )
+    let branch_note = if t.pr_link.is_some() {
+        format!("reused from the existing PR; {state}")
     } else if t.kata_ref_pending {
-        (
-            format!("{PENDING_KATA_REF} filled in once the mirror exists; {state}"),
-            "",
-        )
+        format!("{PENDING_KATA_REF} filled in once the mirror exists; {state}")
     } else {
-        (state.to_string(), "")
+        state.to_string()
     };
+    let title_note = if t.pr.is_some() { " (existing PR)" } else { "" };
     let pr = match (&t.pr, t.base_mismatch(), &t.pr_link) {
         (None, ..) => "(will open a draft)".to_string(),
         (Some(pr), Some(why), _) => format!("{} (reuse; {why})", pr.url),
@@ -491,10 +520,17 @@ impl Ctx<'_> {
         cached(&self.default, || {
             let head =
                 run(git(self.root).args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]));
-            match head.as_deref().map(|h| h.strip_prefix("origin/")) {
-                Ok(Some(name)) if !name.is_empty() => Ok(name.to_string()),
-                _ => github::default_branch(self.repo),
+            // A stale origin/HEAD can name a branch origin no longer has.
+            if let Ok(Some(name)) = head.as_deref().map(|h| h.strip_prefix("origin/")) {
+                if !name.is_empty() && self.remote_has_branch(name)? {
+                    return Ok(name.to_string());
+                }
+                eprintln!(
+                    "warning: origin/HEAD names {name}, which origin doesn't have; \
+                     asking GitHub for the default branch (git remote set-head origin --auto)"
+                );
             }
+            github::default_branch(self.repo)
         })
         .map(String::as_str)
     }
@@ -561,9 +597,6 @@ impl Ctx<'_> {
     fn plan_target(&self, number: u64) -> Result<Target> {
         let issue = github::get_issue(self.repo, number)
             .with_context(|| format!("fetching issue #{number}"))?;
-        if issue.has_label(OBJECTIVE_LABEL) {
-            anyhow::bail!("#{number} is an engram-objective, not a plan issue");
-        }
         check_kind(number, &issue)?;
         let body = issue.body.unwrap_or_default();
         let objective = self.objective_of(number, &body)?;
@@ -615,10 +648,9 @@ impl Ctx<'_> {
             worktree: None,
         };
         let vars = t.vars(t.kata_ref.clone(), meta_map);
-        let branch_pending;
-        (t.branch, branch_pending) = render_planned(&self.cfg.dispatch.branch, &vars)?;
-        let (pr_title, title_pending) = render_planned(&self.cfg.dispatch.pr_title, &vars)?;
-        t.pr_title = pr_title;
+        // The templates only matter for a plan without a PR yet, so a broken
+        // one can't block re-running a plan that is already under way.
+        let branch = render_planned(&self.cfg.dispatch.branch, &vars);
 
         // Work started under any branch name is found through the open PR that
         // closes the plan, so a retitled plan or changed template can't start a
@@ -630,7 +662,10 @@ impl Ctx<'_> {
         let found = match linked {
             Some(pr) => Some((pr, format!("linked to #{number}"))),
             None => {
-                let head = (!branch_pending).then_some(t.branch.as_str());
+                let head = match &branch {
+                    Ok((b, false)) => Some(b.as_str()),
+                    _ => None,
+                };
                 github::select_body_closing_pr(self.open_prs()?, self.repo, number, head)
                     .cloned()
                     .map(|pr| (pr, format!("found by `Closes #{number}` in its body")))
@@ -645,14 +680,51 @@ impl Ctx<'_> {
             self.lookup_branch(&mut t)?;
             return Ok(t);
         }
-        t.kata_ref_pending = branch_pending || title_pending;
+        let branch_pending;
+        (t.branch, branch_pending) = branch?;
         t.base = self.default_branch()?.to_string();
         // A pending branch name is only known once the mirror exists; execute
         // validates and looks it up then.
         if !branch_pending {
             self.lookup_branch(&mut t)?;
         }
+        let title_pending = self.set_pr_title(&mut t, &vars)?;
+        t.kata_ref_pending = branch_pending || title_pending;
         Ok(t)
+    }
+
+    /// The PR title: an existing PR's on the branch, else the rendered
+    /// template (returning whether it waits on the mirror's ref).
+    fn set_pr_title(&self, t: &mut Target, vars: &TemplateVars) -> Result<bool> {
+        if let Some(pr) = &t.pr {
+            t.pr_title = pr.title.clone();
+            return Ok(false);
+        }
+        let pending;
+        (t.pr_title, pending) = render_pr_title(&self.cfg.dispatch.pr_title, vars)?;
+        Ok(pending)
+    }
+
+    fn remote_has_branch(&self, b: &str) -> Result<bool> {
+        let output = git(self.root)
+            .args([
+                "ls-remote",
+                "--exit-code",
+                "--heads",
+                "origin",
+                &format!("refs/heads/{b}"),
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .context("running git ls-remote")?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(LS_REMOTE_NO_MATCH) => Ok(false),
+            _ => anyhow::bail!(
+                "git ls-remote origin failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        }
     }
 
     fn lookup_branch(&self, t: &mut Target) -> Result<()> {
@@ -669,25 +741,7 @@ impl Ctx<'_> {
             &format!("refs/heads/{b}"),
         ]))
         .is_ok();
-        let output = git(self.root)
-            .args([
-                "ls-remote",
-                "--exit-code",
-                "--heads",
-                "origin",
-                &format!("refs/heads/{b}"),
-            ])
-            .stdin(Stdio::null())
-            .output()
-            .context("running git ls-remote")?;
-        t.remote = match output.status.code() {
-            Some(0) => true,
-            Some(LS_REMOTE_NO_MATCH) => false,
-            _ => anyhow::bail!(
-                "git ls-remote origin failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        };
+        t.remote = self.remote_has_branch(b)?;
         if t.pr.is_none() {
             t.pr = github::pr_for_branch(self.repo, b, "open")?;
         }
@@ -749,9 +803,9 @@ impl Ctx<'_> {
         if t.kata_ref_pending {
             let vars = t.vars(Some(kata_ref.clone()), t.meta.to_map());
             t.branch = render(&self.cfg.dispatch.branch, &vars)?;
-            t.pr_title = render(&self.cfg.dispatch.pr_title, &vars)?;
             t.kata_ref_pending = false;
             self.lookup_branch(t)?;
+            self.set_pr_title(t, &vars)?;
             eprintln!("branch: rendered {} with kata {kata_ref}", t.branch);
         }
 
@@ -1141,11 +1195,15 @@ mod tests {
         "{meta[team]}-{meta[jira]}-{meta[area]}-{meta[team]}",
         Some("a56d"),
         Err(
-            "plan #142 has no kata metadata 'team', 'area' \
+            "plan #142 has no metadata 'team', 'area' \
              (kata meta set a56d team <value>; kata meta set a56d area <value>)"
         )
     )]
-    #[case::missing_meta_without_mirror("{meta[team]}", None, Err("kata meta set <kata-ref> team"))]
+    #[case::missing_meta_without_mirror(
+        "{meta[team]}",
+        None,
+        Err("'team' only comes from kata metadata: mirror the plan in kata")
+    )]
     #[case::kata_ref_is_gone("{kata_ref}", Some("a56d"), Err("unknown placeholder `{kata_ref}`"))]
     #[case::unknown_placeholder("{short_id}-{slug}", None, Err("unknown placeholder `{short_id}`"))]
     #[case::unclosed("{number", None, Err("unclosed `{`"))]
@@ -1159,6 +1217,39 @@ mod tests {
             (Err(e), Err(part)) => assert!(e.to_string().contains(part), "{e}"),
             (got, want) => panic!("got {got:?}, want {want:?}"),
         }
+    }
+
+    // Without a mirror, jira and type can only come from the plan body.
+    #[rstest]
+    #[case::mirror(
+        Some("a56d"),
+        &["no metadata 'jira', 'type' (kata meta set a56d jira <value>; kata meta set a56d type"],
+        &["issue body"]
+    )]
+    #[case::no_mirror(
+        None,
+        &["`Jira: KEY-1` line to the plan issue body; add a `Type: feat` line"],
+        &["kata meta set"]
+    )]
+    fn fill_template_hints_how_to_supply_missing_meta(
+        #[case] kata_ref: Option<&str>,
+        #[case] has: &[&str],
+        #[case] lacks: &[&str],
+    ) {
+        let p = PlanFields {
+            meta: BTreeMap::new(),
+            ..plan(kata_ref)
+        };
+        let err = fill_template("{meta[jira]}/{meta[type]}", &p).unwrap_err();
+        assert_mentions(&format!("{err:#}"), has, lacks);
+    }
+
+    #[rstest]
+    #[case::filled("{title}", Ok("Add dispatch preflight!"))]
+    #[case::empty("", Err("[dispatch] pr_title ``"))]
+    #[case::whitespace("  ", Err("renders an empty PR title for plan #142"))]
+    fn fill_pr_title_refuses_blank_titles(#[case] template: &str, #[case] want: Want<&str>) {
+        assert_result(fill_pr_title(template, &plan(None)), want.map(Into::into));
     }
 
     #[rstest]
@@ -1336,21 +1427,35 @@ mod tests {
     #[rstest]
     #[case::open_plan("OPEN", &[PLAN_LABEL], Ok(()))]
     #[case::unlabelled("OPEN", &[], Err("not an engram-plan issue"))]
-    #[case::objective("OPEN", &[OBJECTIVE_LABEL], Err("not an engram-plan issue"))]
+    #[case::objective("OPEN", &[OBJECTIVE_LABEL], Err("is an engram-objective"))]
     #[case::closed("CLOSED", &[PLAN_LABEL], Err("not open"))]
     fn check_kind_refuses_closed_and_unlabelled_issues(
         #[case] state: &str,
         #[case] labels: &[&str],
         #[case] want: Want<()>,
     ) {
+        let url = "https://github.com/o/r/issues/1";
         let labels = labels.iter().map(|l| github::Label { name: (*l).into() });
         let issue = github::Issue {
             title: String::new(),
             body: None,
             state: state.into(),
             labels: labels.collect(),
+            url: url.into(),
         };
         assert_result(check_kind(1, &issue), want);
+    }
+
+    #[test]
+    fn check_kind_names_pull_requests() {
+        let pr = github::Issue {
+            title: String::new(),
+            body: None,
+            state: "OPEN".into(),
+            labels: vec![],
+            url: "https://github.com/o/r/pull/147".into(),
+        };
+        assert_result(check_kind(147, &pr), Err("#147 is a pull request, not an"));
     }
 
     #[rstest]

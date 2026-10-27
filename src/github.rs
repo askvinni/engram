@@ -9,6 +9,9 @@ pub struct Issue {
     pub state: String,
     #[serde(default)]
     pub labels: Vec<Label>,
+    /// `gh issue view` also returns pull requests; their URL says `/pull/`.
+    #[serde(default)]
+    pub url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -19,6 +22,10 @@ pub struct Label {
 impl Issue {
     pub fn has_label(&self, name: &str) -> bool {
         self.labels.iter().any(|l| l.name == name)
+    }
+
+    pub fn is_pull_request(&self) -> bool {
+        self.url.contains("/pull/")
     }
 }
 
@@ -126,7 +133,7 @@ pub fn get_issue(repo: &str, number: u64) -> Result<Issue> {
         "--repo",
         repo,
         "--json",
-        "title,body,state,labels",
+        "title,body,state,labels,url",
     ])?;
     serde_json::from_str(&out).context("parsing issue JSON")
 }
