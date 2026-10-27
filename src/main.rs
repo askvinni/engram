@@ -141,7 +141,6 @@ fn cmd_init() -> Result<()> {
 
     install_skills(&repo_root)?;
     install_issue_templates(&repo_root)?;
-    install_dispatch_permission(&repo_root);
 
     // GitHub setup is optional: local-only repos (no remote, or no `gh`) skip it
     // and still get a fully working memory directory.
@@ -495,29 +494,6 @@ fn cmd_doctor() -> Result<()> {
         reasons => println!("- dispatch unavailable ({})", reasons.join("; ")),
     }
 
-    // Only needed to run dispatch from auto-mode sessions, so never fails doctor.
-    let settings: Vec<_> = DISPATCH_RULE_SETTINGS
-        .iter()
-        .map(|f| (*f, std::fs::read_to_string(dispatch_root.join(f)).ok()))
-        .collect();
-    match dispatch_rule_check(&settings) {
-        RuleCheck::Allowed(file) => println!("✓ {file} allows `engram dispatch`"),
-        RuleCheck::Denied(file) => println!(
-            "- {file} denies `engram dispatch` (remove it from permissions.deny to dispatch \
-             from auto-mode sessions)"
-        ),
-        RuleCheck::Uneditable => println!(
-            "- no `{DISPATCH_PERMISSION_RULE}` rule, and `engram init` can't edit \
-             {CLAUDE_SETTINGS} (add \"{DISPATCH_PERMISSION_RULE}\" to its permissions.allow \
-             by hand; needed to dispatch from auto-mode sessions)"
-        ),
-        RuleCheck::Missing => println!(
-            "- no `{DISPATCH_PERMISSION_RULE}` rule in {} (run `engram init`; \
-             needed to dispatch from auto-mode sessions)",
-            DISPATCH_RULE_SETTINGS.join(" or ")
-        ),
-    }
-
     if !all_ok {
         anyhow::bail!("one or more checks failed");
     }
@@ -661,126 +637,6 @@ fn install_skills(repo_root: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Project Claude settings `engram init` adds the dispatch permission rule to.
-const CLAUDE_SETTINGS: &str = ".claude/settings.json";
-/// A narrow prefix rule, which auto mode honours (broad rules like `Bash(*)` are
-/// suspended there). It only matches when the command starts `engram dispatch`.
-const DISPATCH_PERMISSION_RULE: &str = "Bash(engram dispatch:*)";
-/// Rules that already allow dispatch: init's, and the equivalent space form.
-const DISPATCH_PERMISSION_RULES: &[&str] = &[DISPATCH_PERMISSION_RULE, "Bash(engram dispatch *)"];
-/// Project settings doctor looks for the rule in (init only writes the first).
-const DISPATCH_RULE_SETTINGS: &[&str] = &[CLAUDE_SETTINGS, ".claude/settings.local.json"];
-
-/// Whether `permissions.<list>` (`allow` or `deny`) has a dispatch rule.
-fn lists_dispatch(settings: &serde_json::Value, list: &str) -> bool {
-    settings["permissions"][list].as_array().is_some_and(|a| {
-        a.iter().any(|r| {
-            r.as_str()
-                .is_some_and(|r| DISPATCH_PERMISSION_RULES.contains(&r))
-        })
-    })
-}
-
-fn allows_dispatch(settings: &serde_json::Value) -> bool {
-    lists_dispatch(settings, "allow")
-}
-
-/// What the project settings say about the dispatch rule, for doctor.
-#[derive(Debug, PartialEq)]
-enum RuleCheck<'a> {
-    Allowed(&'a str),
-    /// Denied in this file; deny wins over allow in any file.
-    Denied(&'a str),
-    /// Nowhere allowed, and init can't add it ([`CLAUDE_SETTINGS`] isn't JSON
-    /// it can edit), so it has to be added by hand.
-    Uneditable,
-    Missing,
-}
-
-/// Check settings files (name, contents if readable) for the dispatch rule.
-fn dispatch_rule_check<'a>(files: &[(&'a str, Option<String>)]) -> RuleCheck<'a> {
-    let parsed: Vec<_> = files
-        .iter()
-        .filter_map(|(name, text)| {
-            let v: serde_json::Value = serde_json::from_str(text.as_deref()?).ok()?;
-            Some((*name, v))
-        })
-        .collect();
-    if let Some((name, _)) = parsed.iter().find(|(_, v)| lists_dispatch(v, "deny")) {
-        return RuleCheck::Denied(name);
-    }
-    if let Some((name, _)) = parsed.iter().find(|(_, v)| allows_dispatch(v)) {
-        return RuleCheck::Allowed(name);
-    }
-    let editable = files
-        .iter()
-        .find(|(name, _)| *name == CLAUDE_SETTINGS)
-        .is_none_or(|(_, text)| merge_dispatch_rule(text.as_deref()).is_ok());
-    if editable {
-        RuleCheck::Missing
-    } else {
-        RuleCheck::Uneditable
-    }
-}
-
-/// `existing` settings with the dispatch rule added to `permissions.allow`,
-/// creating what is missing and keeping every other key in order. `Ok(None)`
-/// when dispatch is already allowed; an error when the settings can't be
-/// edited safely (not JSON, e.g. hand-written comments, or an odd shape).
-fn merge_dispatch_rule(existing: Option<&str>) -> Result<Option<String>> {
-    use serde_json::{Map, Value};
-    let mut settings = match existing.map(str::trim) {
-        None | Some("") => Value::Object(Map::new()),
-        Some(text) => serde_json::from_str(text).context("not valid JSON")?,
-    };
-    if allows_dispatch(&settings) {
-        return Ok(None);
-    }
-    settings
-        .as_object_mut()
-        .context("top level is not an object")?
-        .entry("permissions")
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-        .context("`permissions` is not an object")?
-        .entry("allow")
-        .or_insert_with(|| Value::Array(Vec::new()))
-        .as_array_mut()
-        .context("`permissions.allow` is not an array")?
-        .push(DISPATCH_PERMISSION_RULE.into());
-    Ok(Some(serde_json::to_string_pretty(&settings)? + "\n"))
-}
-
-/// Let `engram dispatch` run from auto-mode Claude sessions in this repo.
-/// Never fails init: settings it can't read, parse or write are left alone
-/// with a warning naming the rule to add by hand.
-fn install_dispatch_permission(repo_root: &std::path::Path) {
-    let path = repo_root.join(CLAUDE_SETTINGS);
-    let add = || -> Result<bool> {
-        let existing = match std::fs::read_to_string(&path) {
-            Ok(text) => Some(text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e).context("reading it"),
-        };
-        let Some(updated) = merge_dispatch_rule(existing.as_deref())? else {
-            return Ok(false);
-        };
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        }
-        std::fs::write(&path, updated).context("writing it")?;
-        Ok(true)
-    };
-    match add() {
-        Ok(false) => println!("{CLAUDE_SETTINGS} already allows `engram dispatch`"),
-        Ok(true) => println!("Allowed `{DISPATCH_PERMISSION_RULE}` in {CLAUDE_SETTINGS}"),
-        Err(e) => eprintln!(
-            "warning: left {CLAUDE_SETTINGS} untouched ({e:#}); add \"{DISPATCH_PERMISSION_RULE}\" \
-             to its permissions.allow by hand"
-        ),
-    }
-}
-
 fn skills_current(repo_root: &std::path::Path) -> bool {
     SKILLS_DIR
         .find("**/*")
@@ -830,7 +686,6 @@ pub(crate) fn days_from_ymd(y: i32, m: u32, d: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rstest::rstest;
 
     #[test]
     fn days_from_ymd_epoch() {
@@ -918,115 +773,6 @@ mod tests {
         assert!(root
             .join(".claude/skills/engram-dispatch/SKILL.md")
             .exists());
-    }
-
-    #[rstest]
-    #[case::no_file(None, r#"{"permissions":{"allow":["Bash(engram dispatch:*)"]}}"#)]
-    #[case::no_permissions(
-        Some(r#"{"model": "opus"}"#),
-        r#"{"model":"opus","permissions":{"allow":["Bash(engram dispatch:*)"]}}"#
-    )]
-    #[case::other_rules(
-        Some(r#"{"hooks": {"Stop": []}, "permissions": {"deny": ["Bash(rm:*)"], "allow": ["Bash(graft:*)"]}, "statusLine": {"type": "command"}}"#),
-        r#"{"hooks":{"Stop":[]},"permissions":{"deny":["Bash(rm:*)"],"allow":["Bash(graft:*)","Bash(engram dispatch:*)"]},"statusLine":{"type":"command"}}"#
-    )]
-    fn merge_dispatch_rule_adds_the_rule_keeping_other_settings(
-        #[case] existing: Option<&str>,
-        #[case] want: &str,
-    ) {
-        let merged = merge_dispatch_rule(existing).unwrap().unwrap();
-        let merged: serde_json::Value = serde_json::from_str(&merged).unwrap();
-        // Compared as text so key order counts.
-        assert_eq!(merged.to_string(), want);
-    }
-
-    #[rstest]
-    fn merge_dispatch_rule_skips_settings_already_allowing_dispatch(
-        #[values(DISPATCH_PERMISSION_RULE, "Bash(engram dispatch *)")] rule: &str,
-    ) {
-        let settings = serde_json::json!({"permissions": {"allow": [rule]}}).to_string();
-        assert_eq!(merge_dispatch_rule(Some(&settings)).unwrap(), None);
-    }
-
-    #[rstest]
-    #[case::jsonc("{ // comment\n}", "not valid JSON")]
-    #[case::top_level_array("[]", "top level is not an object")]
-    #[case::allow_not_an_array(
-        r#"{"permissions": {"allow": "x"}}"#,
-        "`permissions.allow` is not an array"
-    )]
-    fn merge_dispatch_rule_refuses_settings_it_cannot_edit(
-        #[case] settings: &str,
-        #[case] why: &str,
-    ) {
-        let err = merge_dispatch_rule(Some(settings)).unwrap_err();
-        assert!(format!("{err:#}").contains(why), "{err:#}");
-    }
-
-    fn allowing(rule: &str) -> Option<String> {
-        Some(format!(r#"{{"permissions": {{"allow": ["{rule}"]}}}}"#))
-    }
-
-    #[rstest]
-    #[case::shared_file(
-        allowing("Bash(engram dispatch:*)"),
-        None,
-        RuleCheck::Allowed(CLAUDE_SETTINGS)
-    )]
-    #[case::local_file_space_form(
-        allowing("Bash(engram:*)"),
-        allowing("Bash(engram dispatch *)"),
-        RuleCheck::Allowed(DISPATCH_RULE_SETTINGS[1])
-    )]
-    #[case::denied_in_same_file(
-        Some(r#"{"permissions": {"allow": ["Bash(engram dispatch:*)"], "deny": ["Bash(engram dispatch:*)"]}}"#.into()),
-        None,
-        RuleCheck::Denied(CLAUDE_SETTINGS)
-    )]
-    #[case::denied_in_local_file(
-        allowing("Bash(engram dispatch:*)"),
-        Some(r#"{"permissions": {"deny": ["Bash(engram dispatch *)"]}}"#.into()),
-        RuleCheck::Denied(DISPATCH_RULE_SETTINGS[1])
-    )]
-    #[case::unparsable_and_broad_rule(
-        Some("{ // x\n}".into()),
-        allowing("Bash(engram:*)"),
-        RuleCheck::Uneditable
-    )]
-    #[case::odd_shape(Some(r#"{"permissions": []}"#.into()), None, RuleCheck::Uneditable)]
-    #[case::unparsable_local_only(None, Some("{ // x\n}".into()), RuleCheck::Missing)]
-    #[case::no_files(None, None, RuleCheck::Missing)]
-    fn dispatch_rule_check_cases(
-        #[case] shared: Option<String>,
-        #[case] local: Option<String>,
-        #[case] want: RuleCheck,
-    ) {
-        let files = [
-            (CLAUDE_SETTINGS, shared),
-            (DISPATCH_RULE_SETTINGS[1], local),
-        ];
-        assert_eq!(dispatch_rule_check(&files), want);
-    }
-
-    #[test]
-    fn install_dispatch_permission_adds_the_rule_once() {
-        let dir = tempfile::tempdir().unwrap();
-        install_dispatch_permission(dir.path());
-        install_dispatch_permission(dir.path());
-        let text = std::fs::read_to_string(dir.path().join(CLAUDE_SETTINGS)).unwrap();
-        assert_eq!(text.matches(DISPATCH_PERMISSION_RULE).count(), 1);
-    }
-
-    #[rstest]
-    #[case::unparsable(b"{ // mine\n}")]
-    #[case::not_utf8(&[0xff, 0xfe, b'{'])]
-    fn install_dispatch_permission_leaves_unusable_settings_untouched(#[case] bytes: &[u8]) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(CLAUDE_SETTINGS);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, bytes).unwrap();
-        install_dispatch_permission(dir.path());
-        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
     #[test]

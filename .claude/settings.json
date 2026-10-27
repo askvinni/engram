@@ -92,8 +92,7 @@
       "Bash(graft:*)",
       "Bash(npx graft:*)",
       "Bash(graft-dev:*)",
-      "Bash(node dist/cli.js:*)",
-      "Bash(engram dispatch:*)"
+      "Bash(node dist/cli.js:*)"
     ]
   }
 }

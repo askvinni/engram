@@ -286,17 +286,7 @@ Claude is launched as `<claude> --permission-mode auto "$(cat <prompt>)"`, with 
 
 ### From an auto-mode Claude session
 
-`engram init` adds `Bash(engram dispatch:*)` to `.claude/settings.json` unless it (or `Bash(engram dispatch *)`) is already there, re-serialising the file with key order kept; a file it can't read, parse (e.g. JSONC) or write is left untouched with a warning, and init carries on. `engram doctor` reports whether `.claude/settings.json` or `.claude/settings.local.json` has the rule. The `engram-dispatch` skill dry-runs, confirms with you, then dispatches. The rule only matches commands that *start* with `engram dispatch`, so run it from the repo root with nothing in front (`cd … &&` or `GH_TOKEN=…` won't match); that is what `engram.githubUser` and `[dispatch] claude` are for. If the classifier still denies it, add an exception to your **user** `~/.claude/settings.json` (project settings can't carry `autoMode`):
-
-```json
-{
-  "autoMode": {
-    "allow": [
-      "Running `engram dispatch` to start Claude sessions in kwt worktrees for engram plan issues is allowed when the user asked to dispatch them"
-    ]
-  }
-}
-```
+The `engram-dispatch` skill dry-runs, confirms with you, then dispatches. Run `engram dispatch` from the repo root exactly as typed, with nothing in front (no `cd … &&`, no `GH_TOKEN=…`): auto mode denies command lines that configure an agent or pass a credential, which is what `engram.githubUser` and `[dispatch] claude` are for. Adding `Bash(engram dispatch:*)` to `permissions.allow` in `.claude/settings.json` is optional and done by hand; a real auto-mode dispatch worked without it.
 
 ---
 
