@@ -286,7 +286,7 @@ pub struct DispatchOptions {
 
 /// Refuse anything but an open plan issue (plan label), including plain kata
 /// issues.
-fn check_kind(number: u64, issue: &github::Issue) -> Result<()> {
+fn require_plan_issue(number: u64, issue: &github::Issue) -> Result<()> {
     if issue.is_pull_request() {
         anyhow::bail!("#{number} is a pull request, not an engram-plan issue");
     }
@@ -321,18 +321,16 @@ fn confirm() -> Result<bool> {
 }
 
 #[derive(Debug)]
-struct Target {
+struct DispatchPlan {
     number: u64,
     title: String,
     body: String,
-    /// The plan's kata mirror; without one, execute creates it as `plan new`
+    /// The plan's kata mirror; without one, carry_out creates it as `plan new`
     /// would, with `meta` and `parent`.
     kata_ref: Option<String>,
     claimed_by_me: bool,
     meta: kata::TrackerMeta,
     parent: Option<String>,
-    /// `{kata_ref}` in the branch or PR title is a placeholder until the mirror exists.
-    kata_ref_pending: bool,
     branch: String,
     local: bool,
     remote: bool,
@@ -346,17 +344,7 @@ struct Target {
     worktree: Option<PathBuf>,
 }
 
-impl Target {
-    fn vars(&self, kata_ref: Option<String>, meta: BTreeMap<String, String>) -> TemplateVars {
-        TemplateVars {
-            number: self.number,
-            has_mirror: kata_ref.is_some(),
-            kata_ref,
-            title: self.title.clone(),
-            meta,
-        }
-    }
-
+impl DispatchPlan {
     fn ready(&self) -> bool {
         self.pr.as_ref().is_some_and(|pr| !pr.is_draft)
     }
@@ -377,7 +365,7 @@ impl Target {
     }
 }
 
-fn describe(t: &Target, no_launch: bool) -> String {
+fn format_plan(t: &DispatchPlan, no_launch: bool) -> String {
     let kata = match &t.kata_ref {
         Some(r) if t.claimed_by_me => format!("{r} (claimed by you)"),
         Some(r) => format!("{r} (will claim)"),
@@ -390,8 +378,6 @@ fn describe(t: &Target, no_launch: bool) -> String {
     };
     let branch_note = if t.pr_link.is_some() {
         format!("reused from the existing PR; {state}")
-    } else if t.kata_ref_pending {
-        format!("{PENDING_KATA_REF} filled in once the mirror exists; {state}")
     } else {
         state.to_string()
     };
@@ -457,7 +443,20 @@ fn check_mirror_open(number: u64, kata_ref: &str, status: &str) -> Result<()> {
     Ok(())
 }
 
-struct Ctx<'a> {
+/// What `find_mirror` learns about a plan's kata side.
+#[derive(Debug)]
+struct MirrorInfo {
+    kata_ref: Option<String>,
+    claimed_by_me: bool,
+    /// What `{meta[key]}` placeholders see: the mirror's metadata, else what
+    /// a new mirror would get.
+    template_meta: BTreeMap<String, String>,
+    /// Metadata and parent for the mirror `carry_out` creates when there is none.
+    create_meta: kata::TrackerMeta,
+    parent: Option<String>,
+}
+
+struct Run<'a> {
     root: &'a Path,
     repo: &'a str,
     cfg: &'a Config,
@@ -485,7 +484,7 @@ pub fn dispatch(
     number: u64,
     opts: DispatchOptions,
 ) -> Result<()> {
-    let cx = Ctx {
+    let run = Run {
         root: repo_root,
         repo,
         cfg,
@@ -496,18 +495,18 @@ pub fn dispatch(
         actor: OnceCell::new(),
     };
     // Planning: no mutations.
-    let mut t = cx.plan_target(number)?;
-    print!("{}", describe(&t, opts.no_launch));
+    let mut plan = run.plan_dispatch(number)?;
+    print!("{}", format_plan(&plan, opts.no_launch));
     if opts.dry_run {
         return Ok(());
     }
     if !opts.yes && !confirm()? {
         anyhow::bail!("dispatch cancelled");
     }
-    cx.execute(&mut t)
+    run.carry_out(&mut plan)
 }
 
-impl Ctx<'_> {
+impl Run<'_> {
     /// Open PRs with bodies, listed once per run.
     fn open_prs(&self) -> Result<&[PrWithBody]> {
         cached(&self.open_prs, || {
@@ -518,8 +517,11 @@ impl Ctx<'_> {
 
     fn default_branch(&self) -> Result<&str> {
         cached(&self.default, || {
-            let head =
-                run(git(self.root).args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]));
+            let head = run_checked(git(self.root).args([
+                "symbolic-ref",
+                "--short",
+                "refs/remotes/origin/HEAD",
+            ]));
             // A stale origin/HEAD can name a branch origin no longer has.
             if let Ok(Some(name)) = head.as_deref().map(|h| h.strip_prefix("origin/")) {
                 if !name.is_empty() && self.remote_has_branch(name)? {
@@ -539,7 +541,7 @@ impl Ctx<'_> {
         cached(&self.actor, || {
             let env = ["KATA_AUTHOR", "USER"].map(|v| std::env::var(v).ok());
             pick_actor(env, || {
-                run(git(self.root).args(["config", "user.name"])).ok()
+                run_checked(git(self.root).args(["config", "user.name"])).ok()
             })
             .context(
                 "can't tell which kata actor you are: set KATA_AUTHOR (or USER, or git user.name)",
@@ -594,50 +596,27 @@ impl Ctx<'_> {
 
     /// Work out everything dispatch will do for plan `number`, changing
     /// nothing.
-    fn plan_target(&self, number: u64) -> Result<Target> {
+    fn plan_dispatch(&self, number: u64) -> Result<DispatchPlan> {
         let issue = github::get_issue(self.repo, number)
             .with_context(|| format!("fetching issue #{number}"))?;
-        check_kind(number, &issue)?;
+        require_plan_issue(number, &issue)?;
         let body = issue.body.unwrap_or_default();
         let objective = self.objective_of(number, &body)?;
-        let (mut meta, mut parent) = (kata::TrackerMeta::default(), None);
-        let (kata_ref, claimed_by_me, meta_map) = match kata::find_mirror(self.repo, number, &body)?
-        {
-            Some(r) => {
-                let (claimed, map) = self.mirror_claimed_by_me(number, &r)?;
-                (Some(r), claimed, map)
-            }
-            None => {
-                (meta, parent) = match &objective {
-                    Some((_, _, obj_title, obj_body)) => {
-                        let parent = kata::parse_ref(obj_body);
-                        let meta = objective::node_tracker_meta(
-                            &kata::TrackerMeta::default(),
-                            &issue.title,
-                            &body,
-                            obj_title,
-                            obj_body,
-                            parent.as_deref(),
-                        );
-                        (meta, parent)
-                    }
-                    None => (
-                        kata::TrackerMeta::resolve(None, None, &issue.title, &body),
-                        None,
-                    ),
-                };
-                (None, false, meta.to_map())
-            }
+        let mirror = self.find_mirror(number, &issue.title, &body, objective.as_ref())?;
+        let fields = PlanFields {
+            number,
+            kata_ref: mirror.kata_ref.clone(),
+            title: issue.title.clone(),
+            meta: mirror.template_meta,
         };
-        let mut t = Target {
+        let mut t = DispatchPlan {
             number,
             title: issue.title,
             body,
-            kata_ref,
-            claimed_by_me,
-            meta,
-            parent,
-            kata_ref_pending: false,
+            kata_ref: mirror.kata_ref,
+            claimed_by_me: mirror.claimed_by_me,
+            meta: mirror.create_meta,
+            parent: mirror.parent,
             branch: String::new(),
             local: false,
             remote: false,
@@ -647,62 +626,95 @@ impl Ctx<'_> {
             pr_link: None,
             worktree: None,
         };
-        let vars = t.vars(t.kata_ref.clone(), meta_map);
         // The templates only matter for a plan without a PR yet, so a broken
         // one can't block re-running a plan that is already under way.
-        let branch = render_planned(&self.cfg.dispatch.branch, &vars);
-
-        // Work started under any branch name is found through the open PR that
-        // closes the plan, so a retitled plan or changed template can't start a
-        // second branch, PR and session: GitHub's closing link first, else (for
-        // stacked PRs, which GitHub never links) `Closes #N` in a PR body,
-        // preferring the PR on the branch the template renders.
-        let linked = github::open_closing_pr(self.repo, number)
-            .with_context(|| format!("looking up open PRs linked to #{number}"))?;
-        let found = match linked {
-            Some(pr) => Some((pr, format!("linked to #{number}"))),
-            None => {
-                let head = match &branch {
-                    Ok((b, false)) => Some(b.as_str()),
-                    _ => None,
-                };
-                github::select_body_closing_pr(self.open_prs()?, self.repo, number, head)
-                    .cloned()
-                    .map(|pr| (pr, format!("found by `Closes #{number}` in its body")))
+        let branch = fill_template(&self.cfg.dispatch.branch, &fields);
+        match self.find_existing_pr(number, branch.as_deref().ok())? {
+            Some((pr, how)) => {
+                t.branch = pr.head.clone();
+                t.pr_title = pr.title.clone();
+                t.base = pr.base.clone();
+                t.pr_link = Some(how);
+                t.pr = Some(pr);
+                self.find_existing_branch(&mut t)?;
             }
-        };
-        if let Some((pr, how)) = found {
-            t.branch = pr.head.clone();
-            t.pr_title = pr.title.clone();
-            t.base = pr.base.clone();
-            t.pr_link = Some(how);
-            t.pr = Some(pr);
-            self.lookup_branch(&mut t)?;
-            return Ok(t);
+            None => {
+                t.branch = branch?;
+                t.base = self.default_branch()?.to_string();
+                self.find_existing_branch(&mut t)?;
+                t.pr_title = match &t.pr {
+                    Some(pr) => pr.title.clone(),
+                    None => fill_pr_title(&self.cfg.dispatch.pr_title, &fields)?,
+                };
+            }
         }
-        let branch_pending;
-        (t.branch, branch_pending) = branch?;
-        t.base = self.default_branch()?.to_string();
-        // A pending branch name is only known once the mirror exists; execute
-        // validates and looks it up then.
-        if !branch_pending {
-            self.lookup_branch(&mut t)?;
-        }
-        let title_pending = self.set_pr_title(&mut t, &vars)?;
-        t.kata_ref_pending = branch_pending || title_pending;
         Ok(t)
     }
 
-    /// The PR title: an existing PR's on the branch, else the rendered
-    /// template (returning whether it waits on the mirror's ref).
-    fn set_pr_title(&self, t: &mut Target, vars: &TemplateVars) -> Result<bool> {
-        if let Some(pr) = &t.pr {
-            t.pr_title = pr.title.clone();
-            return Ok(false);
+    /// The plan's kata mirror and the metadata its templates see. Without a
+    /// mirror, metadata comes from the plan body and title (plus its
+    /// objective's, for a node plan), as `plan new` would set it.
+    fn find_mirror(
+        &self,
+        number: u64,
+        title: &str,
+        body: &str,
+        objective: Option<&(u64, String, String, String)>,
+    ) -> Result<MirrorInfo> {
+        if let Some(r) = kata::find_mirror(self.repo, number, body)? {
+            let (claimed_by_me, template_meta) = self.mirror_claimed_by_me(number, &r)?;
+            return Ok(MirrorInfo {
+                kata_ref: Some(r),
+                claimed_by_me,
+                template_meta,
+                create_meta: kata::TrackerMeta::default(),
+                parent: None,
+            });
         }
-        let pending;
-        (t.pr_title, pending) = render_pr_title(&self.cfg.dispatch.pr_title, vars)?;
-        Ok(pending)
+        let (create_meta, parent) = match objective {
+            Some((_, _, obj_title, obj_body)) => {
+                let parent = kata::parse_ref(obj_body);
+                let meta = objective::node_tracker_meta(
+                    &kata::TrackerMeta::default(),
+                    title,
+                    body,
+                    obj_title,
+                    obj_body,
+                    parent.as_deref(),
+                );
+                (meta, parent)
+            }
+            None => (kata::TrackerMeta::resolve(None, None, title, body), None),
+        };
+        Ok(MirrorInfo {
+            kata_ref: None,
+            claimed_by_me: false,
+            template_meta: create_meta.to_map(),
+            create_meta,
+            parent,
+        })
+    }
+
+    /// The open PR that closes plan `number`, and how it was found. Work
+    /// started under any branch name is found this way, so a retitled plan or
+    /// changed template can't start a second branch, PR and session: GitHub's
+    /// closing link first, else (for stacked PRs, which GitHub never links)
+    /// `Closes #N` in a PR body, preferring the PR on `branch`.
+    fn find_existing_pr(
+        &self,
+        number: u64,
+        branch: Option<&str>,
+    ) -> Result<Option<(OpenPr, String)>> {
+        let linked = github::open_closing_pr(self.repo, number)
+            .with_context(|| format!("looking up open PRs linked to #{number}"))?;
+        if let Some(pr) = linked {
+            return Ok(Some((pr, format!("linked to #{number}"))));
+        }
+        Ok(
+            github::select_body_closing_pr(self.open_prs()?, self.repo, number, branch)
+                .cloned()
+                .map(|pr| (pr, format!("found by `Closes #{number}` in its body"))),
+        )
     }
 
     fn remote_has_branch(&self, b: &str) -> Result<bool> {
@@ -727,14 +739,14 @@ impl Ctx<'_> {
         }
     }
 
-    fn lookup_branch(&self, t: &mut Target) -> Result<()> {
+    fn find_existing_branch(&self, t: &mut DispatchPlan) -> Result<()> {
         let b = &t.branch;
-        if run(git(self.root).args(["check-ref-format", "--branch", b])).is_err() {
+        if run_checked(git(self.root).args(["check-ref-format", "--branch", b])).is_err() {
             anyhow::bail!(
                 "`{b}` is not a valid branch name — check the [dispatch] branch template"
             );
         }
-        t.local = run(git(self.root).args([
+        t.local = run_checked(git(self.root).args([
             "show-ref",
             "--verify",
             "--quiet",
@@ -762,9 +774,9 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    /// Carry out a confirmed target and print its report. Every step looks up
+    /// Carry out a confirmed plan and print its report. Every step looks up
     /// existing state first, so a re-run after a partial failure resumes.
-    fn execute(&self, t: &mut Target) -> Result<()> {
+    fn carry_out(&self, t: &mut DispatchPlan) -> Result<()> {
         let (kata_ref, claimed_by_me, created) = match &t.kata_ref {
             Some(r) => (r.clone(), t.claimed_by_me, false),
             // Same idempotency key as `plan new`, so the two paths can't
@@ -800,21 +812,13 @@ impl Ctx<'_> {
                 eprintln!("warning: could not append Kata ref to GitHub issue: {e:#}");
             }
         }
-        if t.kata_ref_pending {
-            let vars = t.vars(Some(kata_ref.clone()), t.meta.to_map());
-            t.branch = render(&self.cfg.dispatch.branch, &vars)?;
-            t.kata_ref_pending = false;
-            self.lookup_branch(t)?;
-            self.set_pr_title(t, &vars)?;
-            eprintln!("branch: rendered {} with kata {kata_ref}", t.branch);
-        }
 
-        run(git(self.root).args(["fetch", "origin", &t.base]))?;
-        self.ensure_branch(t)?;
+        run_checked(git(self.root).args(["fetch", "origin", &t.base]))?;
+        self.create_branch_if_missing(t)?;
         if t.remote {
             eprintln!("push: skipped, origin already has {}", t.branch);
         } else {
-            run(git(self.root).args(["push", "-u", "origin", &t.branch]))?;
+            run_checked(git(self.root).args(["push", "-u", "origin", &t.branch]))?;
             eprintln!("push: pushed {} to origin", t.branch);
         }
 
@@ -839,7 +843,7 @@ impl Ctx<'_> {
                 path.clone()
             }
             None => {
-                run(self.kwt().args(["add", &t.branch, "--no-launch"]))?;
+                run_checked(self.kwt().args(["add", &t.branch, "--no-launch"]))?;
                 let path = self.kwt_worktree(&t.branch)?.with_context(|| {
                     format!("kwt added {} but `kwt list` can't find it", t.branch)
                 })?;
@@ -877,7 +881,7 @@ impl Ctx<'_> {
 
     /// Create the branch without checking anything out, so the user's checkout
     /// and HEAD stay untouched.
-    fn ensure_branch(&self, t: &Target) -> Result<()> {
+    fn create_branch_if_missing(&self, t: &DispatchPlan) -> Result<()> {
         let b = &t.branch;
         if t.local {
             eprintln!("branch: {b} exists, reusing it");
@@ -885,18 +889,25 @@ impl Ctx<'_> {
             // Dispatched from another machine: track the remote branch rather
             // than creating a divergent wip commit.
             let refspec = format!("refs/heads/{b}:refs/remotes/origin/{b}");
-            run(git(self.root).args(["fetch", "origin", &refspec]))?;
-            run(git(self.root).args(["branch", "--track", b, &format!("origin/{b}")]))?;
+            run_checked(git(self.root).args(["fetch", "origin", &refspec]))?;
+            run_checked(git(self.root).args(["branch", "--track", b, &format!("origin/{b}")]))?;
             eprintln!("branch: {b} tracks origin/{b}");
         } else {
             // Base the wip commit on the freshly fetched remote ref, not local
             // <default>, which can hold unpushed or stale commits.
             let base_ref = format!("origin/{}", t.base);
-            let tree = run(git(self.root).args(["rev-parse", &format!("{base_ref}^{{tree}}")]))?;
+            let tree =
+                run_checked(git(self.root).args(["rev-parse", &format!("{base_ref}^{{tree}}")]))?;
             let msg = format!("wip: #{} {}", t.number, t.title);
-            let commit =
-                run(git(self.root).args(["commit-tree", &tree, "-p", &base_ref, "-m", &msg]))?;
-            run(git(self.root).args(["branch", b, &commit]))?;
+            let commit = run_checked(git(self.root).args([
+                "commit-tree",
+                &tree,
+                "-p",
+                &base_ref,
+                "-m",
+                &msg,
+            ]))?;
+            run_checked(git(self.root).args(["branch", b, &commit]))?;
             eprintln!("branch: created {b} on {base_ref}");
         }
         Ok(())
@@ -909,7 +920,7 @@ impl Ctx<'_> {
     }
 
     fn kwt_worktree(&self, branch: &str) -> Result<Option<PathBuf>> {
-        let out = run(self.kwt().args(["list", "--json"]))?;
+        let out = run_checked(self.kwt().args(["list", "--json"]))?;
         Ok(select_worktree(&out, branch)?.filter(|p| p.is_dir()))
     }
 
@@ -921,11 +932,12 @@ impl Ctx<'_> {
         // failed"); --start-session is idempotent, so retry.
         let mut attempt = 0;
         loop {
-            let open = run(self
-                .kwt()
-                .arg("open")
-                .arg(worktree)
-                .args(["--start-session", "--json"]));
+            let open = run_checked(
+                self.kwt()
+                    .arg("open")
+                    .arg(worktree)
+                    .args(["--start-session", "--json"]),
+            );
             match open {
                 Ok(out) => return parse_endpoint(&out),
                 Err(e) if attempt + 1 >= KWT_OPEN_ATTEMPTS => return Err(e),
@@ -942,7 +954,7 @@ impl Ctx<'_> {
 
     fn launch_claude(
         &self,
-        t: &Target,
+        t: &DispatchPlan,
         worktree: &Path,
         endpoint: &Endpoint,
         prompt: &str,
@@ -951,10 +963,12 @@ impl Ctx<'_> {
         // kwt (and Ghosthub) run tmux with TMUX_TMPDIR unset; honouring it here
         // would address a different server than the one holding the workspace.
         let tmux = |args: &[&str]| {
-            run(Command::new(&self.tools.tmux)
-                .env_remove("TMUX_TMPDIR")
-                .args(["-L", &endpoint.tmux_socket_name])
-                .args(args))
+            run_checked(
+                Command::new(&self.tools.tmux)
+                    .env_remove("TMUX_TMPDIR")
+                    .args(["-L", &endpoint.tmux_socket_name])
+                    .args(args),
+            )
         };
         let pane = || {
             tmux(&[
@@ -1015,7 +1029,7 @@ fn pr_body(number: u64, kata_ref: &str) -> String {
     format!("Work in progress for engram plan #{number} (kata `{kata_ref}`).\n\nCloses #{number}")
 }
 
-fn build_prompt(t: &Target, kata_ref: &str, pr_url: &str) -> String {
+fn build_prompt(t: &DispatchPlan, kata_ref: &str, pr_url: &str) -> String {
     let n = t.number;
     format!(
         "Work on engram plan #{n}: {}\nkata issue: {kata_ref}\n\n{}\n\n---\n\
@@ -1124,7 +1138,7 @@ fn git(repo_root: &Path) -> Command {
     cmd
 }
 
-fn run(cmd: &mut Command) -> Result<String> {
+fn run_checked(cmd: &mut Command) -> Result<String> {
     let desc = std::iter::once(cmd.get_program())
         .chain(cmd.get_args())
         .map(|a| a.to_string_lossy())
@@ -1324,8 +1338,8 @@ mod tests {
         assert_eq!(tool_problems(missing, kata_installed, kata_bound), want);
     }
 
-    fn target() -> Target {
-        Target {
+    fn target() -> DispatchPlan {
+        DispatchPlan {
             number: 143,
             title: "[5.2] Add engram dispatch".into(),
             body: "Objective: #141 (node 5.2)\n\n## Why\nUse `$HOME` and \"quotes\".\n".into(),
@@ -1333,7 +1347,6 @@ mod tests {
             claimed_by_me: false,
             meta: kata::TrackerMeta::default(),
             parent: None,
-            kata_ref_pending: false,
             branch: "143-add-engram-dispatch".into(),
             local: false,
             remote: false,
@@ -1345,7 +1358,7 @@ mod tests {
         }
     }
 
-    fn with_pr(mut t: Target, base: &str, draft: bool) -> Target {
+    fn with_pr(mut t: DispatchPlan, base: &str, draft: bool) -> DispatchPlan {
         t.pr = Some(OpenPr {
             url: "https://github.com/o/r/pull/9".into(),
             base: base.into(),
@@ -1358,7 +1371,7 @@ mod tests {
 
     /// Found by its body, ready for review, its branch also local; `base` is
     /// the computed one, the PR's own is `main`.
-    fn reused(base: &str) -> Target {
+    fn reused(base: &str) -> DispatchPlan {
         let mut t = with_pr(target(), "main", false);
         t.pr_link = Some("found by `Closes #143` in its body".into());
         t.local = true;
@@ -1413,15 +1426,15 @@ mod tests {
         "pull/9 (reuse; targets main, not a56d-x)",
         "skip (--no-launch)",
     ])]
-    #[case::mirror_pending(Target { kata_ref: None, kata_ref_pending: true, ..target() }, false, &[
-        "(no mirror, will create and claim)", "<kata-ref> filled in once the mirror exists",
+    #[case::no_mirror(DispatchPlan { kata_ref: None, ..target() }, false, &[
+        "kata:     (no mirror, will create and claim)",
     ])]
-    fn describe_says_what_is_reused_and_how(
-        #[case] t: Target,
+    fn format_plan_says_what_is_reused_and_how(
+        #[case] t: DispatchPlan,
         #[case] no_launch: bool,
         #[case] has: &[&str],
     ) {
-        assert_mentions(&describe(&t, no_launch), has, &[]);
+        assert_mentions(&format_plan(&t, no_launch), has, &[]);
     }
 
     #[rstest]
@@ -1429,7 +1442,7 @@ mod tests {
     #[case::unlabelled("OPEN", &[], Err("not an engram-plan issue"))]
     #[case::objective("OPEN", &[OBJECTIVE_LABEL], Err("is an engram-objective"))]
     #[case::closed("CLOSED", &[PLAN_LABEL], Err("not open"))]
-    fn check_kind_refuses_closed_and_unlabelled_issues(
+    fn require_plan_issue_refuses_closed_and_unlabelled_issues(
         #[case] state: &str,
         #[case] labels: &[&str],
         #[case] want: Want<()>,
@@ -1443,11 +1456,11 @@ mod tests {
             labels: labels.collect(),
             url: url.into(),
         };
-        assert_result(check_kind(1, &issue), want);
+        assert_result(require_plan_issue(1, &issue), want);
     }
 
     #[test]
-    fn check_kind_names_pull_requests() {
+    fn require_plan_issue_names_pull_requests() {
         let pr = github::Issue {
             title: String::new(),
             body: None,
@@ -1455,7 +1468,10 @@ mod tests {
             labels: vec![],
             url: "https://github.com/o/r/pull/147".into(),
         };
-        assert_result(check_kind(147, &pr), Err("#147 is a pull request, not an"));
+        assert_result(
+            require_plan_issue(147, &pr),
+            Err("#147 is a pull request, not an"),
+        );
     }
 
     #[rstest]
