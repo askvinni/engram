@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -10,8 +10,10 @@ const KATA_REF_PREFIX: &str = "Kata: ";
 const GITHUB_PREFIX: &str = "GitHub: ";
 const SYNC_META_KEY: &str = "engram.sync";
 const CONFLICT_LABEL: &str = "kata-sync-conflict";
-const JIRA_META_KEY: &str = "jira";
-const TYPE_META_KEY: &str = "type";
+pub const JIRA_META_KEY: &str = "jira";
+pub const TYPE_META_KEY: &str = "type";
+const PLAN_IDEMPOTENCY_PREFIX: &str = "engram-plan-";
+const OBJECTIVE_IDEMPOTENCY_PREFIX: &str = "engram-objective-";
 const CHANGE_TYPES: &[&str] = &[
     "feat", "fix", "chore", "docs", "refactor", "test", "perf", "build", "ci", "style", "revert",
 ];
@@ -56,6 +58,18 @@ impl TrackerMeta {
         self.jira.is_some() && self.kind.is_some()
     }
 
+    /// The metadata a mirror created with these fields would carry, keyed as kata stores it.
+    pub fn to_map(&self) -> BTreeMap<String, String> {
+        let mut map = BTreeMap::new();
+        if let Some(j) = &self.jira {
+            map.insert(JIRA_META_KEY.to_string(), j.clone());
+        }
+        if let Some(t) = &self.kind {
+            map.insert(TYPE_META_KEY.to_string(), t.clone());
+        }
+        map
+    }
+
     fn from_metadata(metadata: &serde_json::Value) -> Self {
         let field = |key: &str| {
             metadata
@@ -96,6 +110,28 @@ pub fn parse_type_arg(s: &str) -> std::result::Result<String, String> {
             CHANGE_TYPES.join(", ")
         )
     })
+}
+
+/// Idempotency key for a plan issue's kata mirror. Every path that creates the
+/// mirror uses it, so they can never produce two mirrors for one plan.
+pub fn plan_idempotency_key(github_number: u64) -> String {
+    format!("{PLAN_IDEMPOTENCY_PREFIX}{github_number}")
+}
+
+/// Idempotency key for an objective issue's kata mirror.
+pub fn objective_idempotency_key(github_number: u64) -> String {
+    format!("{OBJECTIVE_IDEMPOTENCY_PREFIX}{github_number}")
+}
+
+/// Body of a kata mirror: the GitHub URL, then the full GitHub body, so the
+/// mirror stays searchable on its own.
+pub fn mirror_body(issue_url: &str, gh_body: &str) -> String {
+    format!("{GITHUB_PREFIX}{issue_url}\n\n{gh_body}")
+}
+
+/// A GitHub body with the `Kata: <ref>` line appended that points at its mirror.
+pub fn with_ref_line(gh_body: &str, kata_ref: &str) -> String {
+    format!("{gh_body}\n{KATA_REF_PREFIX}{kata_ref}")
 }
 
 /// Read the kdispatch metadata already set on a kata issue.
@@ -284,6 +320,31 @@ pub fn comment(kata_ref: &str, body: &str) -> Result<()> {
     Ok(())
 }
 
+/// Claim a kata issue for the current actor. kata refuses when someone else owns it.
+pub fn claim(kata_ref: &str) -> Result<()> {
+    kata_command(&["claim", kata_ref])?;
+    Ok(())
+}
+
+/// String, number and bool metadata values as strings. Structured values (such
+/// as `engram.sync`) are bookkeeping, not template input, and are skipped.
+pub fn metadata_map(metadata: &serde_json::Value) -> BTreeMap<String, String> {
+    let Some(obj) = metadata.as_object() else {
+        return BTreeMap::new();
+    };
+    obj.iter()
+        .filter_map(|(k, v)| {
+            let value = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => return None,
+            };
+            Some((k.clone(), value))
+        })
+        .collect()
+}
+
 /// Parse the `Kata: <ref>` line that `plan::new` appends to a GitHub issue body.
 pub fn parse_ref(issue_body: &str) -> Option<String> {
     issue_body
@@ -323,6 +384,8 @@ struct KataIssueCore {
     body: String,
     status: String,
     #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
     metadata: serde_json::Value,
 }
 
@@ -342,6 +405,7 @@ pub struct KataIssue {
     pub title: String,
     pub body: String,
     pub status: String,
+    pub owner: Option<String>,
     pub metadata: serde_json::Value,
     pub parent: Option<String>,
     pub blocked_by: Vec<String>,
@@ -359,7 +423,7 @@ fn kata_command(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?)
 }
 
-fn show(kata_ref: &str) -> Result<KataIssue> {
+pub fn show(kata_ref: &str) -> Result<KataIssue> {
     let stdout = kata_command(&["show", kata_ref, "--json"])?;
     let resp: ShowResponse = serde_json::from_str(&stdout).context("parsing kata show JSON")?;
     let blocked_by = resp
@@ -372,6 +436,7 @@ fn show(kata_ref: &str) -> Result<KataIssue> {
         title: resp.issue.title,
         body: resp.issue.body,
         status: resp.issue.status,
+        owner: resp.issue.owner,
         metadata: resp.issue.metadata,
         parent: resp.parent.map(|p| p.short_id),
         blocked_by,
@@ -659,14 +724,20 @@ pub struct SyncReport {
 /// since hand-mirrored issues (nodes 2.1-2.6 among them) never got that line.
 pub fn find_kata_ref_for_issue(repo: &str, github_number: u64) -> Result<String> {
     let issue = github::get_issue(repo, github_number).context("fetching GitHub issue")?;
-    if let Some(kata_ref) = find_kata_ref_line(issue.body.as_deref().unwrap_or("")) {
-        return Ok(kata_ref.to_string());
+    find_mirror(repo, github_number, issue.body.as_deref().unwrap_or(""))?
+        .ok_or_else(|| anyhow::anyhow!("no kata mirror found for GitHub issue #{github_number}"))
+}
+
+/// The kata mirror of a GitHub issue whose body is already in hand: its
+/// `Kata: <ref>` line, else a kata issue whose `GitHub: <url>` line points at it.
+pub fn find_mirror(repo: &str, github_number: u64, gh_body: &str) -> Result<Option<String>> {
+    if let Some(kata_ref) = find_kata_ref_line(gh_body) {
+        return Ok(Some(kata_ref.to_string()));
     }
-    list_all()?
+    Ok(list_all()?
         .into_iter()
         .find(|k| find_github_issue_number(&k.body, repo) == Some(github_number))
-        .map(|k| k.short_id)
-        .ok_or_else(|| anyhow::anyhow!("no kata mirror found for GitHub issue #{github_number}"))
+        .map(|k| k.short_id))
 }
 
 pub fn sync_pair(repo: &str, github_number: u64, kata_ref: &str) -> Result<SyncReport> {
@@ -967,6 +1038,18 @@ pub fn sync_all(repo: &str) -> Result<Vec<Result<SyncReport>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_map_keeps_scalars_only() {
+        let v = serde_json::json!({
+            "jira": "ENG-7", "points": 3, "urgent": true,
+            "engram.sync": {"gh_status": "open"}, "tags": ["a"], "none": null,
+        });
+        let want = [("jira", "ENG-7"), ("points", "3"), ("urgent", "true")]
+            .map(|(k, v)| (k.to_string(), v.to_string()));
+        assert_eq!(metadata_map(&v), BTreeMap::from(want));
+        assert!(metadata_map(&serde_json::Value::Null).is_empty());
+    }
 
     #[test]
     fn kata_available_returns_bool() {

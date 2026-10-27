@@ -7,6 +7,57 @@ pub struct Issue {
     pub title: String,
     pub body: Option<String>,
     pub state: String,
+    #[serde(default)]
+    pub labels: Vec<Label>,
+    /// `gh issue view` also returns pull requests; their URL says `/pull/`.
+    #[serde(default)]
+    pub url: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Label {
+    pub name: String,
+}
+
+impl Issue {
+    pub fn has_label(&self, name: &str) -> bool {
+        self.labels.iter().any(|l| l.name == name)
+    }
+
+    pub fn is_pull_request(&self) -> bool {
+        self.url.contains("/pull/")
+    }
+}
+
+/// An open (or merged) PR found for a plan, with its head and base.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OpenPr {
+    pub url: String,
+    #[serde(rename = "baseRefName")]
+    pub base: String,
+    #[serde(rename = "headRefName", default)]
+    pub head: String,
+    #[serde(rename = "isDraft", default)]
+    pub is_draft: bool,
+    #[serde(default)]
+    pub title: String,
+}
+
+/// JSON fields `gh pr list/view` must return to fill an `OpenPr`.
+const OPEN_PR_FIELDS: &str = "url,baseRefName,headRefName,isDraft,title";
+
+/// A PR with its body (and state, when `gh pr view` reports it).
+#[derive(Debug, Deserialize)]
+pub struct PrWithBody {
+    #[serde(flatten)]
+    pub pr: OpenPr,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub state: String,
+    /// Opened from a fork: its head branch isn't on origin.
+    #[serde(rename = "isCrossRepository", default)]
+    pub cross_repo: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -82,7 +133,7 @@ pub fn get_issue(repo: &str, number: u64) -> Result<Issue> {
         "--repo",
         repo,
         "--json",
-        "title,body,state",
+        "title,body,state,labels,url",
     ])?;
     serde_json::from_str(&out).context("parsing issue JSON")
 }
@@ -313,6 +364,176 @@ pub fn create_pr(repo: &str, title: &str, body: &str, label: &str) -> Result<Str
     gh(&[
         "pr", "create", "--repo", repo, "--title", title, "--body", body, "--label", label,
     ])
+}
+
+/// The PR in `state` (`open`, `merged`) whose head is `branch`, if any.
+pub fn pr_for_branch(repo: &str, branch: &str, state: &str) -> Result<Option<OpenPr>> {
+    let out = gh(&[
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--head",
+        branch,
+        "--state",
+        state,
+        "--json",
+        OPEN_PR_FIELDS,
+        "--limit",
+        "1",
+    ])?;
+    let prs: Vec<OpenPr> = serde_json::from_str(&out).context("parsing PR list JSON")?;
+    Ok(prs.into_iter().next())
+}
+
+/// Numbers of the PRs in `repo` that GitHub links as closing an issue, from
+/// `gh issue view --json closedByPullRequestsReferences`.
+pub fn parse_closing_pr_numbers(json: &str, repo: &str) -> Result<Vec<u64>> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).context("parsing closedByPullRequestsReferences JSON")?;
+    let refs = v["closedByPullRequestsReferences"].as_array();
+    Ok(refs
+        .into_iter()
+        .flatten()
+        .filter(|r| {
+            match (
+                r["repository"]["owner"]["login"].as_str(),
+                r["repository"]["name"].as_str(),
+            ) {
+                (Some(owner), Some(name)) => format!("{owner}/{name}").eq_ignore_ascii_case(repo),
+                _ => true,
+            }
+        })
+        .filter_map(|r| r["number"].as_u64())
+        .collect())
+}
+
+/// The open PR GitHub links as closing issue `number`, whatever its branch is
+/// called. Stacked PRs (into a non-default base) are never linked: search PR
+/// bodies with `select_body_closing_pr` for those.
+pub fn open_closing_pr(repo: &str, number: u64) -> Result<Option<OpenPr>> {
+    let n = number.to_string();
+    let out = gh(&[
+        "issue",
+        "view",
+        &n,
+        "--repo",
+        repo,
+        "--json",
+        "closedByPullRequestsReferences",
+    ])?;
+    for pr in parse_closing_pr_numbers(&out, repo)? {
+        let fields = format!("{OPEN_PR_FIELDS},state");
+        let out = gh(&[
+            "pr",
+            "view",
+            &pr.to_string(),
+            "--repo",
+            repo,
+            "--json",
+            &fields,
+        ])?;
+        let view: PrWithBody =
+            serde_json::from_str(&out).with_context(|| format!("parsing PR #{pr} JSON"))?;
+        if view.state.eq_ignore_ascii_case("open") {
+            return Ok(Some(view.pr));
+        }
+    }
+    Ok(None)
+}
+
+/// GitHub's closing keywords, lower-cased.
+const CLOSING_KEYWORDS: &[&str] = &[
+    "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
+];
+
+/// Most PRs listed when looking for one whose body closes an issue.
+const PR_SCAN_LIMIT: &str = "200";
+
+/// Whether `body` says it closes issue `number` of `repo`: a closing keyword
+/// (any case, optional colon) followed by `#N` or the issue's URL.
+pub fn body_closes(body: &str, repo: &str, number: u64) -> bool {
+    let url_prefix = format!("https://github.com/{}/issues/", repo.to_ascii_lowercase());
+    let words: Vec<String> = body
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect();
+    words.windows(2).any(|w| {
+        let target = w[1]
+            .strip_prefix('#')
+            .or_else(|| w[1].strip_prefix(&url_prefix));
+        let digits = target.map(|t| t.split(|c: char| !c.is_ascii_digit()).next().unwrap_or(""));
+        CLOSING_KEYWORDS.contains(&w[0].trim_end_matches(':'))
+            && digits.and_then(|d| d.parse::<u64>().ok()) == Some(number)
+    })
+}
+
+/// The PR among `prs` whose body closes issue `number` of `repo`, skipping
+/// fork PRs and preferring one whose head is `head`.
+pub fn select_body_closing_pr<'a>(
+    prs: &'a [PrWithBody],
+    repo: &str,
+    number: u64,
+    head: Option<&str>,
+) -> Option<&'a OpenPr> {
+    let matching: Vec<&OpenPr> = prs
+        .iter()
+        .filter(|p| !p.cross_repo && body_closes(&p.body, repo, number))
+        .map(|p| &p.pr)
+        .collect();
+    let preferred = matching
+        .iter()
+        .find(|pr| head.is_some_and(|h| pr.head == h));
+    preferred.or(matching.first()).copied()
+}
+
+/// PRs in `state` (`open`, `merged`, ...) with their bodies, newest first, up
+/// to `PR_SCAN_LIMIT`: what `select_body_closing_pr` searches.
+pub fn list_prs_with_body(repo: &str, state: &str) -> Result<Vec<PrWithBody>> {
+    let fields = format!("{OPEN_PR_FIELDS},body,isCrossRepository");
+    let out = gh(&[
+        "pr",
+        "list",
+        "--repo",
+        repo,
+        "--state",
+        state,
+        "--json",
+        &fields,
+        "--limit",
+        PR_SCAN_LIMIT,
+    ])?;
+    serde_json::from_str(&out).context("parsing PR list JSON")
+}
+
+/// Open a draft PR from `head` into `base` and return its URL.
+pub fn create_draft_pr(
+    repo: &str,
+    head: &str,
+    base: &str,
+    title: &str,
+    body: &str,
+) -> Result<String> {
+    let out = gh(&[
+        "pr", "create", "--repo", repo, "--draft", "--head", head, "--base", base, "--title",
+        title, "--body", body,
+    ])?;
+    out.lines()
+        .last()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .context("gh pr create printed no PR URL")
+}
+
+/// Name of the repo's default branch on GitHub.
+pub fn default_branch(repo: &str) -> Result<String> {
+    let q = ".defaultBranchRef.name";
+    let out = gh(&["repo", "view", repo, "--json", "defaultBranchRef", "-q", q])?;
+    let name = out.trim();
+    if name.is_empty() {
+        anyhow::bail!("gh reported no default branch for {repo}");
+    }
+    Ok(name.to_string())
 }
 
 pub fn add_label_to_issue(repo: &str, issue_number: u64, label: &str) -> Result<()> {
@@ -562,6 +783,7 @@ pub fn list_unlearned_plans(repo: &str) -> Result<Vec<PlanIssue>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     const REPO: &str = "owner/repo";
 
@@ -656,5 +878,50 @@ mod tests {
     fn uses_latest_close_event() {
         let nodes = format!("[{},{}]", closed(&pr(1, "MERGED", REPO)), closed("null"));
         assert_eq!(pick(&nodes), None);
+    }
+
+    #[test]
+    fn closing_pr_numbers_keep_this_repo_only() {
+        let json = r#"{"closedByPullRequestsReferences":[
+            {"number":147,"repository":{"name":"repo","owner":{"login":"Owner"}},"url":"u"},
+            {"number":9,"repository":{"name":"fork","owner":{"login":"someone"}},"url":"u"}
+        ]}"#;
+        assert_eq!(parse_closing_pr_numbers(json, REPO).unwrap(), vec![147]);
+    }
+
+    #[rstest]
+    #[case::closes("Work in progress.\n\nCloses #145", true)]
+    #[case::lowercase_and_period("fixes #145.", true)]
+    #[case::colon("Resolves: #145", true)]
+    #[case::issue_url_any_case("Closes https://github.com/owner/Repo/issues/145", true)]
+    #[case::longer_number_url("Closes https://github.com/owner/repo/issues/1450", false)]
+    #[case::other_repo_url("Closes https://github.com/other/repo/issues/145", false)]
+    #[case::longer_number("Closes #1450", false)]
+    #[case::number_prefix("Closes #14", false)]
+    #[case::no_keyword("See #145", false)]
+    #[case::other_repo_ref("Closes other/repo#145", false)]
+    fn body_closes_matches_keyword_and_exact_number(#[case] body: &str, #[case] closes: bool) {
+        assert_eq!(body_closes(body, REPO, 145), closes);
+    }
+
+    #[rstest]
+    #[case::first_match(None, "u2")]
+    #[case::the_branch_preferred(Some("c"), "u3")]
+    #[case::unknown_branch(Some("zz"), "u2")]
+    fn select_body_closing_pr_skips_forks_and_prefers_the_branch(
+        #[case] head: Option<&str>,
+        #[case] want: &str,
+    ) {
+        let prs: Vec<PrWithBody> = serde_json::from_str(
+            r#"[
+            {"url":"u1","baseRefName":"main","headRefName":"a","isDraft":true,"title":"t","body":"Closes #1450"},
+            {"url":"u0","baseRefName":"main","headRefName":"b","isDraft":true,"title":"t","body":"Closes #145","isCrossRepository":true},
+            {"url":"u2","baseRefName":"a","headRefName":"b","isDraft":true,"title":"t","body":"WIP\n\nCloses #145"},
+            {"url":"u3","baseRefName":"main","headRefName":"c","isDraft":true,"title":"t","body":"Closes #145"}
+        ]"#,
+        )
+        .unwrap();
+        let got = select_body_closing_pr(&prs, REPO, 145, head).map(|p| p.url.as_str());
+        assert_eq!(got, Some(want));
     }
 }
