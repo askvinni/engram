@@ -36,7 +36,7 @@ impl Default for MemoryConfig {
 }
 
 /// `[dispatch]`: templates for the branches and draft PRs `engram dispatch`
-/// creates (see `dispatch::render` for the placeholders).
+/// creates (see `dispatch::fill_template` for the placeholders).
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct DispatchConfig {

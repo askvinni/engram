@@ -20,7 +20,6 @@ const TOOLS: &[(&str, &str)] = &[
     ("claude", "--version"),
 ];
 const SLUG_MAX: usize = 40;
-const PENDING_KATA_REF: &str = "<kata-ref>";
 
 /// Paths of the tools dispatch runs itself (gh and kata go through github.rs
 /// and kata.rs by name; preflight only checks that they work).
@@ -52,7 +51,7 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-fn probe(repo_root: &Path) -> (BTreeMap<&'static str, PathBuf>, Vec<String>) {
+fn check_tools(repo_root: &Path) -> (BTreeMap<&'static str, PathBuf>, Vec<String>) {
     let path_var = std::env::var_os("PATH");
     let mut found = BTreeMap::new();
     let mut missing = Vec::new();
@@ -72,11 +71,11 @@ fn probe(repo_root: &Path) -> (BTreeMap<&'static str, PathBuf>, Vec<String>) {
         }
     }
     let kata_bound = repo_root.join(".kata.toml").exists();
-    let why = reasons(&missing, found.contains_key("kata"), kata_bound);
-    (found, why)
+    let problems = tool_problems(&missing, found.contains_key("kata"), kata_bound);
+    (found, problems)
 }
 
-fn reasons(missing: &[&str], kata_installed: bool, kata_bound: bool) -> Vec<String> {
+fn tool_problems(missing: &[&str], kata_installed: bool, kata_bound: bool) -> Vec<String> {
     let mut out = Vec::new();
     if !missing.is_empty() {
         out.push(format!("missing: {}", missing.join(", ")));
@@ -90,11 +89,11 @@ fn reasons(missing: &[&str], kata_installed: bool, kata_bound: bool) -> Vec<Stri
 }
 
 pub fn unavailable_reasons(repo_root: &Path) -> Vec<String> {
-    probe(repo_root).1
+    check_tools(repo_root).1
 }
 
 pub fn preflight(repo_root: &Path) -> Result<Toolchain> {
-    let (mut found, problems) = probe(repo_root);
+    let (mut found, problems) = check_tools(repo_root);
     if !problems.is_empty() {
         anyhow::bail!("engram dispatch can't run: {}", problems.join("; "));
     }
@@ -110,9 +109,11 @@ pub fn preflight(repo_root: &Path) -> Result<Toolchain> {
     })
 }
 
-#[derive(Debug, Clone, Default)]
-struct TemplateVars {
+/// What `[dispatch]` templates can say about a plan issue.
+#[derive(Debug, Default)]
+struct PlanFields {
     number: u64,
+    /// The plan's kata mirror, used only in the hint for missing metadata.
     kata_ref: Option<String>,
     title: String,
     meta: BTreeMap<String, String>,
@@ -160,73 +161,58 @@ fn slugify(title: &str) -> String {
     slug.trim_end_matches('-').to_string()
 }
 
-fn render(template: &str, vars: &TemplateVars) -> Result<String> {
+/// `template` with each `{name}` replaced by its value for `plan`. Every
+/// missing `{meta[key]}` is reported at once.
+fn fill_template(template: &str, plan: &PlanFields) -> Result<String> {
     let bad = |why: String| anyhow::anyhow!("bad template `{template}`: {why}");
     let mut out = String::new();
-    let mut chars = template.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '{' | '}' if chars.peek() == Some(&c) => {
-                chars.next();
-                out.push(c);
-            }
-            '}' => return Err(bad("unmatched `}` (use `}}` for a literal brace)".into())),
-            '{' => {
-                let mut name = String::new();
-                loop {
-                    match chars.next() {
-                        Some('}') => break,
-                        Some('{') | None => {
-                            return Err(bad("unclosed `{` (use `{{` for a literal brace)".into()))
-                        }
-                        Some(ch) => name.push(ch),
-                    }
-                }
-                out.push_str(&expand(&name, vars).map_err(bad)?);
-            }
-            c => out.push(c),
+    let mut missing_meta: Vec<&str> = Vec::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let close = after.find('}').ok_or_else(|| bad("unclosed `{`".into()))?;
+        let name = &after[..close];
+        match name.strip_prefix("meta[").and_then(|r| r.strip_suffix(']')) {
+            Some(key) => match plan.meta.get(key) {
+                Some(value) => out.push_str(value),
+                None if !missing_meta.contains(&key) => missing_meta.push(key),
+                None => {}
+            },
+            None => out.push_str(&placeholder_value(name, plan).ok_or_else(|| {
+                bad(format!(
+                    "unknown placeholder `{{{name}}}` (expected number, title, slug or meta[key])"
+                ))
+            })?),
         }
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    if !missing_meta.is_empty() {
+        let kata_ref = plan.kata_ref.as_deref().unwrap_or("<kata-ref>");
+        let keys: Vec<String> = missing_meta.iter().map(|k| format!("'{k}'")).collect();
+        let hints: Vec<String> = missing_meta
+            .iter()
+            .map(|k| format!("kata meta set {kata_ref} {k} <value>"))
+            .collect();
+        return Err(bad(format!(
+            "plan #{} has no kata metadata {} ({})",
+            plan.number,
+            keys.join(", "),
+            hints.join("; ")
+        )));
     }
     Ok(out)
 }
 
-fn expand(name: &str, vars: &TemplateVars) -> std::result::Result<String, String> {
-    let n = vars.number;
-    if let Some(key) = name.strip_prefix("meta[").and_then(|r| r.strip_suffix(']')) {
-        let kata_ref = vars.kata_ref.as_deref().unwrap_or(PENDING_KATA_REF);
-        return vars.meta.get(key).cloned().ok_or_else(|| {
-            format!(
-                "plan #{n} has no kata metadata '{key}' (kata meta set {kata_ref} {key} <value>)"
-            )
-        });
-    }
+/// The value of a non-meta placeholder, or `None` if `name` isn't one.
+fn placeholder_value(name: &str, plan: &PlanFields) -> Option<String> {
     match name {
-        "number" => Ok(n.to_string()),
-        "kata_ref" => vars
-            .kata_ref
-            .clone()
-            .ok_or_else(|| format!("plan #{n} has no kata mirror for {{kata_ref}}")),
-        "title" => Ok(vars.title.clone()),
-        "slug" => Ok(slugify(&vars.title)),
-        other => Err(format!(
-            "unknown placeholder `{{{other}}}` (expected number, kata_ref, title, slug or meta[key])"
-        )),
+        "number" => Some(plan.number.to_string()),
+        "title" => Some(plan.title.clone()),
+        "slug" => Some(slugify(&plan.title)),
+        _ => None,
     }
-}
-
-/// Render before the plan may have a mirror: a `{kata_ref}` that doesn't exist
-/// yet shows as `PENDING_KATA_REF`, and the result is flagged pending.
-fn render_planned(template: &str, vars: &TemplateVars) -> Result<(String, bool)> {
-    if vars.kata_ref.is_some() {
-        return Ok((render(template, vars)?, false));
-    }
-    let shown = TemplateVars {
-        kata_ref: Some(PENDING_KATA_REF.to_string()),
-        ..vars.clone()
-    };
-    let text = render(template, &shown)?;
-    // Only kata_ref differs, so a failure here means the template uses it.
-    Ok((text, render(template, vars).is_err()))
 }
 
 #[cfg(test)]
@@ -234,8 +220,8 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
-    fn vars(kata_ref: Option<&str>) -> TemplateVars {
-        TemplateVars {
+    fn plan(kata_ref: Option<&str>) -> PlanFields {
+        PlanFields {
             number: 142,
             kata_ref: kata_ref.map(Into::into),
             title: "Add dispatch preflight!".into(),
@@ -246,51 +232,35 @@ mod tests {
         }
     }
 
-    /// The expected value, or text the error's full message contains.
-    type Want<T> = std::result::Result<T, &'static str>;
-
-    fn assert_result<T: PartialEq + std::fmt::Debug>(got: Result<T>, want: Want<T>) {
-        match (got, want) {
-            (Ok(got), Ok(want)) => assert_eq!(got, want),
-            (Err(e), Err(part)) => assert!(format!("{e:#}").contains(part), "{e:#}"),
-            (got, want) => panic!("got {got:?}, want {want:?}"),
-        }
-    }
-
     #[rstest]
     #[case::all_placeholders(
-        "{meta[type]}/{meta[jira]}/{number}-{kata_ref}-{slug}: {title}",
+        "{meta[type]}/{meta[jira]}/{number}-{slug}: {title}",
         Some("a56d"),
-        Ok("feat/ENG-7/142-a56d-add-dispatch-preflight: Add dispatch preflight!")
+        Ok("feat/ENG-7/142-add-dispatch-preflight: Add dispatch preflight!")
     )]
-    #[case::escaped_braces("{{x}} {number}}}", None, Ok("{x} 142}"))]
-    #[case::missing_meta("{meta[team]}", Some("a56d"), Err("(kata meta set a56d team <value>)"))]
-    #[case::missing_meta_and_mirror("{meta[team]}", None, Err("kata meta set <kata-ref> team"))]
-    #[case::missing_mirror("{kata_ref}", None, Err("no kata mirror"))]
+    #[case::stray_close_brace_is_literal("{number}}", None, Ok("142}"))]
+    #[case::missing_meta(
+        "{meta[team]}-{meta[jira]}-{meta[area]}-{meta[team]}",
+        Some("a56d"),
+        Err(
+            "plan #142 has no kata metadata 'team', 'area' \
+             (kata meta set a56d team <value>; kata meta set a56d area <value>)"
+        )
+    )]
+    #[case::missing_meta_without_mirror("{meta[team]}", None, Err("kata meta set <kata-ref> team"))]
+    #[case::kata_ref_is_gone("{kata_ref}", Some("a56d"), Err("unknown placeholder `{kata_ref}`"))]
     #[case::unknown_placeholder("{short_id}-{slug}", None, Err("unknown placeholder `{short_id}`"))]
     #[case::unclosed("{number", None, Err("unclosed `{`"))]
-    #[case::nested("{num{ber}", None, Err("unclosed `{`"))]
-    #[case::unmatched_close("number}", None, Err("unmatched `}`"))]
-    fn render_fills_placeholders_or_explains(
+    fn fill_template_fills_placeholders_or_explains(
         #[case] template: &str,
         #[case] kata_ref: Option<&str>,
-        #[case] want: Want<&str>,
+        #[case] want: std::result::Result<&str, &str>,
     ) {
-        assert_result(render(template, &vars(kata_ref)), want.map(Into::into));
-    }
-
-    #[rstest]
-    #[case::pending("{kata_ref}-{slug}", None, Ok(("<kata-ref>-add-dispatch-preflight", true)))]
-    #[case::unused("{number}-{slug}", None, Ok(("142-add-dispatch-preflight", false)))]
-    #[case::present("{kata_ref}", Some("a56d"), Ok(("a56d", false)))]
-    #[case::other_errors_still_fail("{kata_ref}-{meta[team]}", None, Err("metadata 'team'"))]
-    fn render_planned_marks_missing_kata_ref_pending(
-        #[case] template: &str,
-        #[case] kata_ref: Option<&str>,
-        #[case] want: Want<(&str, bool)>,
-    ) {
-        let got = render_planned(template, &vars(kata_ref));
-        assert_result(got, want.map(|(text, pending)| (text.into(), pending)));
+        match (fill_template(template, &plan(kata_ref)), want) {
+            (Ok(got), Ok(want)) => assert_eq!(got, want),
+            (Err(e), Err(part)) => assert!(e.to_string().contains(part), "{e}"),
+            (got, want) => panic!("got {got:?}, want {want:?}"),
+        }
     }
 
     #[rstest]
@@ -335,12 +305,12 @@ mod tests {
     #[case::unbound(&[], true, false, &["repo not bound to kata, run `kata init`"])]
     #[case::binding_unchecked_without_kata(&["kata"], false, false, &["missing: kata"])]
     #[case::ready(&[], true, true, &[])]
-    fn reasons_cases(
+    fn tool_problems_cases(
         #[case] missing: &[&str],
         #[case] kata_installed: bool,
         #[case] kata_bound: bool,
         #[case] want: &[&str],
     ) {
-        assert_eq!(reasons(missing, kata_installed, kata_bound), want);
+        assert_eq!(tool_problems(missing, kata_installed, kata_bound), want);
     }
 }
