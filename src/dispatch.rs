@@ -3,8 +3,9 @@
 //! Dispatch is the only engram command that needs kwt, tmux and kata, so it
 //! checks for them up front (`preflight`) instead of degrading silently.
 //!
-//! Plans and objectives share one pipeline: gather items, plan each without
-//! mutating anything, confirm, then execute one at a time.
+//! Plans and objectives share one pipeline: collect the plan issues to
+//! dispatch (an objective contributes its unblocked nodes' plans), plan each
+//! without mutating anything, confirm, then carry them out one at a time.
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -48,8 +49,6 @@ const CLAUDE_OVERRIDE_ENV: &str = "ENGRAM_DISPATCH_CLAUDE";
 const PROMPT_SUBDIR: &str = "engram/dispatch";
 const READY_NO_RELAUNCH: &str = "PR is ready for review \u{2014} not relaunching";
 const LAUNCHED: &str = "launched";
-/// Outcome of a dispatch that started a new Claude session.
-const NEWLY_LAUNCHED: &str = "newly launched";
 /// `git ls-remote --exit-code` exits 2 when the ref is absent.
 const LS_REMOTE_NO_MATCH: i32 = 2;
 
@@ -287,39 +286,9 @@ pub struct DispatchOptions {
     pub no_launch: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum Work {
-    Plan(u64),
-    NewPlan { objective: u64, node_id: String },
-}
-
-#[derive(Debug)]
-struct Item {
-    work: Work,
-}
-
-impl Item {
-    fn name(&self) -> String {
-        match &self.work {
-            Work::Plan(n) => format!("#{n}"),
-            Work::NewPlan { objective, node_id } => format!("node {node_id} of #{objective}"),
-        }
-    }
-}
-
-/// A plan's pushed branch and PR URL, set once both exist.
-type Placed = (String, String);
-
-#[derive(Debug)]
-struct ObjectiveArg {
-    title: String,
-    body: String,
-    nodes: Vec<ObjectiveNode>,
-}
-
 /// Refuse anything but an open plan (plan label) or objective (node list; the
 /// objective label alone is an error), including plain kata issues.
-fn check_kind(number: u64, issue: &github::Issue, has_nodes: bool) -> Result<()> {
+fn require_plan_or_objective(number: u64, issue: &github::Issue, has_nodes: bool) -> Result<()> {
     if issue.is_pull_request() {
         anyhow::bail!("#{number} is a pull request, not an engram-plan or engram-objective issue");
     }
@@ -342,30 +311,22 @@ fn check_kind(number: u64, issue: &github::Issue, has_nodes: bool) -> Result<()>
     Ok(())
 }
 
-/// Unfinished nodes that wait on nothing. `in_progress` counts: creating a
-/// plan marks its node in progress, and the reuse checks (open PR, worktree,
-/// running Claude, ready PR) keep a re-run from launching twice.
-fn dispatch_candidates(nodes: &[ObjectiveNode]) -> Vec<&ObjectiveNode> {
+/// Unfinished nodes that wait on nothing. `in_progress` counts: the reuse
+/// checks (open PR, worktree, running Claude, ready PR) keep a re-run from
+/// launching twice.
+fn ready_nodes(nodes: &[ObjectiveNode]) -> Vec<&ObjectiveNode> {
     nodes
         .iter()
         .filter(|n| n.status != NodeStatus::Done && objective::blocked_by(n, nodes).is_empty())
         .collect()
 }
 
-fn blocked_report(nodes: &[ObjectiveNode]) -> Vec<(String, Vec<&str>)> {
+fn blocked_nodes(nodes: &[ObjectiveNode]) -> Vec<(String, Vec<&str>)> {
     nodes
         .iter()
         .filter(|n| n.status != NodeStatus::Done)
         .map(|n| (n.id.clone(), objective::blocked_by(n, nodes)))
         .filter(|(_, b)| !b.is_empty())
-        .collect()
-}
-
-fn dedup_candidates(items: Vec<Item>) -> Vec<Item> {
-    let mut seen = BTreeSet::new();
-    items
-        .into_iter()
-        .filter(|i| seen.insert(i.work.clone()))
         .collect()
 }
 
@@ -490,7 +451,7 @@ fn needs_claim(owner: Option<&str>, me: &str, kata_ref: &str) -> Result<bool> {
 
 /// Record missing plan issues and mark nodes in progress (done stays done;
 /// unknown IDs are skipped). Returns the IDs that changed, each once.
-fn apply_node_updates(nodes: &mut [ObjectiveNode], updates: &[(String, u64)]) -> Vec<String> {
+fn merge_node_progress(nodes: &mut [ObjectiveNode], updates: &[(String, u64)]) -> Vec<String> {
     let mut changed: Vec<String> = Vec::new();
     for (id, plan) in updates {
         let Some(node) = nodes.iter_mut().find(|n| &n.id == id) else {
@@ -511,7 +472,7 @@ fn apply_node_updates(nodes: &mut [ObjectiveNode], updates: &[(String, u64)]) ->
 
 /// Re-fetch the objective right before writing and apply only node status and
 /// plan-issue changes, so edits made since the run started aren't overwritten.
-fn write_node_updates(repo: &str, number: u64, updates: &[(String, u64)]) -> Result<()> {
+fn record_node_progress(repo: &str, number: u64, updates: &[(String, u64)]) -> Result<()> {
     let body = github::get_issue(repo, number)
         .context("re-fetching objective")?
         .body
@@ -520,7 +481,7 @@ fn write_node_updates(repo: &str, number: u64, updates: &[(String, u64)]) -> Res
         eprintln!("warning: objective #{number} no longer has a node list; not updating it");
         return Ok(());
     };
-    let changed = apply_node_updates(&mut nodes, updates);
+    let changed = merge_node_progress(&mut nodes, updates);
     if changed.is_empty() {
         return Ok(());
     }
@@ -536,8 +497,6 @@ fn write_node_updates(repo: &str, number: u64, updates: &[(String, u64)]) -> Res
     Ok(())
 }
 
-/// The kata actor, resolved like kata does: the first non-empty of
-/// `KATA_AUTHOR` and `USER`, else git's `user.name` (only asked when needed).
 /// The line printed once planning is done: how many plans will be dispatched,
 /// how many of those are reused as already ready, and how many failed to plan.
 fn count_line(planned: usize, ready: usize, failed: usize, no_launch: bool) -> String {
@@ -553,6 +512,8 @@ fn count_line(planned: usize, ready: usize, failed: usize, no_launch: bool) -> S
     )
 }
 
+/// The kata actor, resolved like kata does: the first non-empty of
+/// `KATA_AUTHOR` and `USER`, else git's `user.name` (only asked when needed).
 fn pick_actor(
     env: [Option<String>; 2],
     git_name: impl FnOnce() -> Option<String>,
@@ -587,17 +548,8 @@ struct MirrorInfo {
     parent: Option<String>,
 }
 
-fn node_work(objective: u64, n: &ObjectiveNode) -> Work {
-    match n.plan_issue {
-        Some(plan) => Work::Plan(plan),
-        None => Work::NewPlan {
-            objective,
-            node_id: n.id.clone(),
-        },
-    }
-}
-
-type Updates = BTreeMap<u64, Vec<(String, u64)>>;
+/// Per objective, the `(node ID, plan)` pairs to mark in progress.
+type NodeProgress = BTreeMap<u64, Vec<(String, u64)>>;
 
 struct Run<'a> {
     root: &'a Path,
@@ -609,7 +561,7 @@ struct Run<'a> {
     default: OnceCell<String>,
     actor: OnceCell<String>,
     /// Objective issues' (title, body), fetched at most once per run.
-    objective_issues: RefCell<BTreeMap<u64, (String, String)>>,
+    objectives: RefCell<BTreeMap<u64, (String, String)>>,
 }
 
 fn cached<T>(cell: &OnceCell<T>, init: impl FnOnce() -> Result<T>) -> Result<&T> {
@@ -640,99 +592,28 @@ pub fn dispatch(
         open_prs: OnceCell::new(),
         default: OnceCell::new(),
         actor: OnceCell::new(),
-        objective_issues: RefCell::new(BTreeMap::new()),
+        objectives: RefCell::new(BTreeMap::new()),
     };
-    let mut seen = BTreeSet::new();
-    let issues: Vec<u64> = issues.iter().copied().filter(|n| seen.insert(*n)).collect();
-    let mut objectives = BTreeMap::new();
-    let items = run.gather(&issues, &mut objectives)?;
-    if items.is_empty() {
+    let numbers = run.collect_work(issues)?;
+    if numbers.is_empty() {
         println!("Nothing to dispatch.");
         return Ok(());
     }
-
-    // Planning: no mutations.
-    let mut failed = 0usize;
-    let mut planned: Vec<(Item, Option<DispatchPlan>)> = Vec::new();
-    for item in items {
-        let target = match &item.work {
-            Work::NewPlan { objective, node_id } => {
-                println!(
-                    "Would create a plan issue for node {node_id} of objective #{objective}, \
-                     then dispatch it"
-                );
-                None
-            }
-            Work::Plan(number) => match run.plan_dispatch(*number) {
-                Ok(t) => {
-                    print!("{}", format_plan(&t, opts.no_launch));
-                    Some(t)
-                }
-                Err(e) => {
-                    eprintln!("error: #{number}: {e:#}");
-                    failed += 1;
-                    continue;
-                }
-            },
-        };
-        planned.push((item, target));
-    }
-    if planned.is_empty() {
+    let (plans, plan_failed) = run.plan_all(&numbers);
+    if plans.is_empty() {
         anyhow::bail!("nothing to dispatch \u{2014} see errors above");
     }
-    let ready = planned
-        .iter()
-        .filter(|(_, t)| t.as_ref().is_some_and(DispatchPlan::ready))
-        .count();
-    println!(
-        "{}",
-        count_line(planned.len(), ready, failed, opts.no_launch)
-    );
-
-    if !opts.dry_run {
-        if !opts.yes && !confirm()? {
-            anyhow::bail!("dispatch cancelled");
-        }
-
-        let mut updates = Updates::new();
-        let mut summary = Vec::new();
-        let (mut launched, mut reused, mut run_failed) = (0usize, 0usize, 0usize);
-        for (item, target) in planned {
-            let name = item.name();
-            match run.run_item(&mut objectives, item.work, target, &mut updates) {
-                Ok(outcome) => {
-                    if outcome.ends_with(NEWLY_LAUNCHED) {
-                        launched += 1;
-                    } else {
-                        reused += 1;
-                    }
-                    summary.push(format!("{name}: {outcome}"));
-                }
-                Err(e) => {
-                    eprintln!("error: {name}: {e:#}");
-                    summary.push(format!("{name}: failed"));
-                    run_failed += 1;
-                }
-            }
-        }
-        failed += run_failed;
-        for (number, ups) in &updates {
-            if let Err(e) = write_node_updates(repo, *number, ups) {
-                eprintln!("error: updating objective #{number}: {e:#}");
-                failed += 1;
-            }
-        }
-        if summary.len() > 1 {
-            println!("Summary:");
-            for line in &summary {
-                println!("  {line}");
-            }
-        }
-        println!(
-            "Dispatched {} plan(s): {launched} {NEWLY_LAUNCHED}, {reused} reused, {run_failed} failed",
-            launched + reused
+    if opts.dry_run {
+        anyhow::ensure!(
+            plan_failed == 0,
+            "{plan_failed} plan(s) failed — see errors above"
         );
+        return Ok(());
     }
+    if !opts.yes && !confirm()? {
+        anyhow::bail!("dispatch cancelled");
+    }
+    let failed = plan_failed + run.run_all(plans);
     anyhow::ensure!(
         failed == 0,
         "{failed} dispatch(es) failed — see errors above"
@@ -784,49 +665,115 @@ impl Run<'_> {
         .map(String::as_str)
     }
 
-    fn fetch_arg(&self, number: u64) -> Result<(github::Issue, Option<Vec<ObjectiveNode>>)> {
+    fn fetch_argument_issue(
+        &self,
+        number: u64,
+    ) -> Result<(github::Issue, Option<Vec<ObjectiveNode>>)> {
         let issue = github::get_issue(self.repo, number)
             .with_context(|| format!("fetching issue #{number}"))?;
         let nodes = objective::parse_nodes_from_comment(issue.body.as_deref().unwrap_or(""));
-        check_kind(number, &issue, nodes.is_some())?;
+        require_plan_or_objective(number, &issue, nodes.is_some())?;
         Ok((issue, nodes))
     }
 
-    fn gather(
-        &self,
-        issues: &[u64],
-        objectives: &mut BTreeMap<u64, ObjectiveArg>,
-    ) -> Result<Vec<Item>> {
-        let mut items = Vec::new();
+    /// The plan issues to dispatch, each once: plan arguments as given, and
+    /// for an objective its ready nodes' plans. Blocked nodes and ready nodes
+    /// without a plan issue are listed and skipped.
+    fn collect_work(&self, issues: &[u64]) -> Result<Vec<u64>> {
+        let (mut plans, mut seen) = (Vec::new(), BTreeSet::new());
         for &number in issues {
-            let (issue, nodes) = self.fetch_arg(number)?;
+            if !seen.insert(number) {
+                continue;
+            }
+            let (issue, nodes) = self.fetch_argument_issue(number)?;
             let Some(nodes) = nodes else {
-                items.push(Item {
-                    work: Work::Plan(number),
-                });
+                plans.push(number);
                 continue;
             };
-            let blocked = blocked_report(&nodes);
+            let blocked = blocked_nodes(&nodes);
             if !blocked.is_empty() {
                 println!("Objective #{number}: blocked nodes");
                 for (id, blockers) in &blocked {
                     println!("  {id}  waits on {}", blockers.join(", "));
                 }
             }
-            let candidates = dispatch_candidates(&nodes);
-            if candidates.is_empty() {
+            let ready = ready_nodes(&nodes);
+            if ready.is_empty() {
                 println!("Objective #{number}: no unblocked nodes to dispatch");
             }
-            items.extend(candidates.into_iter().map(|n| Item {
-                work: node_work(number, n),
-            }));
-            let (title, body) = (issue.title, issue.body.unwrap_or_default());
-            self.objective_issues
+            for node in ready {
+                match node.plan_issue {
+                    Some(plan) => {
+                        if seen.insert(plan) {
+                            plans.push(plan);
+                        }
+                    }
+                    None => println!(
+                        "Objective #{number}: skip node {}: no plan issue yet \u{2014} run \
+                         `engram objective plan {number} --node {}` (or --all-unblocked)",
+                        node.id, node.id
+                    ),
+                }
+            }
+            self.objectives
                 .borrow_mut()
-                .insert(number, (title.clone(), body.clone()));
-            objectives.insert(number, ObjectiveArg { title, body, nodes });
+                .insert(number, (issue.title, issue.body.unwrap_or_default()));
         }
-        Ok(dedup_candidates(items))
+        Ok(plans)
+    }
+
+    /// Plan each issue without mutating anything, printing each plan and then
+    /// the count line. Returns the plans and how many failed.
+    fn plan_all(&self, numbers: &[u64]) -> (Vec<DispatchPlan>, usize) {
+        let mut plans = Vec::new();
+        let mut failed = 0;
+        for &number in numbers {
+            match self.plan_dispatch(number) {
+                Ok(plan) => {
+                    print!("{}", format_plan(&plan, self.opts.no_launch));
+                    plans.push(plan);
+                }
+                Err(e) => {
+                    eprintln!("error: #{number}: {e:#}");
+                    failed += 1;
+                }
+            }
+        }
+        let ready = plans.iter().filter(|p| p.ready()).count();
+        println!(
+            "{}",
+            count_line(plans.len(), ready, failed, self.opts.no_launch)
+        );
+        (plans, failed)
+    }
+
+    /// Carry out each plan, then mark dispatched objective nodes in progress
+    /// and print the tally. Returns how many failed.
+    fn run_all(&self, plans: Vec<DispatchPlan>) -> usize {
+        let mut progress = NodeProgress::new();
+        let (mut launched, mut reused, mut failed) = (0usize, 0usize, 0usize);
+        for mut plan in plans {
+            match self.dispatch_one(&mut plan, &mut progress) {
+                Ok(true) => launched += 1,
+                Ok(false) => reused += 1,
+                Err(e) => {
+                    eprintln!("error: #{}: {e:#}", plan.number);
+                    failed += 1;
+                }
+            }
+        }
+        let mut objective_failed = 0;
+        for (number, nodes) in &progress {
+            if let Err(e) = record_node_progress(self.repo, *number, nodes) {
+                eprintln!("error: updating objective #{number}: {e:#}");
+                objective_failed += 1;
+            }
+        }
+        println!(
+            "Dispatched {} plan(s): {launched} newly launched, {reused} reused, {failed} failed",
+            launched + reused
+        );
+        failed + objective_failed
     }
 
     /// For a plan with an `Objective: #N (node X)` marker: the objective's
@@ -840,7 +787,7 @@ impl Run<'_> {
         let Some((obj, node_id)) = objective::parse_objective_marker(plan_body) else {
             return Ok(None);
         };
-        let cached = self.objective_issues.borrow().get(&obj).cloned();
+        let cached = self.objectives.borrow().get(&obj).cloned();
         let (title, body) = match cached {
             Some(v) => v,
             None => {
@@ -848,7 +795,7 @@ impl Run<'_> {
                     format!("reading objective #{obj} of plan #{number} (node {node_id})")
                 })?;
                 let v = (issue.title, issue.body.unwrap_or_default());
-                self.objective_issues.borrow_mut().insert(obj, v.clone());
+                self.objectives.borrow_mut().insert(obj, v.clone());
                 v
             }
         };
@@ -889,7 +836,7 @@ impl Run<'_> {
         if issue.has_label(OBJECTIVE_LABEL) {
             anyhow::bail!("#{number} is an engram-objective, not a plan issue");
         }
-        check_kind(number, &issue, false)?;
+        require_plan_or_objective(number, &issue, false)?;
         let body = issue.body.unwrap_or_default();
         let objective = self.objective_of(number, &body)?;
         let mirror = self.find_mirror(number, &issue.title, &body, objective.as_ref())?;
@@ -1065,84 +1012,25 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// Execute one planned item, creating its plan first for a new node. Once
-    /// the branch and PR exist, the objective node is queued to be marked in
-    /// progress, even if a later step fails.
-    fn run_item(
-        &self,
-        objectives: &mut BTreeMap<u64, ObjectiveArg>,
-        work: Work,
-        target: Option<DispatchPlan>,
-        updates: &mut Updates,
-    ) -> Result<String> {
-        let (mut t, created) = match (target, work) {
-            (Some(t), _) => (t, None),
-            (None, Work::NewPlan { objective, node_id }) => {
-                let number = self.create_node_plan(objectives, objective, &node_id)?;
-                (self.plan_dispatch(number)?, Some(number))
-            }
-            (None, Work::Plan(n)) => anyhow::bail!("#{n} was not planned"),
-        };
-        if created.is_some() {
-            print!("{}", format_plan(&t, self.opts.no_launch));
-        }
-        let mut placed = None;
-        let result = self.carry_out(&mut t, &mut placed);
-        if let (Some(_), Some((objective, node_id))) = (placed, &t.objective_node) {
-            updates
+    /// Carry out one plan. Once its branch and PR exist, its objective node is
+    /// queued to be marked in progress, even if a later step fails.
+    fn dispatch_one(&self, plan: &mut DispatchPlan, progress: &mut NodeProgress) -> Result<bool> {
+        let mut has_pr = false;
+        let result = self.carry_out(plan, &mut has_pr);
+        if let (true, Some((objective, node_id))) = (has_pr, &plan.objective_node) {
+            progress
                 .entry(*objective)
                 .or_default()
-                .push((node_id.clone(), t.number));
+                .push((node_id.clone(), plan.number));
         }
-        let outcome = result?;
-        Ok(match created {
-            Some(n) => format!("created #{n}; {outcome}"),
-            None => outcome,
-        })
+        result
     }
 
-    /// Create the plan issue for an objective node through the same path as
-    /// `engram objective plan`, and record it on the objective right away so an
-    /// interrupted run can't orphan it or create a duplicate next time.
-    fn create_node_plan(
-        &self,
-        objectives: &mut BTreeMap<u64, ObjectiveArg>,
-        objective: u64,
-        node_id: &str,
-    ) -> Result<u64> {
-        let obj = objectives
-            .get_mut(&objective)
-            .with_context(|| format!("objective #{objective} was not loaded"))?;
-        let idx = obj
-            .nodes
-            .iter()
-            .position(|n| n.id == node_id)
-            .with_context(|| format!("node {node_id} not found in objective #{objective}"))?;
-        eprintln!("plan: generating a plan issue for node {node_id} (this calls Claude)");
-        let url = objective::create_plan_for_node(
-            self.repo,
-            objective,
-            &obj.title,
-            &obj.body,
-            &mut obj.nodes,
-            idx,
-            None,
-            &kata::TrackerMeta::default(),
-            false,
-        )?;
-        eprintln!("plan: created {url}");
-        let number = obj.nodes[idx]
-            .plan_issue
-            .with_context(|| format!("node {node_id} has no plan issue after creating {url}"))?;
-        write_node_updates(self.repo, objective, &[(node_id.to_string(), number)]).with_context(|| {
-            format!("created #{number} but could not record it on objective #{objective}; not dispatching it")
-        })?;
-        Ok(number)
-    }
-
-    /// Carry out a confirmed plan and print its report. Every step looks up
-    /// existing state first, so a re-run after a partial failure resumes.
-    fn carry_out(&self, t: &mut DispatchPlan, placed: &mut Option<Placed>) -> Result<String> {
+    /// Carry out a confirmed plan and print its report; `Ok(true)` when it
+    /// launched a new Claude session. `has_pr` is set once the branch and PR
+    /// exist. Every step looks up existing state first, so a re-run after a
+    /// partial failure resumes.
+    fn carry_out(&self, t: &mut DispatchPlan, has_pr: &mut bool) -> Result<bool> {
         let (kata_ref, claimed_by_me, created) = match &t.kata_ref {
             Some(r) => (r.clone(), t.claimed_by_me, false),
             // Same idempotency key as `plan new`, so the two paths can't
@@ -1202,7 +1090,7 @@ impl Run<'_> {
                 url
             }
         };
-        *placed = Some((t.branch.clone(), pr_url.clone()));
+        *has_pr = true;
 
         let worktree = match &t.worktree {
             Some(path) => {
@@ -1243,11 +1131,7 @@ impl Run<'_> {
             t.base,
             worktree.display()
         );
-        Ok(if launch == LAUNCHED {
-            NEWLY_LAUNCHED.to_string()
-        } else {
-            format!("reused ({launch})")
-        })
+        Ok(launch == LAUNCHED)
     }
 
     /// Create the branch without checking anything out, so the user's checkout
@@ -1817,7 +1701,7 @@ mod tests {
     #[case::objective_without_nodes("OPEN", &[OBJECTIVE_LABEL], false, Err("without a node list"))]
     #[case::unlabelled("OPEN", &[], false, Err("neither"))]
     #[case::closed("CLOSED", &[PLAN_LABEL], false, Err("not open"))]
-    fn check_kind_refuses_closed_and_unlabelled_issues(
+    fn require_plan_or_objective_refuses_closed_and_unlabelled_issues(
         #[case] state: &str,
         #[case] labels: &[&str],
         #[case] has_nodes: bool,
@@ -1832,7 +1716,7 @@ mod tests {
             labels: labels.collect(),
             url: url.into(),
         };
-        assert_result(check_kind(1, &issue, has_nodes), want);
+        assert_result(require_plan_or_objective(1, &issue, has_nodes), want);
     }
 
     fn node(id: &str, status: NodeStatus, deps: &[&str]) -> ObjectiveNode {
@@ -1864,13 +1748,10 @@ mod tests {
             planned("6", Done, &["3"], 60),
         ];
         // In-progress 2 counts; 5's unknown dependency doesn't block; done never qualifies.
-        let picked: Vec<&str> = dispatch_candidates(&nodes)
-            .iter()
-            .map(|n| n.id.as_str())
-            .collect();
+        let picked: Vec<&str> = ready_nodes(&nodes).iter().map(|n| n.id.as_str()).collect();
         assert_eq!(picked, ["2", "5"]);
         assert_eq!(
-            blocked_report(&nodes),
+            blocked_nodes(&nodes),
             vec![
                 ("3".to_string(), vec!["2"]),
                 ("4".to_string(), vec!["2", "3"])
@@ -1879,7 +1760,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_node_updates_records_plan_and_progress_only() {
+    fn merge_node_progress_records_plan_and_progress_only() {
         let mut nodes = vec![
             node("1", Pending, &[]),
             planned("2", InProgress, &[], 20),
@@ -1888,39 +1769,18 @@ mod tests {
         let up = |id: &str, plan: u64| (id.to_string(), plan);
         let updates =
             [("1", 10), ("1", 10), ("2", 99), ("3", 30), ("9.9", 1)].map(|(id, n)| up(id, n));
-        let changed = apply_node_updates(&mut nodes, &updates);
+        let changed = merge_node_progress(&mut nodes, &updates);
         assert_eq!(changed, vec!["1"]);
         assert_eq!(nodes[0].status, InProgress);
         assert_eq!(nodes[0].plan_issue, Some(10));
         // An existing plan issue is never replaced; done stays done.
         assert_eq!(nodes[1].plan_issue, Some(20));
         assert_eq!(nodes[2].status, Done);
-        assert!(apply_node_updates(&mut nodes, &[up("1", 10), up("2", 20)]).is_empty());
-    }
-
-    #[test]
-    fn dedup_candidates_keeps_first_of_each() {
-        let new = |id: &str| Work::NewPlan {
-            objective: 141,
-            node_id: id.into(),
-        };
-        let works = [
-            Work::Plan(142),
-            new("5.2"),
-            Work::Plan(150),
-            Work::Plan(142),
-            new("5.2"),
-        ];
-        let items = works.map(|work| Item { work }).into_iter().collect();
-        let out: Vec<Work> = dedup_candidates(items)
-            .into_iter()
-            .map(|i| i.work)
-            .collect();
-        assert_eq!(out, [Work::Plan(142), new("5.2"), Work::Plan(150)]);
+        assert!(merge_node_progress(&mut nodes, &[up("1", 10), up("2", 20)]).is_empty());
     }
 
     #[rstest]
-    fn check_kind_names_pull_requests(#[values(false, true)] has_nodes: bool) {
+    fn require_plan_or_objective_names_pull_requests(#[values(false, true)] has_nodes: bool) {
         let pr = github::Issue {
             title: String::new(),
             body: None,
@@ -1929,7 +1789,7 @@ mod tests {
             url: "https://github.com/o/r/pull/147".into(),
         };
         assert_result(
-            check_kind(147, &pr, has_nodes),
+            require_plan_or_objective(147, &pr, has_nodes),
             Err("#147 is a pull request, not an"),
         );
     }

@@ -98,7 +98,7 @@ pub enum Commands {
     /// launch Claude in its tmux session
     Dispatch {
         /// engram-plan and/or engram-objective issue numbers; an objective
-        /// dispatches its unblocked nodes, creating missing plan issues
+        /// dispatches its unblocked nodes that already have a plan issue
         #[arg(required = true)]
         issues: Vec<u64>,
         #[command(flatten)]
