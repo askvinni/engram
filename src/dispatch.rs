@@ -6,6 +6,9 @@
 //! Plans and objectives share one pipeline: collect the plan issues to
 //! dispatch (an objective contributes its unblocked nodes' plans), plan each
 //! without mutating anything, confirm, then carry them out one at a time.
+//! `--stack` follows the same steps for one objective's dependency chains: a
+//! stack is only an ordering plus a base policy (each node on its
+//! dependency's branch).
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -284,6 +287,52 @@ pub struct DispatchOptions {
     /// Set everything up but leave the tmux pane at a shell
     #[arg(long)]
     pub no_launch: bool,
+    /// Dispatch one objective's dependency chains as stacked PRs, each
+    /// based on its dependency's branch
+    #[arg(long)]
+    pub stack: bool,
+}
+
+/// What a stack node's branch starts from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Base {
+    /// The default branch.
+    Main,
+    /// The branch of the node with this ID.
+    OnNode(String),
+}
+
+/// An objective node in stack order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StackedNode {
+    node_id: String,
+    base: Base,
+}
+
+/// An objective's unfinished nodes in stack order, and the ones left out.
+#[derive(Debug, PartialEq)]
+struct StackOrder {
+    stacked: Vec<StackedNode>,
+    /// (node ID, why it is skipped)
+    skipped: Vec<(String, String)>,
+}
+
+/// A stack node's branch and PR URL (while planning, the branch stands in
+/// for a PR not opened yet): what dependents start from and what is linked.
+#[derive(Debug, Clone)]
+struct PlacedNode {
+    branch: String,
+    pr: String,
+}
+
+impl PlacedNode {
+    fn of(plan: &DispatchPlan) -> Self {
+        let pr = plan.pr.as_ref().map_or(&plan.branch, |pr| &pr.url);
+        PlacedNode {
+            branch: plan.branch.clone(),
+            pr: pr.clone(),
+        }
+    }
 }
 
 /// Refuse anything but an open plan (plan label) or objective (node list; the
@@ -294,7 +343,12 @@ fn require_plan_or_objective(number: u64, issue: &github::Issue, has_nodes: bool
     }
     let state = &issue.state;
     if !state.eq_ignore_ascii_case("open") {
-        anyhow::bail!("#{number} is not open (state: {state})");
+        let hint = if issue.has_label(PLAN_LABEL) {
+            format!("; if its work merged, run `engram plan land {number}`")
+        } else {
+            String::new()
+        };
+        anyhow::bail!("#{number} is not open (state: {state}){hint}");
     }
     if !has_nodes && issue.has_label(OBJECTIVE_LABEL) {
         anyhow::bail!(
@@ -330,6 +384,122 @@ fn blocked_nodes(nodes: &[ObjectiveNode]) -> Vec<(String, Vec<&str>)> {
         .collect()
 }
 
+/// Order an objective's unfinished nodes for a stack: dependencies first, ties
+/// in objective order. No unfinished dependency: based on the default branch;
+/// one: on its branch; several: on the one that transitively depends on all
+/// the others, else skipped as a diamond (and so are its dependents). Returns
+/// the nodes in order and the skipped ones; fails on a cycle.
+fn order_for_stack(nodes: &[ObjectiveNode]) -> Result<StackOrder> {
+    let unfinished: Vec<&ObjectiveNode> = nodes
+        .iter()
+        .filter(|n| n.status != NodeStatus::Done)
+        .collect();
+    let deps_of = |n| {
+        let mut seen = BTreeSet::new();
+        let mut deps: Vec<&str> = objective::blocked_by(n, nodes);
+        deps.retain(|d| seen.insert(*d));
+        deps
+    };
+    let mut ordered: Vec<&ObjectiveNode> = Vec::new();
+    let mut placed: BTreeSet<&str> = BTreeSet::new();
+    while let Some(next) = unfinished
+        .iter()
+        .find(|n| !placed.contains(n.id.as_str()) && deps_of(n).iter().all(|d| placed.contains(d)))
+    {
+        placed.insert(&next.id);
+        ordered.push(next);
+    }
+    if ordered.len() < unfinished.len() {
+        let stuck: Vec<&str> = unfinished
+            .iter()
+            .map(|n| n.id.as_str())
+            .filter(|id| !placed.contains(id))
+            .collect();
+        anyhow::bail!(
+            "dependency cycle among objective nodes {}; fix their depends_on",
+            stuck.join(", ")
+        );
+    }
+
+    let mut stacked = Vec::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
+    for n in ordered {
+        let deps = deps_of(n);
+        if let Some(dep) = deps.iter().find(|d| skipped.iter().any(|(id, _)| id == *d)) {
+            skipped.push((n.id.clone(), format!("depends on skipped node {dep}")));
+            continue;
+        }
+        let covering = deps.iter().find(|d| {
+            let above = objective::unfinished_ancestors(d, nodes);
+            deps.iter().all(|o| o == *d || above.contains(*o))
+        });
+        let base = match (deps.as_slice(), covering) {
+            ([], _) => Base::Main,
+            (_, Some(d)) => Base::OnNode(d.to_string()),
+            (_, None) => {
+                skipped.push((
+                    n.id.clone(),
+                    format!(
+                        "diamond: waits on {} and none of them depends on the others; \
+                         dispatch it once all but one are done",
+                        deps.join(", ")
+                    ),
+                ));
+                continue;
+            }
+        };
+        stacked.push(StackedNode {
+            node_id: n.id.clone(),
+            base,
+        });
+    }
+    Ok(StackOrder { stacked, skipped })
+}
+
+/// Split stacked nodes into maximal linear chains, bottom to top, each with
+/// the base its bottom sits on. A chain starts on the default branch or below
+/// a node with several stacked children, and follows single children.
+fn straight_chains(nodes: &[StackedNode]) -> Vec<(Base, Vec<String>)> {
+    let children = |id: &str| -> Vec<&str> {
+        nodes
+            .iter()
+            .filter(|t| t.base == Base::OnNode(id.to_string()))
+            .map(|t| t.node_id.as_str())
+            .collect()
+    };
+    nodes
+        .iter()
+        .filter(|t| match &t.base {
+            Base::Main => true,
+            Base::OnNode(parent) => children(parent).len() != 1,
+        })
+        .map(|t| {
+            let mut chain = vec![t.node_id.clone()];
+            while let [only] = children(&chain[chain.len() - 1])[..] {
+                chain.push(only.to_string());
+            }
+            (t.base.clone(), chain)
+        })
+        .collect()
+}
+
+/// The chains worth `gh stack link`: two or more PRs, at least one of them
+/// newly dispatched. Chains made only of reused PRs are left as they are.
+fn chains_to_link(nodes: &[StackedNode], fresh: &BTreeSet<String>) -> Vec<(Base, Vec<String>)> {
+    let mut chains = straight_chains(nodes);
+    chains.retain(|(_, chain)| chain.len() >= 2 && chain.iter().any(|id| fresh.contains(id)));
+    chains
+}
+
+/// The branch a stack node (or chain) based on `base` starts from: `main`,
+/// or its dependency's branch once that is placed (`None` until then).
+fn base_branch(base: &Base, main: &str, placed: &BTreeMap<String, PlacedNode>) -> Option<String> {
+    match base {
+        Base::Main => Some(main.to_string()),
+        Base::OnNode(id) => placed.get(id).map(|p| p.branch.clone()),
+    }
+}
+
 fn confirm() -> Result<bool> {
     if !std::io::stdin().is_terminal() {
         anyhow::bail!("stdin is not a terminal — pass --yes to dispatch without confirmation");
@@ -362,7 +532,8 @@ struct DispatchPlan {
     local: bool,
     remote: bool,
     pr_title: String,
-    /// The base the PR targets: the default branch or a found PR's base.
+    /// The base the PR targets: the default branch, a found PR's base, or in a
+    /// stack the dependency's branch.
     base: String,
     pr: Option<OpenPr>,
     /// How an open PR closing the plan was found; its branch and title then
@@ -371,9 +542,19 @@ struct DispatchPlan {
     worktree: Option<PathBuf>,
     /// `(objective, node ID)` when the plan's marker names an existing node.
     objective_node: Option<(u64, String)>,
+    /// In a stack, the dependency branch the PR is based on (`None` on the
+    /// default branch and outside a stack).
+    stacked_on: Option<String>,
 }
 
 impl DispatchPlan {
+    /// Base a stack node on `base`; a reused PR keeps its own base.
+    fn set_stack_base(&mut self, base: String, main: &str) {
+        self.base = base;
+        let pr_base = self.pr_base();
+        self.stacked_on = (pr_base != main).then(|| pr_base.to_string());
+    }
+
     fn ready(&self) -> bool {
         self.pr.as_ref().is_some_and(|pr| !pr.is_draft)
     }
@@ -434,6 +615,19 @@ fn format_plan(t: &DispatchPlan, no_launch: bool) -> String {
         "Dispatch plan #{}: {}\n  kata:     {kata}\n  branch:   {} \u{2190} {} ({branch_note})\n  \
          PR title: {}{title_note}\n  PR:       {pr}\n  worktree: {worktree}\n  launch:   {launch}\n",
         t.number, t.title, t.branch, t.base, t.pr_title
+    )
+}
+
+fn format_ready_base(t: &DispatchPlan) -> String {
+    let url = t.pr.as_ref().map_or("", |pr| pr.url.as_str());
+    let mismatch = t
+        .base_mismatch()
+        .map(|w| format!(" ({w})"))
+        .unwrap_or_default();
+    format!(
+        "plan #{}: {}\n  PR {url}{mismatch} is ready for review \u{2014} only used as a base \
+         ({} \u{2190} {}); no claim, worktree or session\n",
+        t.number, t.title, t.branch, t.base
     )
 }
 
@@ -551,6 +745,16 @@ struct MirrorInfo {
 /// Per objective, the `(node ID, plan)` pairs to mark in progress.
 type NodeProgress = BTreeMap<u64, Vec<(String, u64)>>;
 
+/// Queue `plan`'s objective node, if any, to be marked in progress.
+fn queue_node_progress(plan: &DispatchPlan, progress: &mut NodeProgress) {
+    if let Some((objective, node_id)) = &plan.objective_node {
+        progress
+            .entry(*objective)
+            .or_default()
+            .push((node_id.clone(), plan.number));
+    }
+}
+
 struct Run<'a> {
     root: &'a Path,
     repo: &'a str,
@@ -573,8 +777,9 @@ fn cached<T>(cell: &OnceCell<T>, init: impl FnOnce() -> Result<T>) -> Result<&T>
 }
 
 /// Plan, confirm and execute `engram dispatch` for any mix of plan and
-/// objective issues. A failure is reported and the rest continue; the command
-/// fails at the end if any did.
+/// objective issues, or (`--stack`) one objective's dependency chains. A
+/// failure is reported and the rest continue (a failed stack node skips its
+/// dependents); the command fails at the end if any did.
 pub fn dispatch(
     repo_root: &Path,
     repo: &str,
@@ -594,6 +799,9 @@ pub fn dispatch(
         actor: OnceCell::new(),
         objectives: RefCell::new(BTreeMap::new()),
     };
+    if opts.stack {
+        return run.dispatch_stack(issues);
+    }
     let numbers = run.collect_work(issues)?;
     if numbers.is_empty() {
         println!("Nothing to dispatch.");
@@ -728,7 +936,7 @@ impl Run<'_> {
         let mut plans = Vec::new();
         let mut failed = 0;
         for &number in numbers {
-            match self.plan_dispatch(number) {
+            match self.plan_dispatch(number, false) {
                 Ok(plan) => {
                     print!("{}", format_plan(&plan, self.opts.no_launch));
                     plans.push(plan);
@@ -753,7 +961,7 @@ impl Run<'_> {
         let mut progress = NodeProgress::new();
         let (mut launched, mut reused, mut failed) = (0usize, 0usize, 0usize);
         for mut plan in plans {
-            match self.dispatch_one(&mut plan, &mut progress) {
+            match self.dispatch_one(&mut plan, &mut progress, &mut None) {
                 Ok(true) => launched += 1,
                 Ok(false) => reused += 1,
                 Err(e) => {
@@ -762,6 +970,18 @@ impl Run<'_> {
                 }
             }
         }
+        self.finish(progress, launched, reused, failed)
+    }
+
+    /// Mark dispatched objective nodes in progress and print the tally.
+    /// Returns how many dispatches and objective updates failed.
+    fn finish(
+        &self,
+        progress: NodeProgress,
+        launched: usize,
+        reused: usize,
+        failed: usize,
+    ) -> usize {
         let mut objective_failed = 0;
         for (number, nodes) in &progress {
             if let Err(e) = record_node_progress(self.repo, *number, nodes) {
@@ -776,13 +996,256 @@ impl Run<'_> {
         failed + objective_failed
     }
 
+    /// `dispatch` for `--stack`: the same steps, with each node based on its
+    /// dependency's branch and linear chains linked with `gh stack link`.
+    fn dispatch_stack(&self, issues: &[u64]) -> Result<()> {
+        let nodes = self.collect_stack_work(issues)?;
+        let main = self.default_branch()?.to_string();
+        let (planned, plan_failed) = self.plan_stack(nodes, &main);
+        if planned.is_empty() && plan_failed > 0 {
+            anyhow::bail!("nothing to dispatch \u{2014} see errors above");
+        }
+        // Done or only reused as a base: nothing to confirm or link.
+        if planned.iter().all(|(_, t)| t.ready()) {
+            println!("Nothing to dispatch.");
+            anyhow::ensure!(
+                plan_failed == 0,
+                "{plan_failed} plan(s) failed — see errors above"
+            );
+            return Ok(());
+        }
+        let chains = self.preview_links(&planned, &main);
+        let ready = planned.iter().filter(|(_, t)| t.ready()).count();
+        println!(
+            "{}",
+            count_line(planned.len(), ready, plan_failed, self.opts.no_launch)
+        );
+        if self.opts.dry_run {
+            anyhow::ensure!(
+                plan_failed == 0,
+                "{plan_failed} plan(s) failed — see errors above"
+            );
+            return Ok(());
+        }
+        if !self.opts.yes && !confirm()? {
+            anyhow::bail!("dispatch cancelled");
+        }
+        let failed = plan_failed + self.run_stack(planned, &chains, &main);
+        anyhow::ensure!(
+            failed == 0,
+            "{failed} dispatch(es) failed — see errors above"
+        );
+        Ok(())
+    }
+
+    /// The objective's unfinished nodes in stack order, with their plan
+    /// issues. Diamonds, nodes without a plan issue and (when planned) their
+    /// dependents are listed and skipped.
+    fn collect_stack_work(&self, issues: &[u64]) -> Result<Vec<(StackedNode, u64)>> {
+        let &[number] = issues else {
+            anyhow::bail!(
+                "--stack takes exactly one engram-objective issue, got {}",
+                issues.len()
+            );
+        };
+        let (issue, nodes) = self.fetch_argument_issue(number)?;
+        let Some(nodes) = nodes else {
+            anyhow::bail!(
+                "--stack needs an engram-objective issue; #{number} is a plan \u{2014} \
+                 dispatch it without --stack"
+            );
+        };
+        let StackOrder { stacked, skipped } = order_for_stack(&nodes)?;
+        println!(
+            "Objective #{number}: stacked dispatch onto {}",
+            self.default_branch()?
+        );
+        for (id, why) in &skipped {
+            println!("  skip node {id}: {why}");
+        }
+        self.objectives
+            .borrow_mut()
+            .insert(number, (issue.title, issue.body.unwrap_or_default()));
+        let mut out = Vec::new();
+        for s in stacked {
+            let id = &s.node_id;
+            match nodes
+                .iter()
+                .find(|n| &n.id == id)
+                .and_then(|n| n.plan_issue)
+            {
+                Some(plan) => out.push((s, plan)),
+                None => println!(
+                    "  skip node {id}: no plan issue yet \u{2014} run \
+                     `engram objective plan {number} --node {id}`"
+                ),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Plan each stack node on its dependency's branch, changing nothing. A
+    /// node whose dependency wasn't planned is skipped, since its base branch
+    /// won't exist. Returns the plans and how many failed.
+    fn plan_stack(
+        &self,
+        nodes: Vec<(StackedNode, u64)>,
+        main: &str,
+    ) -> (Vec<(StackedNode, DispatchPlan)>, usize) {
+        let mut planned = Vec::new();
+        let mut failed = 0;
+        let mut placed: BTreeMap<String, PlacedNode> = BTreeMap::new();
+        for (s, number) in nodes {
+            let id = &s.node_id;
+            let Some(base) = base_branch(&s.base, main, &placed) else {
+                println!("  skip node {id}: its dependency was not planned");
+                continue;
+            };
+            let mut t = match self.plan_dispatch(number, true) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("error: node {id} (#{number}): {e:#}");
+                    failed += 1;
+                    continue;
+                }
+            };
+            t.set_stack_base(base, main);
+            let text = if t.ready() {
+                format_ready_base(&t)
+            } else {
+                format_plan(&t, self.opts.no_launch)
+            };
+            print!("Node {id}: {text}");
+            placed.insert(id.clone(), PlacedNode::of(&t));
+            planned.push((s, t));
+        }
+        (planned, failed)
+    }
+
+    /// Print the `gh stack link` commands the run will try. Returns the chains
+    /// to link, none when gh-stack is unavailable.
+    fn preview_links(
+        &self,
+        planned: &[(StackedNode, DispatchPlan)],
+        main: &str,
+    ) -> Vec<(Base, Vec<String>)> {
+        let nodes: Vec<StackedNode> = planned.iter().map(|(s, _)| s.clone()).collect();
+        let placed: BTreeMap<String, PlacedNode> = planned
+            .iter()
+            .map(|(s, t)| (s.node_id.clone(), PlacedNode::of(t)))
+            .collect();
+        // Nodes that will be dispatched, not just reused as a base.
+        let fresh: BTreeSet<String> = planned
+            .iter()
+            .filter(|(_, t)| !t.ready())
+            .map(|(s, _)| s.node_id.clone())
+            .collect();
+        let mut chains = chains_to_link(&nodes, &fresh);
+        for (base, chain) in &chains {
+            let base = base_branch(base, main, &placed).unwrap_or_default();
+            let prs: Vec<&str> = chain
+                .iter()
+                .filter_map(|id| placed.get(id).map(|p| p.pr.as_str()))
+                .collect();
+            println!(
+                "Would link: GH_REPO={} gh stack link --base {base} {}",
+                self.repo,
+                prs.join(" ")
+            );
+        }
+        if chains.is_empty() {
+            return chains;
+        }
+        if let Err(e) = github::gh_stack(self.root, self.repo, &["--help"]) {
+            eprintln!(
+                "warning: gh-stack is unavailable ({e:#}), so `gh stack link` will be skipped; \
+                 the PRs are still chained by their base branches"
+            );
+            chains.clear();
+        }
+        chains
+    }
+
+    /// Carry out each stack node, skipping nodes whose dependency got no
+    /// branch and PR; a ready PR is only used as a base (no claim, worktree
+    /// or session). Then link `chains`, mark nodes in progress and print the
+    /// tally. Returns how many failed.
+    fn run_stack(
+        &self,
+        planned: Vec<(StackedNode, DispatchPlan)>,
+        chains: &[(Base, Vec<String>)],
+        main: &str,
+    ) -> usize {
+        let mut progress = NodeProgress::new();
+        // Nodes whose branch and PR exist, even if their session then failed.
+        let mut placed: BTreeMap<String, PlacedNode> = BTreeMap::new();
+        let (mut launched, mut reused, mut failed) = (0usize, 0usize, 0usize);
+        for (s, mut plan) in planned {
+            let id = s.node_id;
+            if base_branch(&s.base, main, &placed).is_none() {
+                eprintln!("skip: node {id}: its dependency was not dispatched");
+                continue;
+            }
+            let mut pr_url = None;
+            let result = if plan.ready() {
+                plan.warn_base_mismatch();
+                pr_url = plan.pr.as_ref().map(|pr| pr.url.clone());
+                queue_node_progress(&plan, &mut progress);
+                println!(
+                    "#{}  {READY_NO_RELAUNCH}; used as a base ({} \u{2190} {})",
+                    plan.number, plan.branch, plan.base
+                );
+                Ok(false)
+            } else {
+                self.dispatch_one(&mut plan, &mut progress, &mut pr_url)
+            };
+            match result {
+                Ok(true) => launched += 1,
+                Ok(false) => reused += 1,
+                Err(e) => {
+                    eprintln!("error: node {id} (#{}): {e:#}", plan.number);
+                    if pr_url.is_some() {
+                        eprintln!("  its branch and PR exist; dependents still stack on it");
+                    }
+                    failed += 1;
+                }
+            }
+            if let Some(pr) = pr_url {
+                let branch = plan.branch;
+                placed.insert(id, PlacedNode { branch, pr });
+            }
+        }
+
+        for (base, chain) in chains {
+            // Only the dispatched bottom of a chain can be linked.
+            let prs: Vec<&str> = chain
+                .iter()
+                .map_while(|id| placed.get(id).map(|p| p.pr.as_str()))
+                .collect();
+            let Some(base) = base_branch(base, main, &placed).filter(|_| prs.len() >= 2) else {
+                continue;
+            };
+            let mut args = vec!["link", "--base", &base];
+            args.extend(&prs);
+            match github::gh_stack(self.root, self.repo, &args) {
+                Ok(()) => println!("Linked stack on {base}: {}", prs.join(" ")),
+                Err(e) => eprintln!(
+                    "warning: `gh stack link` failed: {e:#}\n  \
+                     the PRs are still chained by their base branches"
+                ),
+            }
+        }
+        self.finish(progress, launched, reused, failed)
+    }
+
     /// For a plan with an `Objective: #N (node X)` marker: the objective's
     /// (number, node, title, body). Fails when the objective or node can't be
-    /// found, or node X still waits on others.
+    /// found, or (unless `stacked`) node X still waits on others.
     fn objective_of(
         &self,
         number: u64,
         plan_body: &str,
+        stacked: bool,
     ) -> Result<Option<(u64, String, String, String)>> {
         let Some((obj, node_id)) = objective::parse_objective_marker(plan_body) else {
             return Ok(None);
@@ -806,7 +1269,7 @@ impl Run<'_> {
             )
         })?;
         let blockers = objective::blocked_by(node, &nodes);
-        if !blockers.is_empty() {
+        if !blockers.is_empty() && !stacked {
             anyhow::bail!(
                 "plan #{number} is node {node_id} of objective #{obj}, which is blocked \
                  by node(s) {} that are not done yet",
@@ -829,8 +1292,8 @@ impl Run<'_> {
     }
 
     /// Work out everything dispatch will do for plan `number`, changing
-    /// nothing.
-    fn plan_dispatch(&self, number: u64) -> Result<DispatchPlan> {
+    /// nothing. `stacked` lets a node with unfinished dependencies through.
+    fn plan_dispatch(&self, number: u64, stacked: bool) -> Result<DispatchPlan> {
         let issue = github::get_issue(self.repo, number)
             .with_context(|| format!("fetching issue #{number}"))?;
         if issue.has_label(OBJECTIVE_LABEL) {
@@ -838,7 +1301,7 @@ impl Run<'_> {
         }
         require_plan_or_objective(number, &issue, false)?;
         let body = issue.body.unwrap_or_default();
-        let objective = self.objective_of(number, &body)?;
+        let objective = self.objective_of(number, &body, stacked)?;
         let mirror = self.find_mirror(number, &issue.title, &body, objective.as_ref())?;
         let fields = PlanFields {
             number,
@@ -863,6 +1326,7 @@ impl Run<'_> {
             pr_link: None,
             worktree: None,
             objective_node: objective.map(|(o, id, ..)| (o, id)),
+            stacked_on: None,
         };
         // The templates only matter for a plan without a PR yet, so a broken
         // one can't block re-running a plan that is already under way.
@@ -1012,25 +1476,27 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// Carry out one plan. Once its branch and PR exist, its objective node is
-    /// queued to be marked in progress, even if a later step fails.
-    fn dispatch_one(&self, plan: &mut DispatchPlan, progress: &mut NodeProgress) -> Result<bool> {
-        let mut has_pr = false;
-        let result = self.carry_out(plan, &mut has_pr);
-        if let (true, Some((objective, node_id))) = (has_pr, &plan.objective_node) {
-            progress
-                .entry(*objective)
-                .or_default()
-                .push((node_id.clone(), plan.number));
+    /// Carry out one plan. `pr_url` is set once the branch and PR exist, even
+    /// if a later step fails; from then on its objective node is queued to be
+    /// marked in progress.
+    fn dispatch_one(
+        &self,
+        plan: &mut DispatchPlan,
+        progress: &mut NodeProgress,
+        pr_url: &mut Option<String>,
+    ) -> Result<bool> {
+        let result = self.carry_out(plan, pr_url);
+        if pr_url.is_some() {
+            queue_node_progress(plan, progress);
         }
         result
     }
 
     /// Carry out a confirmed plan and print its report; `Ok(true)` when it
-    /// launched a new Claude session. `has_pr` is set once the branch and PR
+    /// launched a new Claude session. `pr_url` is set once the branch and PR
     /// exist. Every step looks up existing state first, so a re-run after a
     /// partial failure resumes.
-    fn carry_out(&self, t: &mut DispatchPlan, has_pr: &mut bool) -> Result<bool> {
+    fn carry_out(&self, t: &mut DispatchPlan, pr_url_out: &mut Option<String>) -> Result<bool> {
         let (kata_ref, claimed_by_me, created) = match &t.kata_ref {
             Some(r) => (r.clone(), t.claimed_by_me, false),
             // Same idempotency key as `plan new`, so the two paths can't
@@ -1083,14 +1549,14 @@ impl Run<'_> {
                 pr.url.clone()
             }
             None => {
-                let body = pr_body(t.number, &kata_ref);
+                let body = pr_body(t.number, &kata_ref, t.stacked_on.as_deref());
                 let url =
                     github::create_draft_pr(self.repo, &t.branch, &t.base, &t.pr_title, &body)?;
                 eprintln!("pr: opened draft {url}");
                 url
             }
         };
-        *has_pr = true;
+        *pr_url_out = Some(pr_url.clone());
 
         let worktree = match &t.worktree {
             Some(path) => {
@@ -1280,23 +1746,34 @@ impl Run<'_> {
     }
 }
 
-fn pr_body(number: u64, kata_ref: &str) -> String {
-    format!("Work in progress for engram plan #{number} (kata `{kata_ref}`).\n\nCloses #{number}")
+fn pr_body(number: u64, kata_ref: &str, stacked_on: Option<&str>) -> String {
+    let stacked = stacked_on
+        .map(|base| format!(" Stacked on `{base}`."))
+        .unwrap_or_default();
+    format!(
+        "Work in progress for engram plan #{number} (kata `{kata_ref}`).{stacked}\n\nCloses #{number}"
+    )
 }
 
 fn build_prompt(t: &DispatchPlan, kata_ref: &str, pr_url: &str) -> String {
     let n = t.number;
-    format!(
+    let mut out = format!(
         "Work on engram plan #{n}: {}\nkata issue: {kata_ref}\n\n{}\n\n---\n\
          A draft pull request is already open for this branch: {pr_url} (base `{}`).\n\
          Do not open a new PR and do not change its base.\n\
-         Keep the `Closes #{n}` line in the PR body if you edit it.\n\
-         When the implementation is complete and tests pass, push your commits to this branch \
-         and run `gh pr ready` on the existing PR, adding a summary comment of what changed and why.\n",
+         Keep the `Closes #{n}` line in the PR body if you edit it.\n",
         t.title,
         t.body.trim_end(),
         t.pr_base()
-    )
+    );
+    if let Some(base) = &t.stacked_on {
+        out += &format!(
+            "It is stacked on `{base}` as part of a multi-PR dependency chain \u{2014} \
+             do not rebase it onto the default branch.\n"
+        );
+    }
+    out + "When the implementation is complete and tests pass, push your commits to this branch \
+           and run `gh pr ready` on the existing PR, adding a summary comment of what changed and why.\n"
 }
 
 #[derive(Debug, Deserialize)]
@@ -1612,6 +2089,7 @@ mod tests {
             pr_link: None,
             worktree: None,
             objective_node: Some((141, "5.2".into())),
+            stacked_on: None,
         }
     }
 
@@ -1637,17 +2115,30 @@ mod tests {
     }
 
     #[rstest]
-    #[case::fresh(None, "main", &["(base `main`)"], &[])]
+    #[case::fresh(false, None, "main", &["(base `main`)"], &["stacked on"])]
+    #[case::stack_on_the_default_branch(
+        true, None, "main", &["(base `main`)"], &["stacked on"])]
+    #[case::stacked(true, None, "a56d-x", &[
+        "(base `a56d-x`)", "It is stacked on `a56d-x`", "do not rebase it onto the default branch",
+    ], &[])]
     // A reused PR's real base wins over the computed one.
-    #[case::reused_pr(Some("old-base"), "computed-base", &["(base `old-base`)"], &["computed-base"])]
-    fn prompt_carries_plan_and_base(
+    #[case::reused_pr(true, Some("old-base"), "computed-base",
+        &["(base `old-base`)", "stacked on `old-base`"], &["computed-base"])]
+    #[case::reused_pr_on_main(true, Some("main"), "computed-base",
+        &["(base `main`)"], &["stacked on"])]
+    fn prompt_carries_plan_base_and_stacking(
+        #[case] in_stack: bool,
         #[case] pr_base: Option<&str>,
         #[case] base: &str,
         #[case] has: &[&str],
         #[case] lacks: &[&str],
     ) {
         let mut t = pr_base.map_or_else(target, |b| with_pr(target(), b, true));
-        t.base = base.into();
+        if in_stack {
+            t.set_stack_base(base.into(), "main");
+        } else {
+            t.base = base.into();
+        }
         let p = build_prompt(&t, "mfbq", "https://github.com/o/r/pull/9");
         let always = [
             "Work on engram plan #143: [5.2] Add engram dispatch\nkata issue: mfbq\n\n",
@@ -1659,12 +2150,26 @@ mod tests {
         assert_mentions(&p, &[&always[..], has].concat(), lacks);
     }
 
-    #[test]
-    fn pr_body_closes_the_plan() {
-        assert_eq!(
-            pr_body(143, "mfbq"),
-            "Work in progress for engram plan #143 (kata `mfbq`).\n\nCloses #143"
-        );
+    #[rstest]
+    #[case::own_base(
+        143,
+        "mfbq",
+        None,
+        "Work in progress for engram plan #143 (kata `mfbq`).\n\nCloses #143"
+    )]
+    #[case::stacked(
+        145,
+        "bjs1",
+        Some("81h7-x"),
+        "Work in progress for engram plan #145 (kata `bjs1`). Stacked on `81h7-x`.\n\nCloses #145"
+    )]
+    fn pr_body_closes_the_plan(
+        #[case] number: u64,
+        #[case] kata_ref: &str,
+        #[case] stacked_on: Option<&str>,
+        #[case] want: &str,
+    ) {
+        assert_eq!(pr_body(number, kata_ref, stacked_on), want);
     }
 
     #[rstest]
@@ -1700,7 +2205,11 @@ mod tests {
     #[case::plan("OPEN", &[PLAN_LABEL], false, Ok(()))]
     #[case::objective_without_nodes("OPEN", &[OBJECTIVE_LABEL], false, Err("without a node list"))]
     #[case::unlabelled("OPEN", &[], false, Err("neither"))]
-    #[case::closed("CLOSED", &[PLAN_LABEL], false, Err("not open"))]
+    #[case::closed_plan(
+        "CLOSED", &[PLAN_LABEL], false,
+        Err("#1 is not open (state: CLOSED); if its work merged, run `engram plan land 1`")
+    )]
+    #[case::closed_objective("CLOSED", &[OBJECTIVE_LABEL], true, Err("not open (state: CLOSED)"))]
     fn require_plan_or_objective_refuses_closed_and_unlabelled_issues(
         #[case] state: &str,
         #[case] labels: &[&str],
@@ -1735,6 +2244,134 @@ mod tests {
             plan_issue: Some(plan),
             ..node(id, status, deps)
         }
+    }
+
+    fn on(id: &str, base: Option<&str>) -> StackedNode {
+        StackedNode {
+            node_id: id.into(),
+            base: base.map_or(Base::Main, |b| Base::OnNode(b.into())),
+        }
+    }
+
+    #[rstest]
+    #[case::empty(vec![], vec![], &[])]
+    #[case::chain(
+        vec![node("a", Pending, &[]), node("b", Pending, &["a"]), node("c", Pending, &["b"])],
+        vec![on("a", None), on("b", Some("a")), on("c", Some("b"))], &[])]
+    #[case::dependencies_first(
+        vec![node("c", Pending, &["b"]), node("b", Pending, &["a"]),
+             node("x", Pending, &[]), node("a", Pending, &[])],
+        vec![on("x", None), on("a", None), on("b", Some("a")), on("c", Some("b"))], &[])]
+    #[case::fan_out(
+        vec![node("a", Pending, &[]), node("b", Pending, &["a"]),
+             node("c", Pending, &["a"]), node("r", Pending, &[])],
+        vec![on("a", None), on("b", Some("a")), on("c", Some("a")), on("r", None)], &[])]
+    // Objective #141's shape: 5.5 waits on 5.3 and 5.4, and 5.4 on 5.3.
+    #[case::transitive_dependency_is_no_diamond(
+        vec![node("5.3", InProgress, &[]), node("5.4", Pending, &["5.3"]),
+             node("5.5", Pending, &["5.3", "5.4"])],
+        vec![on("5.3", None), on("5.4", Some("5.3")), on("5.5", Some("5.4"))], &[])]
+    // Done dependencies base on the default branch; unknown ones are ignored.
+    #[case::done_and_unknown_dependencies(
+        vec![node("a", Done, &[]), node("b", Done, &[]),
+             node("c", Pending, &["a", "b"]), node("d", Pending, &["a", "c", "zz"])],
+        vec![on("c", None), on("d", Some("c"))], &[])]
+    #[case::diamond_and_its_dependents(
+        vec![node("a", Pending, &[]), node("b", Pending, &[]),
+             node("d", Pending, &["a", "b"]), node("e", Pending, &["d"])],
+        vec![on("a", None), on("b", None)],
+        &[("d", "diamond: waits on a, b"), ("e", "depends on skipped node d")])]
+    // b reaches c only through done x, whose work is on the default branch
+    // without c's: b's branch doesn't contain c, so n is a diamond.
+    #[case::path_through_a_done_node(
+        vec![node("c", Pending, &[]), node("x", Done, &["c"]),
+             node("b", Pending, &["x"]), node("n", Pending, &["b", "c"])],
+        vec![on("c", None), on("b", None)], &[("n", "diamond: waits on b, c")])]
+    #[case::cycle_among_done_nodes(
+        vec![node("x", Done, &["y"]), node("y", Done, &["x"])], vec![], &[])]
+    fn order_for_stack_bases_each_node_on_its_dependency(
+        #[case] nodes: Vec<ObjectiveNode>,
+        #[case] want: Vec<StackedNode>,
+        #[case] want_skipped: &[(&str, &str)],
+    ) {
+        let StackOrder { stacked, skipped } = order_for_stack(&nodes).unwrap();
+        assert_eq!(stacked, want);
+        assert_eq!(skipped.len(), want_skipped.len(), "{skipped:?}");
+        for ((id, why), (want_id, want_why)) in skipped.iter().zip(want_skipped) {
+            assert!(id == want_id && why.starts_with(want_why), "{id}: {why}");
+        }
+    }
+
+    #[test]
+    fn order_for_stack_reports_cycles() {
+        let nodes = [
+            node("a", Pending, &[]),
+            node("b", Pending, &["c"]),
+            node("c", Pending, &["b"]),
+        ];
+        assert_result(
+            order_for_stack(&nodes),
+            Err("cycle among objective nodes b, c"),
+        );
+    }
+
+    #[test]
+    fn straight_chains_split_at_forks_and_roots() {
+        // a -> b -> {c -> d, e}; r alone.
+        let targets = [
+            on("a", None),
+            on("b", Some("a")),
+            on("c", Some("b")),
+            on("d", Some("c")),
+            on("e", Some("b")),
+            on("r", None),
+        ];
+        let chain = |base: Option<&str>, ids: &[&str]| {
+            (
+                on("", base).base,
+                ids.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            straight_chains(&targets),
+            vec![
+                chain(None, &["a", "b"]),
+                chain(Some("b"), &["c", "d"]),
+                chain(Some("b"), &["e"]),
+                chain(None, &["r"])
+            ]
+        );
+    }
+
+    #[rstest]
+    #[case::nothing_fresh(&[], &[])]
+    #[case::fresh_top(&["d"], &[(Some("b"), &["c", "d"][..])])]
+    #[case::fresh_bottom(&["a"], &[(None, &["a", "b"][..])])]
+    #[case::fresh_single_never_links(&["e", "r"], &[])]
+    fn chains_to_link_needs_a_fresh_node(
+        #[case] fresh: &[&str],
+        #[case] want: &[(Option<&str>, &[&str])],
+    ) {
+        // a -> b -> {c -> d, e}; r alone.
+        let targets = [
+            on("a", None),
+            on("b", Some("a")),
+            on("c", Some("b")),
+            on("d", Some("c")),
+            on("e", Some("b")),
+            on("r", None),
+        ];
+        let fresh = fresh.iter().map(|s| s.to_string()).collect();
+        let want: Vec<_> = want
+            .iter()
+            .map(|(base, ids)| {
+                (
+                    on("", *base).base,
+                    ids.iter().map(|s| s.to_string()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(chains_to_link(&targets, &fresh), want);
     }
 
     #[test]
