@@ -454,6 +454,17 @@ fn stack_chains(targets: &[StackTarget]) -> Vec<(StackBase, Vec<String>)> {
         .collect()
 }
 
+/// The chains worth `gh stack link`: two or more PRs, at least one of them
+/// newly dispatched. Chains made only of reused PRs are left as they are.
+fn chains_to_link(
+    targets: &[StackTarget],
+    fresh: &BTreeSet<String>,
+) -> Vec<(StackBase, Vec<String>)> {
+    let mut chains = stack_chains(targets);
+    chains.retain(|(_, chain)| chain.len() >= 2 && chain.iter().any(|id| fresh.contains(id)));
+    chains
+}
+
 fn resolve_base(
     base: &StackBase,
     default: &str,
@@ -984,6 +995,15 @@ impl Run<'_> {
         if planned.is_empty() {
             anyhow::bail!("nothing to dispatch \u{2014} see errors above");
         }
+        // Every node is done or only reused as a base: nothing to confirm or link.
+        if planned.iter().all(|(_, t)| t.ready()) {
+            println!("Nothing to dispatch.");
+            anyhow::ensure!(
+                plan_failed == 0,
+                "{plan_failed} dispatch(es) failed — see errors above"
+            );
+            return Ok(());
+        }
         let chains = self.preview_links(&planned, &default);
         if self.opts.dry_run {
             anyhow::ensure!(
@@ -1144,8 +1164,13 @@ impl Run<'_> {
                 (s.node_id.clone(), (t.branch.clone(), pr))
             })
             .collect();
-        let mut chains = stack_chains(&targets);
-        chains.retain(|(_, chain)| chain.len() >= 2);
+        // Nodes that will be dispatched, not just reused as a base.
+        let fresh: BTreeSet<String> = planned
+            .iter()
+            .filter(|(_, t)| !t.ready())
+            .map(|(s, _)| s.node_id.clone())
+            .collect();
+        let mut chains = chains_to_link(&targets, &fresh);
         let check = if chains.is_empty() {
             Ok(())
         } else {
@@ -2346,6 +2371,37 @@ mod tests {
                 chain(None, &["r"])
             ]
         );
+    }
+
+    #[rstest]
+    #[case::nothing_fresh(&[], &[])]
+    #[case::fresh_top(&["d"], &[(Some("b"), &["c", "d"][..])])]
+    #[case::fresh_bottom(&["a"], &[(None, &["a", "b"][..])])]
+    #[case::fresh_single_never_links(&["e", "r"], &[])]
+    fn chains_to_link_needs_a_fresh_node(
+        #[case] fresh: &[&str],
+        #[case] want: &[(Option<&str>, &[&str])],
+    ) {
+        // a -> b -> {c -> d, e}; r alone.
+        let targets = [
+            on("a", None),
+            on("b", Some("a")),
+            on("c", Some("b")),
+            on("d", Some("c")),
+            on("e", Some("b")),
+            on("r", None),
+        ];
+        let fresh = fresh.iter().map(|s| s.to_string()).collect();
+        let want: Vec<_> = want
+            .iter()
+            .map(|(base, ids)| {
+                (
+                    on("", *base).base,
+                    ids.iter().map(|s| s.to_string()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(chains_to_link(&targets, &fresh), want);
     }
 
     #[test]
