@@ -575,7 +575,7 @@ impl DispatchPlan {
     }
 }
 
-fn format_plan(t: &DispatchPlan, no_launch: bool) -> String {
+fn format_plan(t: &DispatchPlan, no_launch: bool, claude: &str) -> String {
     let kata = match &t.kata_ref {
         Some(r) if t.claimed_by_me => format!("{r} (claimed by you)"),
         Some(r) => format!("{r} (will claim)"),
@@ -609,7 +609,7 @@ fn format_plan(t: &DispatchPlan, no_launch: bool) -> String {
     } else if t.ready() {
         format!("skip ({READY_NO_RELAUNCH})")
     } else {
-        "claude in the workspace's tmux pane".to_string()
+        format!("{} in the workspace's tmux pane", redact_secrets(claude))
     };
     format!(
         "Dispatch plan #{}: {}\n  kata:     {kata}\n  branch:   {} \u{2190} {} ({branch_note})\n  \
@@ -938,7 +938,10 @@ impl Run<'_> {
         for &number in numbers {
             match self.plan_dispatch(number, false) {
                 Ok(plan) => {
-                    print!("{}", format_plan(&plan, self.opts.no_launch));
+                    print!(
+                        "{}",
+                        format_plan(&plan, self.opts.no_launch, &self.claude())
+                    );
                     plans.push(plan);
                 }
                 Err(e) => {
@@ -1113,7 +1116,7 @@ impl Run<'_> {
             let text = if t.ready() {
                 format_ready_base(&t)
             } else {
-                format_plan(&t, self.opts.no_launch)
+                format_plan(&t, self.opts.no_launch, &self.claude())
             };
             print!("Node {id}: {text}");
             placed.insert(id.clone(), PlacedNode::of(&t));
@@ -1673,6 +1676,15 @@ impl Run<'_> {
         }
     }
 
+    /// The claude command the pane runs (see [`claude_command`]).
+    fn claude(&self) -> String {
+        claude_command(
+            std::env::var(CLAUDE_OVERRIDE_ENV).ok(),
+            self.cfg.dispatch.claude.as_deref(),
+            &self.tools.claude,
+        )
+    }
+
     fn launch_claude(
         &self,
         t: &DispatchPlan,
@@ -1719,11 +1731,7 @@ impl Run<'_> {
         std::fs::write(&prompt_file, prompt)
             .with_context(|| format!("writing {}", prompt_file.display()))?;
 
-        let claude = claude_command(
-            std::env::var(CLAUDE_OVERRIDE_ENV).ok(),
-            self.cfg.dispatch.claude.as_deref(),
-            &self.tools.claude,
-        );
+        let claude = self.claude();
         let user = config::github_user();
         let cmd = launch_command(&claude, user.as_deref(), worktree, &prompt_file);
         tmux(&["send-keys", "-t", session, "-l", &cmd])?;
@@ -1862,6 +1870,24 @@ fn claude_command(
         .filter(|c| !c.is_empty())
         .or_else(|| configured.filter(|c| !c.is_empty()).map(str::to_string))
         .unwrap_or_else(|| shell_quote(&resolved.to_string_lossy()))
+}
+
+/// `cmd` for display: the value of every `NAME=value` word whose name looks
+/// like a credential is hidden, so a configured command never prints a token.
+fn redact_secrets(cmd: &str) -> String {
+    cmd.split(' ')
+        .map(|word| match word.split_once('=') {
+            Some((name, _))
+                if ["TOKEN", "SECRET", "KEY", "PASSWORD"]
+                    .iter()
+                    .any(|s| name.to_ascii_uppercase().contains(s)) =>
+            {
+                format!("{name}=\u{2026}")
+            }
+            _ => word.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn launch_command(
@@ -2213,7 +2239,7 @@ mod tests {
     #[case::fresh(target(), false, &[
         "kata:     mfbq (will claim)",
         "143-add-engram-dispatch \u{2190} main (create from origin with an empty wip commit)",
-        "PR:       (will open a draft)\n  worktree: (will create with kwt)\n  launch:   claude",
+        "PR:       (will open a draft)\n  worktree: (will create with kwt)\n  launch:   claude in",
     ])]
     #[case::reused_ready_pr(reused("main"), false, &[
         "(reused from the existing PR; reuse local branch)",
@@ -2233,7 +2259,31 @@ mod tests {
         #[case] no_launch: bool,
         #[case] has: &[&str],
     ) {
-        assert_mentions(&format_plan(&t, no_launch), has, &[]);
+        assert_mentions(&format_plan(&t, no_launch, "claude"), has, &[]);
+    }
+
+    #[rstest]
+    #[case::configured(
+        "my-claude --x",
+        "launch:   my-claude --x in the workspace's tmux pane"
+    )]
+    #[case::token_hidden(
+        "GH_TOKEN=ghp_secret claude",
+        "launch:   GH_TOKEN=\u{2026} claude in the workspace's tmux pane"
+    )]
+    fn format_plan_shows_the_resolved_claude_command(#[case] claude: &str, #[case] want: &str) {
+        let text = format_plan(&target(), false, claude);
+        assert_mentions(&text, &[want], &["ghp_secret"]);
+    }
+
+    #[rstest]
+    #[case::plain("/bin/claude --model opus", "/bin/claude --model opus")]
+    #[case::credentials(
+        "GH_TOKEN=a API_KEY=b Secret=c DEBUG=1 claude",
+        "GH_TOKEN=\u{2026} API_KEY=\u{2026} Secret=\u{2026} DEBUG=1 claude"
+    )]
+    fn redact_secrets_hides_credential_assignments(#[case] cmd: &str, #[case] want: &str) {
+        assert_eq!(redact_secrets(cmd), want);
     }
 
     #[rstest]

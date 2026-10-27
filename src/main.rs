@@ -500,9 +500,18 @@ fn cmd_doctor() -> Result<()> {
         .iter()
         .map(|f| (*f, std::fs::read_to_string(dispatch_root.join(f)).ok()))
         .collect();
-    match settings_allowing_dispatch(&settings) {
-        Some(file) => println!("✓ {file} allows `engram dispatch`"),
-        None => println!(
+    match dispatch_rule_check(&settings) {
+        RuleCheck::Allowed(file) => println!("✓ {file} allows `engram dispatch`"),
+        RuleCheck::Denied(file) => println!(
+            "- {file} denies `engram dispatch` (remove it from permissions.deny to dispatch \
+             from auto-mode sessions)"
+        ),
+        RuleCheck::Uneditable => println!(
+            "- no `{DISPATCH_PERMISSION_RULE}` rule, and `engram init` can't edit \
+             {CLAUDE_SETTINGS} (add \"{DISPATCH_PERMISSION_RULE}\" to its permissions.allow \
+             by hand; needed to dispatch from auto-mode sessions)"
+        ),
+        RuleCheck::Missing => println!(
             "- no `{DISPATCH_PERMISSION_RULE}` rule in {} (run `engram init`; \
              needed to dispatch from auto-mode sessions)",
             DISPATCH_RULE_SETTINGS.join(" or ")
@@ -662,23 +671,56 @@ const DISPATCH_PERMISSION_RULES: &[&str] = &[DISPATCH_PERMISSION_RULE, "Bash(eng
 /// Project settings doctor looks for the rule in (init only writes the first).
 const DISPATCH_RULE_SETTINGS: &[&str] = &[CLAUDE_SETTINGS, ".claude/settings.local.json"];
 
-fn allows_dispatch(settings: &serde_json::Value) -> bool {
-    settings["permissions"]["allow"]
-        .as_array()
-        .is_some_and(|a| {
-            a.iter().any(|r| {
-                r.as_str()
-                    .is_some_and(|r| DISPATCH_PERMISSION_RULES.contains(&r))
-            })
+/// Whether `permissions.<list>` (`allow` or `deny`) has a dispatch rule.
+fn lists_dispatch(settings: &serde_json::Value, list: &str) -> bool {
+    settings["permissions"][list].as_array().is_some_and(|a| {
+        a.iter().any(|r| {
+            r.as_str()
+                .is_some_and(|r| DISPATCH_PERMISSION_RULES.contains(&r))
         })
+    })
 }
 
-/// The first settings file (name, contents if readable) that allows dispatch.
-fn settings_allowing_dispatch<'a>(files: &[(&'a str, Option<String>)]) -> Option<&'a str> {
-    files.iter().find_map(|(name, text)| {
-        let v: serde_json::Value = serde_json::from_str(text.as_deref()?).ok()?;
-        allows_dispatch(&v).then_some(*name)
-    })
+fn allows_dispatch(settings: &serde_json::Value) -> bool {
+    lists_dispatch(settings, "allow")
+}
+
+/// What the project settings say about the dispatch rule, for doctor.
+#[derive(Debug, PartialEq)]
+enum RuleCheck<'a> {
+    Allowed(&'a str),
+    /// Denied in this file; deny wins over allow in any file.
+    Denied(&'a str),
+    /// Nowhere allowed, and init can't add it ([`CLAUDE_SETTINGS`] isn't JSON
+    /// it can edit), so it has to be added by hand.
+    Uneditable,
+    Missing,
+}
+
+/// Check settings files (name, contents if readable) for the dispatch rule.
+fn dispatch_rule_check<'a>(files: &[(&'a str, Option<String>)]) -> RuleCheck<'a> {
+    let parsed: Vec<_> = files
+        .iter()
+        .filter_map(|(name, text)| {
+            let v: serde_json::Value = serde_json::from_str(text.as_deref()?).ok()?;
+            Some((*name, v))
+        })
+        .collect();
+    if let Some((name, _)) = parsed.iter().find(|(_, v)| lists_dispatch(v, "deny")) {
+        return RuleCheck::Denied(name);
+    }
+    if let Some((name, _)) = parsed.iter().find(|(_, v)| allows_dispatch(v)) {
+        return RuleCheck::Allowed(name);
+    }
+    let editable = files
+        .iter()
+        .find(|(name, _)| *name == CLAUDE_SETTINGS)
+        .is_none_or(|(_, text)| merge_dispatch_rule(text.as_deref()).is_ok());
+    if editable {
+        RuleCheck::Missing
+    } else {
+        RuleCheck::Uneditable
+    }
 }
 
 /// `existing` settings with the dispatch rule added to `permissions.allow`,
@@ -926,24 +968,44 @@ mod tests {
     }
 
     #[rstest]
-    #[case::shared_file(allowing("Bash(engram dispatch:*)"), None, Some(CLAUDE_SETTINGS))]
+    #[case::shared_file(
+        allowing("Bash(engram dispatch:*)"),
+        None,
+        RuleCheck::Allowed(CLAUDE_SETTINGS)
+    )]
     #[case::local_file_space_form(
         allowing("Bash(engram:*)"),
         allowing("Bash(engram dispatch *)"),
-        Some(DISPATCH_RULE_SETTINGS[1])
+        RuleCheck::Allowed(DISPATCH_RULE_SETTINGS[1])
     )]
-    #[case::unparsable_and_broad_rule(Some("{ // x\n}".into()), allowing("Bash(engram:*)"), None)]
-    #[case::no_files(None, None, None)]
-    fn settings_allowing_dispatch_checks_both_files_and_forms(
+    #[case::denied_in_same_file(
+        Some(r#"{"permissions": {"allow": ["Bash(engram dispatch:*)"], "deny": ["Bash(engram dispatch:*)"]}}"#.into()),
+        None,
+        RuleCheck::Denied(CLAUDE_SETTINGS)
+    )]
+    #[case::denied_in_local_file(
+        allowing("Bash(engram dispatch:*)"),
+        Some(r#"{"permissions": {"deny": ["Bash(engram dispatch *)"]}}"#.into()),
+        RuleCheck::Denied(DISPATCH_RULE_SETTINGS[1])
+    )]
+    #[case::unparsable_and_broad_rule(
+        Some("{ // x\n}".into()),
+        allowing("Bash(engram:*)"),
+        RuleCheck::Uneditable
+    )]
+    #[case::odd_shape(Some(r#"{"permissions": []}"#.into()), None, RuleCheck::Uneditable)]
+    #[case::unparsable_local_only(None, Some("{ // x\n}".into()), RuleCheck::Missing)]
+    #[case::no_files(None, None, RuleCheck::Missing)]
+    fn dispatch_rule_check_cases(
         #[case] shared: Option<String>,
         #[case] local: Option<String>,
-        #[case] want: Option<&str>,
+        #[case] want: RuleCheck,
     ) {
         let files = [
             (CLAUDE_SETTINGS, shared),
             (DISPATCH_RULE_SETTINGS[1], local),
         ];
-        assert_eq!(settings_allowing_dispatch(&files), want);
+        assert_eq!(dispatch_rule_check(&files), want);
     }
 
     #[test]

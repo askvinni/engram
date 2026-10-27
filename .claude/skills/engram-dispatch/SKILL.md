@@ -21,6 +21,6 @@ Arguments: plan numbers (each based on the default branch), objective numbers (t
 
 - **Run the command exactly as written**: no `cd … &&`, no env-var prefixes (`GH_TOKEN=…`, `ENGRAM_DISPATCH_CLAUDE=…`), no wrappers or `./target/...` paths. The allowed rule `Bash(engram dispatch:*)` only matches commands that start with `engram dispatch`.
 - **Wrong GitHub account?** Don't add `GH_TOKEN`. Ask the user to run `git config engram.githubUser <github-login>` once per clone; engram then uses that account for its gh calls and the sessions it launches.
-- **Missing `{meta[key]}`**: ask the user for the value (never invent one), set it with the `kata meta set <kata-ref> <key> <value>` command the error prints, and dry-run again.
+- **Missing `{meta[key]}`**: ask the user for the value (never invent one). If the plan has a kata mirror (the dry run shows a real ref, not `<kata-ref>`), set it with the `kata meta set <kata-ref> <key> <value>` command the error prints. Otherwise add it to the plan issue body as a matching line (`Jira: ENG-1234`, `Type: feat`; dispatch reads those when it creates the mirror). Then dry-run again.
 - **On failure, report and stop.** Don't redo steps by hand (`kwt add`/`open`, `gh pr create`, `git branch`, `tmux send-keys`); dispatch is idempotent, so the same command resumes once the cause is fixed.
 - **Never attach** to the tmux sessions dispatch starts; the user finds them in Ghosthub.
