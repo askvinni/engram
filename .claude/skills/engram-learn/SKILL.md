@@ -29,7 +29,7 @@ If either check fails, `engram plan learn` will exit with an error message. Fix 
 
 1. Fetches issue `#N` title and body
 2. Finds the merged PR via GitHub's `CLOSED_EVENT` GraphQL query (`src/github.rs:find_linked_pr`)
-3. Fetches the PR diff, capped at 8 000 bytes (`src/github.rs:get_pr_diff`)
+3. Fetches the PR diff, capped at 8 000 characters in the prompt (`src/claude.rs`)
 4. Fetches issue comments and extracts the first comment containing `<!-- engram:conversation -->` (`src/github.rs:get_issue_comments`); the conversation text is included in the synthesis prompt under `## Planning Conversation` (also capped at 8 000 chars)
 5. Reads all existing `.engram/memory/` files for deduplication context (`src/memory.rs:read_all`)
 6. Loads `.engram/prompt-hooks/*.md` (excluding `README.md`) to inject repo-specific synthesis rules, plus the repo's CLAUDE.md/AGENTS.md (minus the engram-managed section, capped at 8 000 chars) as "always-loaded instructions" that learnings must never restate
