@@ -10,7 +10,7 @@ tripwires:
   warning: create_plan_for_node sets a node to in_progress as soon as its plan issue exists. Pending-only selection would skip every planned but undispatched node. Include in_progress nodes and rely on dispatch's live reuse checks (open PR, worktree, running Claude, ready PR) to avoid launching twice.
 generated:
   by: engram/0.1.0
-  at: "2026-10-27"
+  at: 2026-10-27
 sources:
 - id: '144'
   resource: https://github.com/askvinni/engram/issues/144
