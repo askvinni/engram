@@ -236,13 +236,12 @@ When you run `engram plan land <plan>` or `engram plan learn <plan>` on a plan t
 
 ## Dispatch
 
-`engram dispatch` hands plan issues to background Claude sessions. Each plan gets its own branch, draft PR, kwt worktree and tmux workspace, and Claude starts there in auto mode with the plan as its prompt. The sessions show up in Ghosthub without taking over your terminal.
+`engram dispatch` hands plan issues to background Claude sessions. Each plan gets a branch, a draft PR, a kwt worktree and a tmux workspace, and Claude starts there in auto mode with the plan as its prompt. The sessions show up in Ghosthub without taking over your terminal.
 
 ```
 engram dispatch 42                 # one plan
 engram dispatch 42 43 44           # several plans, each based on the default branch
 engram dispatch 41                 # an objective: its unblocked nodes
-engram dispatch 41 50              # any mix of plans and objectives
 engram dispatch --stack 41         # an objective's dependency chains as stacked PRs
 ```
 
@@ -253,18 +252,22 @@ engram dispatch --stack 41         # an objective's dependency chains as stacked
 | `--no-launch` | Do everything except start Claude; the pane stays at a shell |
 | `--stack` | Stacked dispatch of exactly one objective |
 
-**Tools.** Dispatch is the only command that needs `kwt`, `tmux` and `kata` (with the repo bound by `kata init`), on top of `gh` and `claude`. The tools and the kata binding are checked up front, naming every problem (`engram doctor` reports the same as a non-failing line); a missing GitHub remote or `gh` login surfaces afterwards, when engram resolves the repo. If `kwt` is only a shell alias, the copy bundled at `/Applications/Ghosthub.app/Contents/Helpers/kwt` is used. `--stack` links PRs with the optional gh-stack extension.
+**Tools.** On top of `gh` and `claude`, dispatch needs `kwt`, `tmux` and `kata`, with the repo bound by `kata init`. Missing tools or kata binding are reported up front (and by `engram doctor`); GitHub problems surface once engram resolves the repo. If `kwt` is only a shell alias, the copy bundled at `/Applications/Ghosthub.app/Contents/Helpers/kwt` is used. `--stack` links PRs with the optional gh-stack extension.
 
-**What one dispatch does**, after you confirm:
+**What it does.** Every plan is checked first without changing anything (`--dry-run` stops there); after you confirm, each one goes through:
 
-1. **kata**: find the plan's mirror (or create it with the same idempotency key as `plan new`) and claim it; only then append `Kata: <ref>` to a just-mirrored GitHub issue. A mirror claimed by someone else stops that plan before anything changes.
+1. **kata**: find the plan's mirror (or create it with the same idempotency key as `plan new`) and claim it, then append `Kata: <ref>` to the GitHub issue if the mirror was just created. A mirror claimed by someone else stops that plan before anything changes.
 2. **Branch** from `origin/<base>` with one empty `wip: #N <title>` commit, without checking anything out, then push it and open a **draft PR** ending in `Closes #N`.
 3. **Worktree**: `kwt add <branch> --no-launch`, then `kwt open --start-session` (detached).
-4. **Launch** `claude --permission-mode auto` in the pane with a prompt built from the plan, the PR and how to finish (push, then `gh pr ready` with a summary). Dispatch waits until Claude has taken over the pane and reports it if Claude exits straight away.
+4. **Launch** Claude in the pane with the plan as its prompt, told to push and run `gh pr ready` when done. An immediate exit is reported.
 
-**Modes.** A plan that belongs to an objective (`Objective: #N (node X)`) is refused while node X waits on unfinished nodes, or if that objective or node can't be found. An objective dispatches every node that isn't `done` and waits on nothing, creating missing plan issues first (as `engram objective plan` does) and marking dispatched nodes `in_progress`; blocked nodes are listed, and a node whose plan is already closed fails the plan checks (land it with `engram plan land`). `--stack` takes every unfinished node, dependencies first, each based on its unfinished dependency's branch (or, with several, on the one that depends on all the others; otherwise it is skipped as a *diamond*, with its dependents). Nodes whose PR is ready for review are only used as bases. Linear chains with a newly dispatched node are linked with `gh stack link` (run with `GH_REPO`, since gh-stack can't resolve SSH host aliases); without gh-stack the PRs are still chained by their bases. With nothing left to dispatch, `--stack` prints "Nothing to dispatch" and links nothing. A failed node skips its dependents. To dispatch only some of an objective's nodes, pass their plan numbers instead.
+A failed plan doesn't stop the rest; the command fails at the end. Dispatched objective nodes are marked `in_progress`.
 
-**Re-running is safe.** Every step looks up what exists first: mirror and claim, branch (or tracks `origin`'s), PR (through GitHub's closing link, else `Closes #N` in an open PR's body, which is how stacked PRs are found), worktree and session. The branch and PR-title templates only apply while no open PR closes the plan (a found PR's branch and title are kept), so a retitled plan or changed template doesn't start a second branch; a reused PR keeps its base (with a warning if it differs), Claude only launches into a pane at a shell prompt and not once the PR is ready for review, and a branch whose PR already merged is refused.
+**Objectives.** An objective dispatches its unfinished nodes that wait on nothing and lists the blocked ones. A node without a plan issue is skipped with a hint to run `engram objective plan <objective> --node <id>`. A plan that is an objective node (`Objective: #N (node X)`) is refused while node X waits on unfinished nodes, and a closed plan is refused with an `engram plan land <N>` hint.
+
+**`--stack`** takes every unfinished node of one objective, dependencies first, each based on its unfinished dependency's branch. With several, it goes on the one that depends on all the others, else it is skipped as a *diamond*. Nodes whose PR is ready for review are only used as bases. A skipped node, or one that fails before its PR exists, skips its dependents. Linear chains with a newly dispatched node are linked with `gh stack link` (run with `GH_REPO`, since gh-stack can't resolve SSH host aliases); without gh-stack the PRs are still chained by their bases. With nothing new to dispatch, it prints "Nothing to dispatch."
+
+**Re-running is safe.** Every step reuses what exists: mirror and claim, branch, PR, worktree and session. The PR is found through GitHub's closing link or `Closes #N` in its body, and its branch, title and base are kept, so a retitled plan doesn't start a second branch. Claude only launches into a pane at a shell prompt, never once the PR is ready for review, and a branch whose PR already merged is refused.
 
 ### Configuration
 
@@ -274,9 +277,9 @@ branch = "{meta[type]}/{meta[jira]}/{slug}"   # default "{number}-{slug}"
 pr_title = "[{meta[jira]}] {title}"           # default "{title}"
 ```
 
-Placeholders: `{number}` (plan issue), `{kata_ref}` (the mirror's short ref, shown as `<kata-ref>` in a dry run until it exists), `{title}`, `{slug}` (lowercase and dashes, at most 40 characters, cut at a word, a leading `[5.1]` dropped) and `{meta[key]}` (kata metadata, e.g. `jira`, `type`, set by `plan new`/`objective plan` from `--jira`/`--type`, a body line or the title; a plan without a kata mirror reads `jira`/`type` from its `Jira:`/`Type:` body lines or title the same way). `{{`/`}}` are literal braces. Missing keys fail at planning, all listed at once with the fix (`kata meta set <kata-ref> jira ENG-1234`, or a `Jira:` line in the issue body), and the branch name is checked with `git check-ref-format`. The old Python dispatcher's git-config templates are not read: move them here (`prTitle` → `pr_title`, `{short_id}` → `{kata_ref}`; the old default was `{short_id}-{slug}`). Unknown `[dispatch]` keys produce a warning.
+Placeholders: `{number}` (plan issue), `{title}`, `{slug}` (lowercase and dashes, at most 40 characters, cut at a word, a leading `[5.1]` dropped) and `{meta[key]}`. Metadata comes from the kata mirror, or for a plan without one from its `Jira:`/`Type:` body lines or title, as `plan new` would set it. Missing keys fail at planning, each listed with how to set it. The templates only apply to a plan without an open PR, branch names are checked with `git check-ref-format`, and unknown `[dispatch]` keys produce a warning. The old Python dispatcher's git-config templates are not read: move them here (`prTitle` → `pr_title`; its kata-ref placeholders have no equivalent).
 
-Claude is launched as `claude --permission-mode auto "$(cat <prompt>)"`, and the prompt file lives under `$XDG_STATE_HOME/engram/dispatch/`, outside every worktree. `ENGRAM_DISPATCH_CLAUDE` replaces the `claude` command, for tests.
+Claude is launched as `claude --permission-mode auto "$(cat <prompt>)"`, with the prompt file under `$XDG_STATE_HOME/engram/dispatch/`, outside every worktree. If `ENGRAM_DISPATCH_CLAUDE` is set and non-empty, its value replaces the `claude` path (for tests).
 
 ---
 

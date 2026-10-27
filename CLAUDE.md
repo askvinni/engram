@@ -72,7 +72,7 @@ Native kata mirroring for issue *creation* is implemented: `plan new`, `objectiv
 
 ## Dispatch
 
-`engram dispatch` lives in `src/dispatch.rs`. Plans, objectives and `--stack` share one pipeline (gather items → plan each → confirm → execute); a stack is only an ordering plus a base policy. Planning (`plan_target`, `gather*`) never mutates anything: `--dry-run` is planning plus an early return, so every new check belongs there, not in `execute`. Keep pure logic (templates, `slugify`, `stack_order`/`stack_chains`, candidate dedup, node updates, `describe`, `build_prompt`, `launch_command`, kwt JSON parsing) in plain functions and unit-test those with literal inputs; never spawn or mock gh/git/kata/kwt/tmux in tests. Check side effects by hand with `--dry-run`, then `--no-launch` on a throwaway plan.
+`engram dispatch` lives in `src/dispatch.rs`: collect plan issues (`collect_work`, or `collect_stack_work` for `--stack`) → `plan_dispatch` → confirm → `carry_out`. A stack only adds an order (`order_for_stack`) and a base per node (`base_branch`). Planning never mutates anything: `--dry-run` is planning plus an early return, so every new check belongs there, not in `carry_out`. Keep pure logic (`fill_template`, `slugify`, `order_for_stack`, `straight_chains`, `ready_nodes`, `merge_node_progress`, `format_plan`, `build_prompt`, `launch_command`, kwt JSON parsing) in plain functions and unit-test those with literal inputs; never spawn or mock gh/git/kata/kwt/tmux in tests. Check side effects by hand with `--dry-run`, then `--no-launch` on a throwaway plan.
 
 **Preflight is dispatch-only.** Only `cmd_dispatch` calls `preflight` (gh, kata, kwt, tmux, claude, `.kata.toml`); `doctor` shows `unavailable_reasons` as a non-failing line. kwt, tmux and claude are called through the resolved `Toolchain` paths.
 
@@ -81,11 +81,11 @@ Native kata mirroring for issue *creation* is implemented: `plan new`, `objectiv
 - Remove `TMUX_TMPDIR` from every tmux call and address tmux as `-L <tmux_socket_name>` with the session from `kwt open --start-session --json` (kwt runs its own server; never use `tmux ls`).
 - `--start-session` is the only `kwt open` mode that never attaches the terminal; it fails transiently ("fork failed") and is idempotent, so it is retried (`KWT_OPEN_ATTEMPTS`).
 - The launch command starts with `cd <worktree> &&` (the pane may sit in a deleted directory), is only typed into a pane running a shell, and counts as launched only once Claude has taken the pane over and is still there after `LAUNCH_SETTLE`.
-- kwt falls back to `GHOSTHUB_KWT`, since it is often only a shell alias. Worktrees are found by exact branch in `kwt list --json`; `kwt get` matches fuzzily.
-- The prompt file lives under `$XDG_STATE_HOME/engram/dispatch/`, outside every worktree. The claude command is `ENGRAM_DISPATCH_CLAUDE` (tests), else the resolved path; the flags and prompt are always appended.
+- kwt falls back to the `GHOSTHUB_KWT` path, since it is often only a shell alias. Worktrees are found by exact branch in `kwt list --json`; `kwt get` matches fuzzily.
+- The prompt file lives under `$XDG_STATE_HOME/engram/dispatch/`, outside every worktree. `ENGRAM_DISPATCH_CLAUDE` (tests) replaces only the resolved claude path; the flags and prompt are always appended.
 - Branches are made with `git commit-tree` + `git branch` on the fetched `origin/<base>`, never by checkout. `gh stack` runs with `GH_REPO`, since gh-stack can't map SSH host aliases.
 
-**Idempotency.** Every `execute` step looks up existing state first, so a re-run resumes. Keep `Closes #N` in the draft PR body: GitHub never links stacked PRs, so re-runs find them by that line. Never steal another actor's kata claim.
+**Idempotency.** Every `carry_out` step looks up existing state first, so a re-run resumes. Keep `Closes #N` in the draft PR body: GitHub never links stacked PRs, so re-runs find them by that line. Never steal another actor's kata claim.
 
 ## Constants
 
