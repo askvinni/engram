@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::github::{self, OpenPr, PrWithBody};
 use crate::kata;
 use crate::objective::{self, NodeStatus, ObjectiveNode};
@@ -46,7 +46,7 @@ const LAUNCH_POLL: Duration = Duration::from_millis(500);
 /// `kwt open --start-session` attempts; backoff is 1s, then 2s.
 const KWT_OPEN_ATTEMPTS: u64 = 3;
 const PANE_TAIL_LINES: usize = 5;
-/// Replaces the launched `claude` command, verbatim (for tests).
+/// Overrides the launched command above `[dispatch] claude` (verbatim; for tests).
 const CLAUDE_OVERRIDE_ENV: &str = "ENGRAM_DISPATCH_CLAUDE";
 /// Prompt files live under `$XDG_STATE_HOME/<PROMPT_SUBDIR>`, outside every worktree.
 const PROMPT_SUBDIR: &str = "engram/dispatch";
@@ -575,7 +575,7 @@ impl DispatchPlan {
     }
 }
 
-fn format_plan(t: &DispatchPlan, no_launch: bool) -> String {
+fn format_plan(t: &DispatchPlan, no_launch: bool, claude: &str) -> String {
     let kata = match &t.kata_ref {
         Some(r) if t.claimed_by_me => format!("{r} (claimed by you)"),
         Some(r) => format!("{r} (will claim)"),
@@ -609,7 +609,7 @@ fn format_plan(t: &DispatchPlan, no_launch: bool) -> String {
     } else if t.ready() {
         format!("skip ({READY_NO_RELAUNCH})")
     } else {
-        "claude in the workspace's tmux pane".to_string()
+        format!("{} in the workspace's tmux pane", redact_secrets(claude))
     };
     format!(
         "Dispatch plan #{}: {}\n  kata:     {kata}\n  branch:   {} \u{2190} {} ({branch_note})\n  \
@@ -938,7 +938,10 @@ impl Run<'_> {
         for &number in numbers {
             match self.plan_dispatch(number, false) {
                 Ok(plan) => {
-                    print!("{}", format_plan(&plan, self.opts.no_launch));
+                    print!(
+                        "{}",
+                        format_plan(&plan, self.opts.no_launch, &self.claude())
+                    );
                     plans.push(plan);
                 }
                 Err(e) => {
@@ -1113,7 +1116,7 @@ impl Run<'_> {
             let text = if t.ready() {
                 format_ready_base(&t)
             } else {
-                format_plan(&t, self.opts.no_launch)
+                format_plan(&t, self.opts.no_launch, &self.claude())
             };
             print!("Node {id}: {text}");
             placed.insert(id.clone(), PlacedNode::of(&t));
@@ -1420,7 +1423,7 @@ impl Run<'_> {
     }
 
     fn remote_has_branch(&self, b: &str) -> Result<bool> {
-        let output = git(self.root)
+        let output = git_remote(self.root)?
             .args([
                 "ls-remote",
                 "--exit-code",
@@ -1533,12 +1536,12 @@ impl Run<'_> {
             }
         }
 
-        run_checked(git(self.root).args(["fetch", "origin", &t.base]))?;
+        run_checked(git_remote(self.root)?.args(["fetch", "origin", &t.base]))?;
         self.create_branch_if_missing(t)?;
         if t.remote {
             eprintln!("push: skipped, origin already has {}", t.branch);
         } else {
-            run_checked(git(self.root).args(["push", "-u", "origin", &t.branch]))?;
+            run_checked(git_remote(self.root)?.args(["push", "-u", "origin", &t.branch]))?;
             eprintln!("push: pushed {} to origin", t.branch);
         }
 
@@ -1610,7 +1613,7 @@ impl Run<'_> {
             // Dispatched from another machine: track the remote branch rather
             // than creating a divergent wip commit.
             let refspec = format!("refs/heads/{b}:refs/remotes/origin/{b}");
-            run_checked(git(self.root).args(["fetch", "origin", &refspec]))?;
+            run_checked(git_remote(self.root)?.args(["fetch", "origin", &refspec]))?;
             run_checked(git(self.root).args(["branch", "--track", b, &format!("origin/{b}")]))?;
             eprintln!("branch: {b} tracks origin/{b}");
         } else {
@@ -1673,6 +1676,15 @@ impl Run<'_> {
         }
     }
 
+    /// The claude command the pane runs (see [`claude_command`]).
+    fn claude(&self) -> String {
+        claude_command(
+            std::env::var(CLAUDE_OVERRIDE_ENV).ok(),
+            self.cfg.dispatch.claude.as_deref(),
+            &self.tools.claude,
+        )
+    }
+
     fn launch_claude(
         &self,
         t: &DispatchPlan,
@@ -1719,8 +1731,9 @@ impl Run<'_> {
         std::fs::write(&prompt_file, prompt)
             .with_context(|| format!("writing {}", prompt_file.display()))?;
 
-        let claude = claude_command(std::env::var(CLAUDE_OVERRIDE_ENV).ok(), &self.tools.claude);
-        let cmd = launch_command(&claude, worktree, &prompt_file);
+        let claude = self.claude();
+        let user = config::github_user();
+        let cmd = launch_command(&claude, user.as_deref(), worktree, &prompt_file);
         tmux(&["send-keys", "-t", session, "-l", &cmd])?;
         tmux(&["send-keys", "-t", session, "Enter"])?;
 
@@ -1846,20 +1859,61 @@ fn prompt_path(
         .join(format!("{}-{number}.md", repo.replace('/', "-"))))
 }
 
-/// `ENGRAM_DISPATCH_CLAUDE` (verbatim), else the resolved `claude` path.
-fn claude_command(env_override: Option<String>, resolved: &Path) -> String {
+/// `ENGRAM_DISPATCH_CLAUDE`, else `[dispatch] claude` (both verbatim), else
+/// the resolved `claude` path.
+fn claude_command(
+    env_override: Option<String>,
+    configured: Option<&str>,
+    resolved: &Path,
+) -> String {
     env_override
         .filter(|c| !c.is_empty())
+        .or_else(|| configured.filter(|c| !c.is_empty()).map(str::to_string))
         .unwrap_or_else(|| shell_quote(&resolved.to_string_lossy()))
 }
 
-fn launch_command(claude: &str, worktree: &Path, prompt_file: &Path) -> String {
+/// `cmd` for display: the value of every `NAME=value` word whose name looks
+/// like a credential is hidden, so a configured command never prints a token.
+fn redact_secrets(cmd: &str) -> String {
+    cmd.split(' ')
+        .map(|word| match word.split_once('=') {
+            Some((name, _))
+                if ["TOKEN", "SECRET", "KEY", "PASSWORD"]
+                    .iter()
+                    .any(|s| name.to_ascii_uppercase().contains(s)) =>
+            {
+                format!("{name}=\u{2026}")
+            }
+            _ => word.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn launch_command(
+    claude: &str,
+    github_user: Option<&str>,
+    worktree: &Path,
+    prompt_file: &Path,
+) -> String {
     // The pane's shell can start outside the worktree: it inherits the tmux
     // server's cwd, which may be a since-deleted directory, and Claude refuses
     // to start there. cd explicitly rather than trusting the pane.
     let cd = format!("cd {} && ", shell_quote(&worktree.to_string_lossy()));
+    // The pane's shell resolves the token itself (tmux panes don't inherit
+    // engram's env), so it never appears in the keystrokes, the scrollback, or
+    // engram's own command line. A plain assignment chained with && (not a
+    // `VAR=… claude` prefix) gates the launch on the lookup: a failure leaves
+    // the pane at the shell, which launch verification reports, instead of
+    // starting Claude as the active gh account.
+    let token = github_user
+        .map(|u| {
+            let quoted = format!("'{}'", u.replace('\'', r#"'"'"'"#));
+            format!("GH_TOKEN=\"$(gh auth token --user {quoted})\" && export GH_TOKEN && ")
+        })
+        .unwrap_or_default();
     format!(
-        "{cd}{claude} --permission-mode auto \"$(cat {})\"",
+        "{cd}{token}{claude} --permission-mode auto \"$(cat {})\"",
         shell_quote(&prompt_file.to_string_lossy()),
     )
 }
@@ -1868,6 +1922,15 @@ fn git(repo_root: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.current_dir(repo_root);
     cmd
+}
+
+/// `git` for commands that talk to `origin`, with the configured GitHub
+/// identity applied: an HTTPS remote using gh as credential helper would
+/// otherwise authenticate as the active gh account.
+fn git_remote(repo_root: &Path) -> Result<Command> {
+    let mut cmd = git(repo_root);
+    config::with_github_identity(&mut cmd)?;
+    Ok(cmd)
 }
 
 fn run_checked(cmd: &mut Command) -> Result<String> {
@@ -2176,7 +2239,7 @@ mod tests {
     #[case::fresh(target(), false, &[
         "kata:     mfbq (will claim)",
         "143-add-engram-dispatch \u{2190} main (create from origin with an empty wip commit)",
-        "PR:       (will open a draft)\n  worktree: (will create with kwt)\n  launch:   claude",
+        "PR:       (will open a draft)\n  worktree: (will create with kwt)\n  launch:   claude in",
     ])]
     #[case::reused_ready_pr(reused("main"), false, &[
         "(reused from the existing PR; reuse local branch)",
@@ -2196,7 +2259,31 @@ mod tests {
         #[case] no_launch: bool,
         #[case] has: &[&str],
     ) {
-        assert_mentions(&format_plan(&t, no_launch), has, &[]);
+        assert_mentions(&format_plan(&t, no_launch, "claude"), has, &[]);
+    }
+
+    #[rstest]
+    #[case::configured(
+        "my-claude --x",
+        "launch:   my-claude --x in the workspace's tmux pane"
+    )]
+    #[case::token_hidden(
+        "GH_TOKEN=ghp_secret claude",
+        "launch:   GH_TOKEN=\u{2026} claude in the workspace's tmux pane"
+    )]
+    fn format_plan_shows_the_resolved_claude_command(#[case] claude: &str, #[case] want: &str) {
+        let text = format_plan(&target(), false, claude);
+        assert_mentions(&text, &[want], &["ghp_secret"]);
+    }
+
+    #[rstest]
+    #[case::plain("/bin/claude --model opus", "/bin/claude --model opus")]
+    #[case::credentials(
+        "GH_TOKEN=a API_KEY=b Secret=c DEBUG=1 claude",
+        "GH_TOKEN=\u{2026} API_KEY=\u{2026} Secret=\u{2026} DEBUG=1 claude"
+    )]
+    fn redact_secrets_hides_credential_assignments(#[case] cmd: &str, #[case] want: &str) {
+        assert_eq!(redact_secrets(cmd), want);
     }
 
     #[rstest]
@@ -2508,25 +2595,49 @@ mod tests {
         assert_eq!(shell_quote(raw), quoted);
     }
 
-    #[test]
-    fn launch_command_cds_into_the_quoted_worktree() {
-        assert_eq!(
-            launch_command(
-                "'/Apps/My Claude/claude'",
-                Path::new("/wt/my tree"),
-                Path::new("/p.md")
-            ),
-            "cd '/wt/my tree' && '/Apps/My Claude/claude' --permission-mode auto \"$(cat /p.md)\""
-        );
+    #[rstest]
+    #[case::quoted_worktree(
+        "'/Apps/My Claude/claude'",
+        None,
+        "/wt/my tree",
+        "cd '/wt/my tree' && '/Apps/My Claude/claude' --permission-mode auto \"$(cat /p.md)\""
+    )]
+    #[case::token_for_user(
+        "claude",
+        Some("askvinni"),
+        "/wt",
+        "cd /wt && GH_TOKEN=\"$(gh auth token --user 'askvinni')\" && export GH_TOKEN \
+         && claude --permission-mode auto \"$(cat /p.md)\""
+    )]
+    #[case::quoted_user(
+        "claude",
+        Some("a b"),
+        "/wt",
+        "cd /wt && GH_TOKEN=\"$(gh auth token --user 'a b')\" && export GH_TOKEN \
+         && claude --permission-mode auto \"$(cat /p.md)\""
+    )]
+    fn launch_command_quotes_paths_and_gates_the_token(
+        #[case] claude: &str,
+        #[case] token_user: Option<&str>,
+        #[case] worktree: &str,
+        #[case] want: &str,
+    ) {
+        let got = launch_command(claude, token_user, Path::new(worktree), Path::new("/p.md"));
+        assert_eq!(got, want);
     }
 
     #[rstest]
-    #[case::env_override(Some("fake"), "fake")]
-    #[case::blank_env_ignored(Some(""), "'/Apps/My Claude/claude'")]
-    #[case::resolved_path_quoted(None, "'/Apps/My Claude/claude'")]
-    fn claude_command_precedence(#[case] env: Option<&str>, #[case] want: &str) {
+    #[case::env_wins(Some("fake"), Some("claude --x"), "fake")]
+    #[case::blank_env_falls_to_config(Some(""), Some("claude --x"), "claude --x")]
+    #[case::blank_config_falls_to_resolved(None, Some(""), "'/Apps/My Claude/claude'")]
+    #[case::resolved_path_quoted(None, None, "'/Apps/My Claude/claude'")]
+    fn claude_command_precedence(
+        #[case] env: Option<&str>,
+        #[case] config: Option<&str>,
+        #[case] want: &str,
+    ) {
         let resolved = Path::new("/Apps/My Claude/claude");
-        assert_eq!(claude_command(env.map(Into::into), resolved), want);
+        assert_eq!(claude_command(env.map(Into::into), config, resolved), want);
     }
 
     #[rstest]

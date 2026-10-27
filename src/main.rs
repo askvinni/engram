@@ -119,7 +119,7 @@ fn cmd_init() -> Result<()> {
     let mut cfg = config::Config::load(&repo_root)?;
 
     if cfg.github.repo.is_none() {
-        cfg.github.repo = config::infer_repo(&repo_root);
+        cfg.github.repo = config::infer_repo(&repo_root)?;
     }
 
     cfg.save(&repo_root)?;
@@ -430,10 +430,11 @@ fn cmd_doctor() -> Result<()> {
         (
             "gh authenticated",
             Box::new(|| {
-                Command::new("gh")
-                    .args(["auth", "status"])
-                    .output()
-                    .is_ok_and(|o| o.status.success())
+                config::gh_command().is_ok_and(|mut gh| {
+                    gh.args(["auth", "status"])
+                        .output()
+                        .is_ok_and(|o| o.status.success())
+                })
             }),
         ),
         (
@@ -474,7 +475,13 @@ fn cmd_doctor() -> Result<()> {
 
     for (label, check) in checks {
         let ok = check();
-        println!("{} {}", if ok { "✓" } else { "✗" }, label);
+        // A bad `engram.githubUser` fails `gh` auth; say how to fix it.
+        let why = (!ok && *label == "gh authenticated")
+            .then(|| config::gh_command().err())
+            .flatten()
+            .map(|e| format!(" ({e:#})"))
+            .unwrap_or_default();
+        println!("{} {label}{why}", if ok { "✓" } else { "✗" });
         if !ok {
             all_ok = false;
         }
@@ -763,6 +770,9 @@ mod tests {
             .join(".claude/skills/engram-learn/references/memory-quality.md")
             .exists());
         assert!(root.join(".claude/skills/engram-memory/SKILL.md").exists());
+        assert!(root
+            .join(".claude/skills/engram-dispatch/SKILL.md")
+            .exists());
     }
 
     #[test]
