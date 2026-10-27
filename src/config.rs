@@ -8,6 +8,8 @@ use std::sync::OnceLock;
 pub struct Config {
     pub github: GitHubConfig,
     pub memory: MemoryConfig,
+    #[serde(default)]
+    pub dispatch: DispatchConfig,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -33,6 +35,47 @@ impl Default for MemoryConfig {
     }
 }
 
+/// `[dispatch]`: templates for the branches and draft PRs `engram dispatch`
+/// creates (see `dispatch::fill_template` for the placeholders).
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DispatchConfig {
+    pub branch: String,
+    pub pr_title: String,
+}
+
+impl Default for DispatchConfig {
+    fn default() -> Self {
+        Self {
+            branch: DEFAULT_BRANCH_TEMPLATE.into(),
+            pr_title: DEFAULT_PR_TITLE_TEMPLATE.into(),
+        }
+    }
+}
+
+const DEFAULT_BRANCH_TEMPLATE: &str = "{number}-{slug}";
+const DEFAULT_PR_TITLE_TEMPLATE: &str = "{title}";
+
+/// Keys `[dispatch]` understands; anything else is ignored with a warning.
+const DISPATCH_KEYS: &[&str] = &["branch", "pr_title"];
+
+static UNKNOWN_DISPATCH_WARNED: OnceLock<()> = OnceLock::new();
+
+/// Keys in the `[dispatch]` table that `DispatchConfig` doesn't know about
+/// (e.g. the kdispatch-style `prTitle`), sorted.
+fn unknown_dispatch_keys(table: &toml::Table) -> Vec<String> {
+    let Some(dispatch) = table.get("dispatch").and_then(|v| v.as_table()) else {
+        return Vec::new();
+    };
+    let mut keys: Vec<String> = dispatch
+        .keys()
+        .filter(|k| !DISPATCH_KEYS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
+}
+
 impl Config {
     pub fn load(repo_root: &Path) -> Result<Self> {
         let path = repo_root.join(".engram/config.toml");
@@ -41,7 +84,20 @@ impl Config {
         }
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&contents).context("parsing .engram/config.toml")
+        let table: toml::Table =
+            toml::from_str(&contents).context("parsing .engram/config.toml")?;
+        let unknown = unknown_dispatch_keys(&table);
+        if !unknown.is_empty() {
+            UNKNOWN_DISPATCH_WARNED.get_or_init(|| {
+                eprintln!(
+                    "warning: ignoring unknown key(s) in [dispatch] of .engram/config.toml: {} \
+                     (valid keys: {})",
+                    unknown.join(", "),
+                    DISPATCH_KEYS.join(", ")
+                );
+            });
+        }
+        table.try_into().context("parsing .engram/config.toml")
     }
 
     pub fn save(&self, repo_root: &Path) -> Result<()> {
@@ -166,6 +222,7 @@ pub fn resolve_repo(cfg: &Config, repo_root: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     fn git(dir: &Path, args: &[&str]) {
         let status = Command::new("git")
@@ -228,5 +285,53 @@ mod tests {
     fn unavailable_reason_configured_repo_needs_no_remote() {
         assert_eq!(github_unavailable_reason(true, true, false), None);
         assert_eq!(github_unavailable_reason(true, false, true), None);
+    }
+
+    #[rstest]
+    #[case::defaults("", "{number}-{slug}", "{title}")]
+    #[case::partial("[dispatch]\nbranch = \"{slug}\"\n", "{slug}", "{title}")]
+    fn dispatch_section_fills_in_defaults(
+        #[case] section: &str,
+        #[case] branch: &str,
+        #[case] pr_title: &str,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".engram")).unwrap();
+        let text = format!("[github]\n\n[memory]\ndefault_categories = []\n{section}");
+        std::fs::write(dir.path().join(".engram/config.toml"), text).unwrap();
+        let d = Config::load(dir.path()).unwrap().dispatch;
+        assert_eq!((d.branch.as_str(), d.pr_title.as_str()), (branch, pr_title));
+    }
+
+    #[rstest]
+    #[case::no_section("[github]\n", &[])]
+    #[case::known_only("[dispatch]\nbranch = \"x\"\npr_title = \"y\"\n", &[])]
+    #[case::kdispatch_style("[dispatch]\nprTitle = \"y\"\nbranch = \"x\"\n", &["prTitle"])]
+    #[case::sorted("[dispatch]\nzeta = 1\nalpha = 2\n", &["alpha", "zeta"])]
+    fn unknown_dispatch_keys_are_reported(#[case] text: &str, #[case] expected: &[&str]) {
+        let table: toml::Table = toml::from_str(text).unwrap();
+        assert_eq!(unknown_dispatch_keys(&table), expected);
+    }
+
+    #[test]
+    fn dispatch_keys_match_dispatch_config_fields() {
+        let table = toml::Table::try_from(DispatchConfig::default()).unwrap();
+        let mut fields: Vec<&str> = table.keys().map(String::as_str).collect();
+        fields.sort();
+        let mut keys = DISPATCH_KEYS.to_vec();
+        keys.sort();
+        assert_eq!(fields, keys);
+    }
+
+    #[test]
+    fn unknown_dispatch_key_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".engram")).unwrap();
+        let text = "[github]\n\n[memory]\ndefault_categories = []\n\n[dispatch]\nprTitle = \"x\"\n";
+        std::fs::write(dir.path().join(".engram/config.toml"), text).unwrap();
+        assert_eq!(
+            Config::load(dir.path()).unwrap().dispatch,
+            DispatchConfig::default()
+        );
     }
 }

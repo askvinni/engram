@@ -8,6 +8,7 @@ name = "engram"
 path = "src/main.rs"
 
 [dev-dependencies]
+rstest = "0.28"
 tempfile = "3"
 
 [dependencies]

@@ -3,6 +3,9 @@ mod claude;
 mod cli;
 mod compact;
 mod config;
+// Until `engram dispatch` lands, only doctor's availability line uses it.
+#[allow(dead_code)]
+mod dispatch;
 mod github;
 mod index;
 mod kata;
@@ -16,6 +19,7 @@ use clap::Parser;
 use cli::{Cli, Commands, OutputMode};
 use include_dir::{include_dir, Dir};
 use serde::Serialize;
+use std::path::PathBuf;
 use std::process::Command;
 
 /// JSON schema for `engram search --json`
@@ -475,6 +479,13 @@ fn cmd_doctor() -> Result<()> {
         if !ok {
             all_ok = false;
         }
+    }
+
+    // Only `engram dispatch` needs kwt/tmux/kata, so this line never fails doctor.
+    let dispatch_root = config::find_repo_root().unwrap_or_else(|_| PathBuf::from("."));
+    match dispatch::unavailable_reasons(&dispatch_root).as_slice() {
+        [] => println!("✓ dispatch available"),
+        reasons => println!("- dispatch unavailable ({})", reasons.join("; ")),
     }
 
     if !all_ok {
