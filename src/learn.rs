@@ -50,18 +50,21 @@ pub fn write_memory(
     let current_memory = memory::read_all(repo_root)?;
 
     let prompt_hooks = claude::load_prompt_hooks(repo_root);
+    let instructions = memory::read_always_loaded_instructions(repo_root)
+        .context("reading always-loaded instructions")?;
 
     println!("Synthesizing learnings with Claude...");
-    let items = claude::synthesize_learnings(
-        &issue.title,
-        issue.body.as_deref().unwrap_or(""),
-        &pr.title,
-        pr.body.as_deref().unwrap_or(""),
-        &diff,
-        &conversation,
-        &current_memory,
-        &prompt_hooks,
-    )?;
+    let items = claude::synthesize_learnings(&claude::SynthesisInput {
+        issue_title: &issue.title,
+        issue_body: issue.body.as_deref().unwrap_or(""),
+        pr_title: &pr.title,
+        pr_body: pr.body.as_deref().unwrap_or(""),
+        pr_diff: &diff,
+        conversation: &conversation,
+        current_memory: &current_memory,
+        prompt_hooks: &prompt_hooks,
+        instructions: &instructions,
+    })?;
 
     if items.is_empty() {
         println!("No learnings extracted.");

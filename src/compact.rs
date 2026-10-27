@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
 
@@ -17,7 +17,9 @@ pub fn run(repo_root: &Path) -> Result<()> {
     println!("  {} topic files found.", topics.len());
 
     println!("Auditing with Claude...");
-    let actions = claude::compact_learnings(&topics)?;
+    let instructions = memory::read_always_loaded_instructions(repo_root)
+        .context("reading always-loaded instructions")?;
+    let actions = claude::compact_learnings(&topics, &instructions)?;
 
     let deletes: Vec<_> = actions.iter().filter(|a| a.action == "delete").collect();
     let merges: Vec<_> = actions

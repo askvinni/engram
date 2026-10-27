@@ -5,6 +5,8 @@ use std::path::Path;
 
 const ENGRAM_START: &str = "<!-- engram:start -->";
 const ENGRAM_END: &str = "<!-- engram:end -->";
+/// Instruction files every agent session loads; learnings must never restate them.
+const INSTRUCTION_FILES: &[&str] = &["CLAUDE.md", "AGENTS.md"];
 
 /// Memory categories and their OKF v0.2 `type` value.
 pub const CATEGORIES: &[(&str, &str)] = &[
@@ -539,6 +541,42 @@ pub fn write_claude_md_section(repo_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Removes engram's own managed section (`ENGRAM_START`..`ENGRAM_END`, markers
+/// included) so synthesis sees only the human-written instructions.
+pub fn strip_engram_section(text: &str) -> String {
+    match (text.find(ENGRAM_START), text.rfind(ENGRAM_END)) {
+        (Some(start), Some(end_idx)) if end_idx >= start => {
+            let end = end_idx + ENGRAM_END.len();
+            format!("{}{}", &text[..start], &text[end..])
+        }
+        _ => text.to_string(),
+    }
+}
+
+/// Joins the repo's always-loaded instruction files (`INSTRUCTION_FILES`), each
+/// under a `### <name>` heading, with engram's managed section stripped. Missing
+/// or empty files are skipped, as is a file identical to one already included
+/// (e.g. CLAUDE.md symlinked to AGENTS.md). Returns "" when there is nothing.
+pub fn read_always_loaded_instructions(repo_root: &Path) -> Result<String> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut sections = Vec::new();
+    for name in INSTRUCTION_FILES {
+        let path = repo_root.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let text = strip_engram_section(&raw).trim().to_string();
+        if text.is_empty() || seen.contains(&text) {
+            continue;
+        }
+        sections.push(format!("### {name}\n{text}"));
+        seen.push(text);
+    }
+    Ok(sections.join("\n\n"))
+}
+
 // --- helpers ---
 
 pub fn today_iso() -> String {
@@ -721,5 +759,51 @@ mod tests {
         assert_eq!(ids, ["1", "2"]);
         assert_eq!(fm.generated.unwrap().at, today_iso());
         assert_eq!(body.trim(), "Merged.");
+    }
+
+    #[test]
+    fn strip_engram_section_removes_managed_block_only() {
+        let text = "# Repo\n\nRule A.\n\n<!-- engram:start -->\n## Engram Memory\n\n@.engram/memory/index.md\n<!-- engram:end -->\n\nRule B.\n";
+        assert_eq!(
+            strip_engram_section(text),
+            "# Repo\n\nRule A.\n\n\n\nRule B.\n"
+        );
+        assert_eq!(strip_engram_section("no markers"), "no markers");
+        let reversed = "<!-- engram:end --> x <!-- engram:start -->";
+        assert_eq!(strip_engram_section(reversed), reversed);
+    }
+
+    #[test]
+    fn read_always_loaded_instructions_joins_strips_and_dedupes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(read_always_loaded_instructions(root).unwrap(), "");
+
+        std::fs::write(
+            root.join("CLAUDE.md"),
+            "Use anyhow.\n<!-- engram:start -->\n@.engram/memory/index.md\n<!-- engram:end -->\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("AGENTS.md"), "Use anyhow.\n").unwrap();
+        assert_eq!(
+            read_always_loaded_instructions(root).unwrap(),
+            "### CLAUDE.md\nUse anyhow."
+        );
+
+        std::fs::write(root.join("AGENTS.md"), "Run cargo test.\n").unwrap();
+        assert_eq!(
+            read_always_loaded_instructions(root).unwrap(),
+            "### CLAUDE.md\nUse anyhow.\n\n### AGENTS.md\nRun cargo test."
+        );
+
+        std::fs::write(
+            root.join("CLAUDE.md"),
+            "<!-- engram:start -->\nonly managed\n<!-- engram:end -->\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_always_loaded_instructions(root).unwrap(),
+            "### AGENTS.md\nRun cargo test."
+        );
     }
 }

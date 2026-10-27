@@ -91,6 +91,19 @@ Run compact when:
 
 Do not run compact immediately after `engram plan learn` — wait until several learn cycles have accumulated so compact has enough material to reason about relationships between files.
 
+## Reviewing a learn or land PR
+
+`engram plan learn`, `plan land` and `objective land` open a PR of new memory files. Expect to keep roughly a third or less; keeping everything is a red flag. For each file:
+
+1. **Already in CLAUDE.md/AGENTS.md?** Those load every session, so a file that restates them (or follows directly from them) is pure duplication → delete.
+2. **Issue/node number in the title or slug, or "differs from" the issue/spec/old tool?** The code is the source of truth, not the closed issue → delete, unless the divergence is itself a recurring trap (then rewrite it as the trap, without the history).
+3. **One-off process advice** tied to a single event, PR or migration → delete.
+4. **Describes the diff** — function names, signatures, struct shapes, single-feature details → delete.
+5. **Verify every claim against the current code**, not against the issue; fix or delete what is wrong.
+6. **Several files sharing one root insight** (common when one change yields many files) → merge into the strongest.
+
+What survives records a failure, an external constraint, or a non-obvious WHY that applies beyond the feature. After deleting files, run `engram memory migrate` (idempotent) to rebuild `index.md` and the CLAUDE.md section, or remove the deleted rows from `index.md` by hand.
+
 ## Recording observations mid-session
 
 When you notice something worth remembering during a session, record it right away instead of waiting for `plan land`:
@@ -108,7 +121,7 @@ You can edit memory files directly without going through `engram learn`:
 
 1. Edit the file and update `generated.at` to today's date
 2. If the learning no longer applies (e.g., the source was refactored), delete the file
-3. Run `engram compact`-equivalent rebuild by editing `index.md` to remove the deleted entry, or just let the next `engram learn` call rebuild the index
+3. Run `engram memory migrate` to rebuild `index.md` (or let the next `engram learn` do it)
 
 Do not leave stale learnings in place — an agent that reads an outdated tripwire warning will mistrust the whole memory system.
 
