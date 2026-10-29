@@ -20,12 +20,34 @@ A learning passes if **all three** are true:
 
 Skip these, even if they're accurate and true:
 
-- **Import paths and use declarations** — agents use the compiler to find these
-- **Function signatures and struct field lists** — read the source
+- **Import paths, function signatures, struct field lists** — agents use the compiler and the source
 - **Single-module implementation details** — e.g. exactly how `slugify()` works inside `src/memory.rs`; no other module cares
-- **Patterns already universal in the codebase** — e.g. "use `anyhow::Result`"; it's in every file and in CLAUDE.md
-- **Things derivable from `cargo doc`** — public API docs belong in `///` comments, not memory files
-- **Descriptions of what a CLI flag does** — agents can run `engram --help`
+- **Things derivable from `cargo doc` or `--help`** — API docs belong in `///` comments; flags are in `engram --help`
+
+---
+
+## Common over-extraction (delete these)
+
+Most synthesized learnings that reviewers cut fall into these patterns. Drop a candidate that matches one, however accurate it is.
+
+- **Restates the always-loaded instructions.** CLAUDE.md and AGENTS.md load in every session; memory files load only when `read_when` matches. Anything those files already say, or that follows directly from them, is pure duplication — even if this issue is where the rule was learned. Smell: you can point at the paragraph in the always-loaded instructions that says it (e.g. "add `.context()` at every call boundary" when the error-handling section already does).
+- **Spec drift / history narration.** "X shipped differently than issue #N / the plan / the old tool did." The issue is closed and the code is the source of truth; a future agent works from the code, not the issue. Smell: an issue or node number in the title or slug (`objective-141-…`, `…-differs-from-5-4-spec`), or "differs from", "instead of what the issue said". Keep it only if the divergence is itself a trap that will recur — and then state the trap, not the history.
+- **One-off process advice.** Coordination tied to a single event (e.g. "merge the PR retiring tool X after the stack") won't recur in the same form. Smell: it names specific PRs, branches or a one-time migration.
+- **Several angles on one insight.** When candidates from the same change share a root cause, return the strongest one — or none.
+
+---
+
+## Before you return
+
+Check every candidate; drop it at the first "yes":
+
+1. Do the always-loaded instructions already say it?
+2. Does its title or slug carry an issue/node number, or does it narrate how the result differs from an issue, spec or older tool?
+3. Is it tied to one event, PR or migration?
+4. Would a future agent working from the current code get it from 10 minutes with the source?
+5. Does another candidate share its root insight and say it better?
+
+What survives must record a failure, an external constraint, or a non-obvious WHY that applies beyond this feature. **Most issues yield 0–1 learnings; an empty result is normal and good.** A file that restates what agents already know costs tokens in every matching session and dilutes the files that matter.
 
 ---
 

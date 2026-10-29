@@ -8,6 +8,9 @@ const LEARN_QUALITY_GUIDE: &str =
     include_str!("../.claude/skills/engram-learn/references/memory-quality.md");
 const COMPACT_QUALITY_GUIDE: &str = include_str!("../.claude/skills/engram-memory/SKILL.md");
 
+/// Max chars of any one large prompt input (diff, conversation, instructions).
+const PROMPT_SECTION_CAP: usize = 8000;
+
 #[derive(Debug, Deserialize)]
 pub struct Tripwire {
     pub action: String,
@@ -36,6 +39,21 @@ pub struct CompactAction {
     pub target_updated_body: Option<String>,
 }
 
+/// Everything the learn synthesis prompt is built from.
+#[derive(Debug)]
+pub struct SynthesisInput<'a> {
+    pub issue_title: &'a str,
+    pub issue_body: &'a str,
+    pub pr_title: &'a str,
+    pub pr_body: &'a str,
+    pub pr_diff: &'a str,
+    pub conversation: &'a str,
+    pub current_memory: &'a str,
+    pub prompt_hooks: &'a str,
+    /// The repo's CLAUDE.md/AGENTS.md text (see `memory::read_always_loaded_instructions`).
+    pub instructions: &'a str,
+}
+
 fn strip_code_fence(s: &str) -> String {
     let mut lines = s.lines();
     if let Some(first) = lines.next() {
@@ -45,6 +63,31 @@ fn strip_code_fence(s: &str) -> String {
         }
     }
     s.to_string()
+}
+
+/// Returns at most `max` chars of `s` (never splitting a UTF-8 char) and whether it was cut.
+fn truncate_chars(s: &str, max: usize) -> (&str, bool) {
+    match s.char_indices().nth(max) {
+        Some((idx, _)) => (&s[..idx], true),
+        None => (s, false),
+    }
+}
+
+/// Prompt section holding the always-loaded instructions, or "" when there are none.
+fn always_loaded_section(instructions: &str) -> String {
+    let instructions = instructions.trim();
+    if instructions.is_empty() {
+        return String::new();
+    }
+    let (text, cut) = truncate_chars(instructions, PROMPT_SECTION_CAP);
+    let note = if cut {
+        format!("\n*(truncated at {PROMPT_SECTION_CAP} chars)*\n")
+    } else {
+        String::new()
+    };
+    format!(
+        "\n## Always-loaded instructions (never restate)\nEvery agent session in this repo already loads the text below. Anything it says — or that follows directly from it — must not become a memory file.\n\n{text}\n{note}"
+    )
 }
 
 pub fn load_prompt_hooks(repo_root: &std::path::Path) -> String {
@@ -67,57 +110,47 @@ pub fn load_prompt_hooks(repo_root: &std::path::Path) -> String {
         .join("\n\n")
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn synthesize_learnings(
-    issue_title: &str,
-    issue_body: &str,
-    pr_title: &str,
-    pr_body: &str,
-    pr_diff: &str,
-    conversation: &str,
-    current_memory: &str,
-    prompt_hooks: &str,
-) -> Result<Vec<LearningItem>> {
-    let diff = if pr_diff.len() > 8000 {
-        &pr_diff[..8000]
-    } else {
-        pr_diff
-    };
+fn build_synthesis_prompt(input: &SynthesisInput) -> String {
+    let (diff, _) = truncate_chars(input.pr_diff, PROMPT_SECTION_CAP);
+    let (conversation_trimmed, _) = truncate_chars(input.conversation, PROMPT_SECTION_CAP);
 
-    let conversation_trimmed = if conversation.len() > 8000 {
-        &conversation[..8000]
-    } else {
-        conversation
-    };
-
-    let memory_section = if current_memory.is_empty() {
+    let memory_section = if input.current_memory.is_empty() {
         "_none yet_".to_string()
     } else {
-        current_memory.to_string()
+        input.current_memory.to_string()
     };
 
     let conversation_section = if conversation_trimmed.is_empty() {
         String::new()
     } else {
         format!(
-            "\n## Planning Conversation\n{conversation_trimmed}\n*(truncated at 8000 chars if longer)*\n"
+            "\n## Planning Conversation\n{conversation_trimmed}\n*(truncated at {PROMPT_SECTION_CAP} chars if longer)*\n"
         )
     };
 
-    let hooks_section = if prompt_hooks.is_empty() {
+    let hooks_section = if input.prompt_hooks.is_empty() {
         String::new()
     } else {
-        format!("\n## Project-Specific Rules\n{prompt_hooks}\n")
+        format!("\n## Project-Specific Rules\n{}\n", input.prompt_hooks)
     };
 
-    let prompt = format!(
+    let instructions_section = always_loaded_section(input.instructions);
+    let SynthesisInput {
+        issue_title,
+        issue_body,
+        pr_title,
+        pr_body,
+        ..
+    } = input;
+
+    format!(
         r#"You are analyzing a completed GitHub issue and its associated pull request to extract learnings for an AI agent memory system.
 
 ## Quality Guide
 {LEARN_QUALITY_GUIDE}
 
 ---
-
+{instructions_section}
 ## Closed Issue: {issue_title}
 
 {issue_body}
@@ -134,7 +167,7 @@ pub fn synthesize_learnings(
 {hooks_section}
 ---
 
-Extract 1–4 learnings. Only include a learning if it passes the extraction bar in the quality guide above.
+Extract 0–2 learnings. Only include a learning if it passes the extraction bar and the "Before you return" check in the quality guide above. Returning `[]` is expected and correct when nothing clears the bar.
 
 Return ONLY a JSON array, no other text:
 [
@@ -166,12 +199,15 @@ Return ONLY a JSON array, no other text:
     "body": "One paragraph explaining WHY this approach is better than alternatives."
   }}
 ]"#
-    );
+    )
+}
 
-    // Run from a temp dir so Claude Code doesn't pick up the repo's CLAUDE.md
-    // and try to act on it rather than just synthesizing JSON.
+/// Runs `claude -p` from a temp dir so Claude Code doesn't pick up the repo's
+/// CLAUDE.md and try to act on it rather than just returning JSON, and returns
+/// the JSON array in its output.
+fn run_claude_for_json_array(prompt: &str) -> Result<String> {
     let output = Command::new("claude")
-        .args(["-p", &prompt, "--output-format", "text"])
+        .args(["-p", prompt, "--output-format", "text"])
         .current_dir(std::env::temp_dir())
         .output()
         .context("running claude CLI (is Claude Code installed and authenticated?)")?;
@@ -192,30 +228,31 @@ Return ONLY a JSON array, no other text:
     let json_end = stripped
         .rfind(']')
         .context("claude output had no closing ]")?;
-    let json = &stripped[json_start..=json_end];
-
-    serde_json::from_str(json).context("parsing learning items from claude output")
+    Ok(stripped[json_start..=json_end].to_string())
 }
 
-pub fn compact_learnings(topics: &[crate::memory::TopicFile]) -> Result<Vec<CompactAction>> {
-    if topics.is_empty() {
-        return Ok(Vec::new());
-    }
+pub fn synthesize_learnings(input: &SynthesisInput) -> Result<Vec<LearningItem>> {
+    let json = run_claude_for_json_array(&build_synthesis_prompt(input))?;
+    serde_json::from_str(&json).context("parsing learning items from claude output")
+}
 
+fn build_compact_prompt(topics: &[crate::memory::TopicFile], instructions: &str) -> String {
     let files_section: String = topics
         .iter()
         .map(|t| format!("### {}/{}\n{}\n", t.category, t.slug, t.content))
         .collect::<Vec<_>>()
         .join("\n");
 
-    let prompt = format!(
+    let instructions_section = always_loaded_section(instructions);
+
+    format!(
         r#"You are aggressively pruning an AI agent memory system. The default action is DELETE. Only keep a file if it clears a high bar.
 
 ## Memory system reference
 {COMPACT_QUALITY_GUIDE}
 
 ---
-
+{instructions_section}
 ## The only reasons to KEEP a file
 
 1. **It records a failure that already happened** — a bug, a wrong approach, a gotcha that was discovered the hard way. The file exists so the same mistake is not repeated.
@@ -224,6 +261,9 @@ pub fn compact_learnings(topics: &[crate::memory::TopicFile]) -> Result<Vec<Comp
 
 ## DELETE everything else, including
 
+- Any file that restates the always-loaded instructions (CLAUDE.md/AGENTS.md) — they are loaded every session already
+- Any file that narrates how shipped code differs from an issue, spec, plan node or old tool — the code is the source of truth (titles or slugs with issue/node numbers are the usual smell)
+- Any one-off process or coordination advice tied to a single event (e.g. the order to merge one particular set of PRs)
 - Any file that describes HOW the code works (a developer can read the code)
 - Any file that documents the current design or current command behaviour
 - Any pattern that is the obvious/natural approach in Rust or in this codebase
@@ -253,35 +293,41 @@ Return ONLY a JSON array. Every file must appear exactly once. Be aggressive —
     "target_updated_body": "Synthesised paragraph.",
     "reason": "Same root insight"}}
 ]"#
-    );
+    )
+}
 
-    let output = Command::new("claude")
-        .args(["-p", &prompt, "--output-format", "text"])
-        .current_dir(std::env::temp_dir())
-        .output()
-        .context("running claude CLI")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("claude -p failed: {}", stderr.trim());
+/// `instructions` is the repo's CLAUDE.md/AGENTS.md text
+/// (see `memory::read_always_loaded_instructions`); "" omits that section.
+pub fn compact_learnings(
+    topics: &[crate::memory::TopicFile],
+    instructions: &str,
+) -> Result<Vec<CompactAction>> {
+    if topics.is_empty() {
+        return Ok(Vec::new());
     }
-
-    let text = String::from_utf8(output.stdout)?;
-    let stripped = strip_code_fence(text.trim());
-    let json_start = stripped
-        .find('[')
-        .context("claude output contained no JSON array")?;
-    let json_end = stripped
-        .rfind(']')
-        .context("claude output had no closing ]")?;
-    let json = &stripped[json_start..=json_end];
-
-    serde_json::from_str(json).context("parsing compact actions from claude output")
+    let json = run_claude_for_json_array(&build_compact_prompt(topics, instructions))?;
+    serde_json::from_str(&json).context("parsing compact actions from claude output")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SECTION_HEADING: &str = "## Always-loaded instructions (never restate)";
+
+    fn input(instructions: &str) -> SynthesisInput<'_> {
+        SynthesisInput {
+            issue_title: "Issue title",
+            issue_body: "Issue body",
+            pr_title: "PR title",
+            pr_body: "PR body",
+            pr_diff: "diff --git a/x b/x",
+            conversation: "",
+            current_memory: "",
+            prompt_hooks: "",
+            instructions,
+        }
+    }
 
     #[test]
     fn strip_code_fence_bare_json() {
@@ -310,5 +356,68 @@ mod tests {
     fn strip_code_fence_no_closing_fence() {
         let input = "```json\n[1, 2]";
         assert_eq!(strip_code_fence(input), "[1, 2]");
+    }
+
+    #[test]
+    fn truncate_chars_respects_char_boundaries() {
+        assert_eq!(truncate_chars("abc", 5), ("abc", false));
+        assert_eq!(truncate_chars("abc", 3), ("abc", false));
+        assert_eq!(truncate_chars("abcdef", 3), ("abc", true));
+        // Multi-byte chars: a byte slice at 3 would panic mid-"é".
+        assert_eq!(truncate_chars("ééé", 2), ("éé", true));
+    }
+
+    #[test]
+    fn always_loaded_section_empty_when_no_instructions() {
+        assert_eq!(always_loaded_section(""), "");
+        assert_eq!(always_loaded_section("  \n\t"), "");
+    }
+
+    #[test]
+    fn always_loaded_section_truncates_with_note() {
+        let short = always_loaded_section("### CLAUDE.md\nUse anyhow.");
+        assert!(short.contains(SECTION_HEADING));
+        assert!(short.contains("Use anyhow."));
+        assert!(!short.contains("truncated"));
+
+        let long = "x".repeat(PROMPT_SECTION_CAP + 10);
+        let section = always_loaded_section(&long);
+        assert!(section.contains(&"x".repeat(PROMPT_SECTION_CAP)));
+        assert!(!section.contains(&"x".repeat(PROMPT_SECTION_CAP + 1)));
+        assert!(section.contains(&format!("truncated at {PROMPT_SECTION_CAP} chars")));
+    }
+
+    #[test]
+    fn synthesis_prompt_includes_instructions_only_when_present() {
+        let without = build_synthesis_prompt(&input(""));
+        assert!(!without.contains(SECTION_HEADING));
+        assert!(without.contains("Extract 0–2 learnings"));
+        assert!(without.contains("Returning `[]` is expected"));
+
+        let with = build_synthesis_prompt(&input("### CLAUDE.md\nNever use unwrap."));
+        assert!(with.contains(SECTION_HEADING));
+        assert!(with.contains("Never use unwrap."));
+        // Instructions come before the issue so they frame the extraction.
+        let section_at = with.find(SECTION_HEADING).unwrap();
+        assert!(section_at < with.find("## Closed Issue: Issue title").unwrap());
+    }
+
+    #[test]
+    fn compact_prompt_includes_instructions_only_when_present() {
+        let topics = [crate::memory::TopicFile {
+            category: "patterns".into(),
+            slug: "foo".into(),
+            content: "Foo body.".into(),
+        }];
+        let without = build_compact_prompt(&topics, "");
+        assert!(!without.contains(SECTION_HEADING));
+        assert!(without.contains("### patterns/foo\nFoo body."));
+        assert!(without.contains("restates the always-loaded instructions"));
+        assert!(without.contains("narrates how shipped code differs"));
+        assert!(without.contains("one-off process or coordination advice"));
+
+        let with = build_compact_prompt(&topics, "### AGENTS.md\nRun cargo test.");
+        assert!(with.contains(SECTION_HEADING));
+        assert!(with.contains("Run cargo test."));
     }
 }

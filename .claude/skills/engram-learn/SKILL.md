@@ -29,10 +29,10 @@ If either check fails, `engram plan learn` will exit with an error message. Fix 
 
 1. Fetches issue `#N` title and body
 2. Finds the merged PR via GitHub's `CLOSED_EVENT` GraphQL query (`src/github.rs:find_linked_pr`)
-3. Fetches the PR diff, capped at 8 000 bytes (`src/github.rs:get_pr_diff`)
+3. Fetches the PR diff, capped at 8 000 characters in the prompt (`src/claude.rs`)
 4. Fetches issue comments and extracts the first comment containing `<!-- engram:conversation -->` (`src/github.rs:get_issue_comments`); the conversation text is included in the synthesis prompt under `## Planning Conversation` (also capped at 8 000 chars)
 5. Reads all existing `.engram/memory/` files for deduplication context (`src/memory.rs:read_all`)
-6. Loads `.engram/prompt-hooks/*.md` (excluding `README.md`) to inject repo-specific synthesis rules
+6. Loads `.engram/prompt-hooks/*.md` (excluding `README.md`) to inject repo-specific synthesis rules, plus the repo's CLAUDE.md/AGENTS.md (minus the engram-managed section, capped at 8 000 chars) as "always-loaded instructions" that learnings must never restate
 7. Invokes `claude -p` **from `std::env::temp_dir()`** — not from the repo root — to prevent Claude Code from loading the repo's CLAUDE.md as agent context
 8. Strips markdown code fences from the response, parses a JSON array of `LearningItem`s
 9. For each item: writes to `.engram/memory/<category>/<slug>.md`, accumulating `sources` if the file already exists
@@ -54,7 +54,7 @@ Use **`learn`** alone when you want to inspect the created memory files on the b
 
 ## Reviewing synthesized learnings
 
-After `engram plan learn` creates the branch, check each new file in `.engram/memory/`:
+After `engram plan learn`, `plan land` or `objective land` opens a PR, work through the "Reviewing a learn or land PR" checklist in the `engram-memory` skill: expect to delete most files (restated CLAUDE.md/AGENTS.md rules, spec-drift narration, one-off process advice, overlapping files). Then check each kept file:
 
 **`read_when` conditions** — should be concrete task phrases an agent will recognise at decision time:
 - Good: `"calling claude -p programmatically from engram"`
