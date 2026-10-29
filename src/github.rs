@@ -2,6 +2,9 @@ use crate::config;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+/// Label marking a plan issue whose learnings have been synthesized (and the PRs that carry them).
+pub const LEARNED_LABEL: &str = "engram-learned";
+
 #[derive(Debug, Deserialize)]
 pub struct Issue {
     pub title: String,
@@ -787,7 +790,7 @@ pub fn list_unlearned_plans(repo: &str) -> Result<Vec<PlanIssue>> {
         serde_json::from_str(&out).context("parsing issue list JSON")?;
     Ok(all
         .into_iter()
-        .filter(|i| !i.labels.iter().any(|l| l.name == "engram-learned"))
+        .filter(|i| !i.labels.iter().any(|l| l.name == LEARNED_LABEL))
         .map(|i| PlanIssue {
             number: i.number,
             title: i.title,

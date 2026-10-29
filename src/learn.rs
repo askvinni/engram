@@ -115,11 +115,64 @@ fn format_synthesis_comment(items: &[claude::LearningItem]) -> String {
     out
 }
 
+/// How learning from one plan issue ended. Decides whether the issue is
+/// labelled `engram-learned`, which keeps `plan learn --all` from picking it up again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LearnOutcome {
+    /// Synthesis ran and returned no learnings.
+    NoLearnings,
+    /// Learnings were written but memory on disk did not change (nothing staged).
+    Unchanged,
+    /// Learnings were committed and a PR was opened.
+    PrCreated,
+    /// Fetching, synthesis, commit, push or PR creation failed — retry later.
+    Failed,
+}
+
+impl LearnOutcome {
+    /// Once synthesis ran successfully the issue counts as learned; only a
+    /// failure leaves it unlabelled so a later `--all` run retries it.
+    pub fn should_label(self) -> bool {
+        !matches!(self, LearnOutcome::Failed)
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            LearnOutcome::NoLearnings => "no learnings",
+            LearnOutcome::Unchanged => "memory unchanged",
+            LearnOutcome::PrCreated => "learnings PR created",
+            LearnOutcome::Failed => "failed",
+        }
+    }
+}
+
+/// Label `issue_number` as learned if `outcome` warrants it. No-op for `Failed`.
+pub fn mark_learned(repo: &str, issue_number: u64, outcome: LearnOutcome) -> Result<()> {
+    if !outcome.should_label() {
+        return Ok(());
+    }
+    github::add_label_to_issue(repo, issue_number, github::LEARNED_LABEL)
+        .with_context(|| format!("labelling #{issue_number} {}", github::LEARNED_LABEL))?;
+    println!(
+        "Labelled #{issue_number} {} ({}).",
+        github::LEARNED_LABEL,
+        outcome.reason()
+    );
+    Ok(())
+}
+
+/// Like [`mark_learned`], but a labelling failure is only a warning.
+pub fn mark_learned_or_warn(repo: &str, issue_number: u64, outcome: LearnOutcome) {
+    if let Err(e) = mark_learned(repo, issue_number, outcome) {
+        eprintln!("warning: could not label #{issue_number}: {e:#}");
+    }
+}
+
 pub fn run(repo_root: &Path, cfg: &config::Config, issue_number: u64, no_kata: bool) -> Result<()> {
     let repo = config::resolve_repo(cfg, repo_root)?;
 
     if !write_memory(repo_root, issue_number, &repo, no_kata)? {
-        return Ok(());
+        return mark_learned(&repo, issue_number, LearnOutcome::NoLearnings);
     }
 
     let branch = format!("engram/learn-{issue_number}");
@@ -133,7 +186,7 @@ pub fn run(repo_root: &Path, cfg: &config::Config, issue_number: u64, no_kata: b
         .status()?;
     if staged.success() {
         println!("Nothing to commit — memory unchanged.");
-        return Ok(());
+        return mark_learned(&repo, issue_number, LearnOutcome::Unchanged);
     }
 
     git(
@@ -152,13 +205,11 @@ pub fn run(repo_root: &Path, cfg: &config::Config, issue_number: u64, no_kata: b
         &repo,
         &format!("engram: learn from #{issue_number}"),
         &pr_body,
-        "engram-learned",
+        github::LEARNED_LABEL,
     )?;
 
-    github::add_label_to_issue(&repo, issue_number, "engram-learned")?;
-
     println!("PR created: {}", pr_url.trim());
-    Ok(())
+    mark_learned(&repo, issue_number, LearnOutcome::PrCreated)
 }
 
 fn git(repo_root: &Path, args: &[&str]) -> Result<()> {
@@ -174,6 +225,8 @@ fn git(repo_root: &Path, args: &[&str]) -> Result<()> {
 
 /// Commit all memory changes to a new branch and open a PR labeled `engram-learned`.
 /// Returns the PR URL if a commit+PR was created, or None if nothing was staged.
+/// Either way every issue in `learned` is then labelled `engram-learned` (failures
+/// are warnings); if commit, push or PR creation fails, nothing is labelled.
 pub fn commit_memory_pr(
     repo_root: &Path,
     repo: &str,
@@ -193,6 +246,9 @@ pub fn commit_memory_pr(
 
     if nothing_staged {
         println!("Nothing to commit — memory unchanged.");
+        for &n in learned {
+            mark_learned_or_warn(repo, n, LearnOutcome::Unchanged);
+        }
         return Ok(None);
     }
 
@@ -208,13 +264,11 @@ pub fn commit_memory_pr(
     )?;
     git(repo_root, &["push", "-u", "origin", branch])?;
 
-    let pr_url = github::create_pr(repo, pr_title, pr_body, "engram-learned")?;
+    let pr_url = github::create_pr(repo, pr_title, pr_body, github::LEARNED_LABEL)?;
     let pr_url = pr_url.trim().to_string();
 
     for &n in learned {
-        if let Err(e) = github::add_label_to_issue(repo, n, "engram-learned") {
-            eprintln!("warning: could not label #{n}: {e:#}");
-        }
+        mark_learned_or_warn(repo, n, LearnOutcome::PrCreated);
     }
 
     Ok(Some(pr_url))
@@ -223,6 +277,25 @@ pub fn commit_memory_pr(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::no_learnings(LearnOutcome::NoLearnings, true)]
+    #[case::memory_unchanged(LearnOutcome::Unchanged, true)]
+    #[case::pr_created(LearnOutcome::PrCreated, true)]
+    #[case::failed(LearnOutcome::Failed, false)]
+    fn should_label_only_after_successful_synthesis(
+        #[case] outcome: LearnOutcome,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(outcome.should_label(), expected);
+    }
+
+    #[test]
+    fn mark_learned_is_noop_on_failure() {
+        // Must not shell out to gh: Failed short-circuits before any I/O.
+        assert!(mark_learned("owner/repo", 1, LearnOutcome::Failed).is_ok());
+    }
 
     fn make_item(category: &str, slug: &str, title: &str) -> claude::LearningItem {
         claude::LearningItem {

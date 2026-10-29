@@ -638,6 +638,12 @@ pub fn land(repo_root: &std::path::Path, repo: &str, objective_number: u64) -> R
         };
         if wrote {
             learned.push(plan_num);
+        } else {
+            crate::learn::mark_learned_or_warn(
+                repo,
+                plan_num,
+                crate::learn::LearnOutcome::NoLearnings,
+            );
         }
         nodes[idx].status = NodeStatus::Done;
         let updated = build_objective_body(&obj_body, &nodes);
