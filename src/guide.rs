@@ -89,10 +89,12 @@ mod tests {
     }
 
     #[test]
-    fn list_has_all_six_topics() {
+    fn list_has_a_line_per_topic() {
         let out = list();
-        assert_eq!(out.lines().count(), 6);
-        assert!(out.contains("memory-quality"));
+        assert_eq!(out.lines().count(), TOPICS.len());
+        for t in TOPICS {
+            assert!(out.contains(t.name), "missing {}", t.name);
+        }
     }
 
     #[test]

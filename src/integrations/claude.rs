@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::process::Command;
 
+use crate::process;
+
 // The guides served by `engram guide` are included here so the same quality rules
 // that guide interactive Claude Code sessions also govern the claude -p synthesis calls.
 const LEARN_QUALITY_GUIDE: &str = crate::guide::MEMORY_QUALITY;
@@ -9,6 +11,8 @@ const COMPACT_QUALITY_GUIDE: &str = crate::guide::MEMORY;
 
 /// Max chars of any one large prompt input (diff, conversation, instructions).
 const PROMPT_SECTION_CAP: usize = 8000;
+/// Repo-relative directory of the markdown rules injected into the learn prompt.
+pub const PROMPT_HOOKS_DIR: &str = ".engram/prompt-hooks";
 
 #[derive(Debug, Deserialize)]
 pub struct Tripwire {
@@ -27,9 +31,19 @@ pub struct LearningItem {
     pub body: String,
 }
 
+/// What `compact` does with one memory file. An action Claude invents is a
+/// parse error rather than silently ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactKind {
+    Keep,
+    Delete,
+    MergeInto,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CompactAction {
-    pub action: String, // "delete", "keep", "merge_into"
+    pub action: CompactKind,
     pub category: String,
     pub slug: String,
     pub reason: Option<String>,
@@ -72,6 +86,15 @@ fn truncate_chars(s: &str, max: usize) -> (&str, bool) {
     }
 }
 
+/// The note appended to a prompt input that `truncate_chars` cut, or "".
+fn truncation_note(cut: bool) -> String {
+    if cut {
+        format!("\n*(truncated at {PROMPT_SECTION_CAP} chars)*\n")
+    } else {
+        String::new()
+    }
+}
+
 /// Prompt section holding the always-loaded instructions, or "" when there are none.
 fn always_loaded_section(instructions: &str) -> String {
     let instructions = instructions.trim();
@@ -79,28 +102,24 @@ fn always_loaded_section(instructions: &str) -> String {
         return String::new();
     }
     let (text, cut) = truncate_chars(instructions, PROMPT_SECTION_CAP);
-    let note = if cut {
-        format!("\n*(truncated at {PROMPT_SECTION_CAP} chars)*\n")
-    } else {
-        String::new()
-    };
+    let note = truncation_note(cut);
     format!(
         "\n## Always-loaded instructions (never restate)\nEvery agent session in this repo already loads the text below. Anything it says — or that follows directly from it — must not become a memory file.\n\n{text}\n{note}"
     )
 }
 
 pub fn load_prompt_hooks(repo_root: &std::path::Path) -> String {
-    let hooks_dir = repo_root.join(".engram/prompt-hooks");
+    let hooks_dir = repo_root.join(PROMPT_HOOKS_DIR);
     if !hooks_dir.exists() {
         return String::new();
     }
     let mut entries: Vec<_> = std::fs::read_dir(&hooks_dir)
         .into_iter()
         .flatten()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
         .collect();
-    entries.sort_by_key(|e| e.path());
+    entries.sort_by_key(std::fs::DirEntry::path);
     entries
         .iter()
         .filter(|e| e.file_name() != "README.md")
@@ -111,7 +130,8 @@ pub fn load_prompt_hooks(repo_root: &std::path::Path) -> String {
 
 fn build_synthesis_prompt(input: &SynthesisInput) -> String {
     let (diff, _) = truncate_chars(input.pr_diff, PROMPT_SECTION_CAP);
-    let (conversation_trimmed, _) = truncate_chars(input.conversation, PROMPT_SECTION_CAP);
+    let (conversation_trimmed, conversation_cut) =
+        truncate_chars(input.conversation, PROMPT_SECTION_CAP);
 
     let memory_section = if input.current_memory.is_empty() {
         "_none yet_".to_string()
@@ -123,7 +143,8 @@ fn build_synthesis_prompt(input: &SynthesisInput) -> String {
         String::new()
     } else {
         format!(
-            "\n## Planning Conversation\n{conversation_trimmed}\n*(truncated at {PROMPT_SECTION_CAP} chars if longer)*\n"
+            "\n## Planning Conversation\n{conversation_trimmed}\n{}",
+            truncation_note(conversation_cut)
         )
     };
 
@@ -201,25 +222,24 @@ Return ONLY a JSON array, no other text:
     )
 }
 
-/// Runs `claude -p` from a temp dir so Claude Code doesn't pick up the repo's
-/// CLAUDE.md and try to act on it rather than just returning JSON, and returns
-/// the JSON array in its output.
+/// Runs `claude -p` and returns its trimmed output. It runs from a temp dir
+/// so Claude Code doesn't pick up the repo's CLAUDE.md and act on it instead
+/// of just answering.
+pub fn run_prompt(prompt: &str) -> Result<String> {
+    process::run_checked(
+        Command::new("claude")
+            .args(["-p", prompt, "--output-format", "text"])
+            .current_dir(std::env::temp_dir()),
+    )
+    .context("running claude -p (is Claude Code installed and authenticated?)")
+}
+
+/// Runs `claude -p` (see [`run_prompt`]) and returns the JSON array in its output.
 fn run_claude_for_json_array(prompt: &str) -> Result<String> {
-    let output = Command::new("claude")
-        .args(["-p", prompt, "--output-format", "text"])
-        .current_dir(std::env::temp_dir())
-        .output()
-        .context("running claude CLI (is Claude Code installed and authenticated?)")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("claude -p failed: {}", stderr.trim());
-    }
-
-    let text = String::from_utf8(output.stdout)?;
+    let text = run_prompt(prompt)?;
 
     // Strip markdown code fences (```json ... ``` or ``` ... ```) if present
-    let stripped = strip_code_fence(text.trim());
+    let stripped = strip_code_fence(&text);
 
     let json_start = stripped
         .find('[')
@@ -418,6 +438,33 @@ mod tests {
         let with = build_compact_prompt(&topics, "### AGENTS.md\nRun cargo test.");
         assert!(with.contains(SECTION_HEADING));
         assert!(with.contains("Run cargo test."));
+    }
+
+    #[test]
+    fn synthesis_prompt_notes_truncation_only_when_cut() {
+        let mut short = input("");
+        short.conversation = "We agreed on X.";
+        let prompt = build_synthesis_prompt(&short);
+        assert!(prompt.contains("## Planning Conversation\nWe agreed on X."));
+        assert!(!prompt.contains("truncated"));
+
+        let long = "y".repeat(PROMPT_SECTION_CAP + 1);
+        let mut cut = input("");
+        cut.conversation = &long;
+        assert!(build_synthesis_prompt(&cut).contains("truncated at"));
+    }
+
+    #[test]
+    fn compact_kinds_parse_and_unknown_ones_fail() {
+        let actions: Vec<CompactAction> = serde_json::from_str(
+            r#"[{"action":"keep","category":"patterns","slug":"a"},
+                {"action":"merge_into","category":"patterns","slug":"b","target_category":"patterns","target_slug":"a"}]"#,
+        )
+        .unwrap();
+        assert_eq!(actions[0].action, CompactKind::Keep);
+        assert_eq!(actions[1].action, CompactKind::MergeInto);
+        let unknown = r#"[{"action":"archive","category":"patterns","slug":"a"}]"#;
+        assert!(serde_json::from_str::<Vec<CompactAction>>(unknown).is_err());
     }
 
     #[test]

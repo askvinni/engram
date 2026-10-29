@@ -124,7 +124,7 @@ Bullet list of nodes, one per line. Format:
 - 1.1: Description
 - 1.2: Description (depends: 1.1)
 ```
-This section is parsed by `parse_nodes_from_roadmap_input` in `src/objective.rs`. The `engram objective new` command converts it to a rendered Markdown table plus the hidden `<!-- engram:nodes [...] -->` state comment. Do **not** write the table or the JSON manually — the CLI generates them.
+This section is parsed by `parse_nodes_from_roadmap_input` in `src/workflow/objective.rs`. The `engram objective new` command converts it to a rendered Markdown table plus the hidden `<!-- engram:nodes [...] -->` state comment. Do **not** write the table or the JSON manually — the CLI generates them.
 
 ### **Acceptance criteria**
 Checkable outcome checklist for the whole objective. Each item must be verifiable. *"works correctly"* fails; *"`engram objective list` no longer shows this issue after all nodes reach done"* passes.

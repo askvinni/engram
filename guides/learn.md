@@ -22,10 +22,10 @@ If either check fails, `engram plan learn` will exit with an error message. Fix 
 ## What `engram plan learn` does
 
 1. Fetches issue `#N` title and body
-2. Finds the merged PR via GitHub's `CLOSED_EVENT` GraphQL query (`src/github.rs:find_linked_pr`)
-3. Fetches the PR diff, capped at 8 000 characters in the prompt (`src/claude.rs`)
-4. Fetches issue comments and extracts the first comment containing `<!-- engram:conversation -->` (`src/github.rs:get_issue_comments`); the conversation text is included in the synthesis prompt under `## Planning Conversation` (also capped at 8 000 chars)
-5. Reads all existing `.engram/memory/` files for deduplication context (`src/memory.rs:read_all`)
+2. Finds the merged PR via GitHub's `CLOSED_EVENT` GraphQL query (`src/integrations/github.rs:find_linked_pr`)
+3. Fetches the PR diff, capped at 8 000 characters in the prompt (`src/integrations/claude.rs`)
+4. Fetches issue comments and extracts the first comment containing `<!-- engram:conversation -->` (`src/integrations/github.rs:get_issue_comments`); the conversation text is included in the synthesis prompt under `## Planning Conversation` (also capped at 8 000 chars)
+5. Reads all existing `.engram/memory/` files for deduplication context (`src/memory/mod.rs:read_all`)
 6. Loads `.engram/prompt-hooks/*.md` (excluding `README.md`) to inject repo-specific synthesis rules, plus the repo's CLAUDE.md/AGENTS.md (minus the engram-managed section, capped at 8 000 chars) as "always-loaded instructions" that learnings must never restate
 7. Invokes `claude -p` **from `std::env::temp_dir()`** — not from the repo root — to prevent Claude Code from loading the repo's CLAUDE.md as agent context
 8. Strips markdown code fences from the response, parses a JSON array of `LearningItem`s
@@ -54,7 +54,7 @@ After `engram plan learn`, `plan land` or `objective land` opens a PR, work thro
 - Good: `"calling claude -p programmatically from engram"`
 - Bad: `"working with Claude"`
 
-**Body** — should explain WHY, not WHAT. If the content could be found by reading the relevant source file for 5 minutes, the file should not exist. Source pointers (`see src/claude.rs:synthesize_learnings`) are better than copied code.
+**Body** — should explain WHY, not WHAT. If the content could be found by reading the relevant source file for 5 minutes, the file should not exist. Source pointers (`see src/integrations/claude.rs:synthesize_learnings`) are better than copied code.
 
 **Category** — verify it's the lowest applicable level:
 - `patterns/` — approaches worth repeating across multiple future features
@@ -68,7 +68,7 @@ For the full extraction quality bar, run `engram guide memory-quality`.
 
 To influence how Claude categorises or phrases learnings for this repo, add `.md` files to `.engram/prompt-hooks/`. Each file's content is appended to the synthesis prompt.
 
-Do not put a README or other documentation file there unless it is named exactly `README.md` — that name is the only one filtered out automatically (`src/claude.rs:load_prompt_hooks`). Any other `.md` file in that directory will be treated as a rule.
+Do not put a README or other documentation file there unless it is named exactly `README.md` — that name is the only one filtered out automatically (`src/integrations/claude.rs:load_prompt_hooks`). Any other `.md` file in that directory will be treated as a rule.
 
 ## After the learning PR merges
 

@@ -4,10 +4,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+/// Repo-relative path of engram's committed config file.
+pub const CONFIG_PATH: &str = ".engram/config.toml";
+
+/// `.engram/config.toml`. Tables this engram doesn't know are ignored.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Config {
+    #[serde(default)]
     pub github: GitHubConfig,
-    pub memory: MemoryConfig,
+    /// The retired `[memory]` table, unused but written back as found:
+    /// engram builds before its retirement fail to parse a config without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory: Option<toml::Table>,
     #[serde(default)]
     pub dispatch: DispatchConfig,
 }
@@ -15,24 +23,6 @@ pub struct Config {
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct GitHubConfig {
     pub repo: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct MemoryConfig {
-    pub default_categories: Vec<String>,
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            default_categories: vec![
-                "patterns".into(),
-                "tripwires".into(),
-                "architecture".into(),
-                "testing".into(),
-            ],
-        }
-    }
 }
 
 /// `[dispatch]`: templates for the branches and draft PRs `engram dispatch`
@@ -63,7 +53,7 @@ const DEFAULT_BRANCH_TEMPLATE: &str = "{number}-{slug}";
 const DEFAULT_PR_TITLE_TEMPLATE: &str = "{title}";
 
 /// Keys `[dispatch]` understands; anything else is ignored with a warning.
-const DISPATCH_KEYS: &[&str] = &["branch", "pr_title"];
+const DISPATCH_KEYS: &[&str] = &["branch", "pr_title", "claude"];
 
 static UNKNOWN_DISPATCH_WARNED: OnceLock<()> = OnceLock::new();
 
@@ -84,34 +74,37 @@ fn unknown_dispatch_keys(table: &toml::Table) -> Vec<String> {
 
 impl Config {
     pub fn load(repo_root: &Path) -> Result<Self> {
-        let path = repo_root.join(".engram/config.toml");
+        let path = repo_root.join(CONFIG_PATH);
         if !path.exists() {
             return Ok(Self::default());
         }
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         let table: toml::Table =
-            toml::from_str(&contents).context("parsing .engram/config.toml")?;
+            toml::from_str(&contents).with_context(|| format!("parsing {CONFIG_PATH}"))?;
         let unknown = unknown_dispatch_keys(&table);
         if !unknown.is_empty() {
             UNKNOWN_DISPATCH_WARNED.get_or_init(|| {
                 eprintln!(
-                    "warning: ignoring unknown key(s) in [dispatch] of .engram/config.toml: {} \
+                    "warning: ignoring unknown key(s) in [dispatch] of {CONFIG_PATH}: {} \
                      (valid keys: {})",
                     unknown.join(", "),
                     DISPATCH_KEYS.join(", ")
                 );
             });
         }
-        table.try_into().context("parsing .engram/config.toml")
+        table
+            .try_into()
+            .with_context(|| format!("parsing {CONFIG_PATH}"))
     }
 
     pub fn save(&self, repo_root: &Path) -> Result<()> {
-        let dir = repo_root.join(".engram");
-        std::fs::create_dir_all(&dir)?;
-        let contents = toml::to_string_pretty(self)?;
-        std::fs::write(dir.join("config.toml"), contents)?;
-        Ok(())
+        let path = repo_root.join(CONFIG_PATH);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        let contents = toml::to_string_pretty(self).context("serializing config")?;
+        std::fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))
     }
 
     pub fn repo(&self) -> Option<&str> {
@@ -304,6 +297,11 @@ fn github_unavailable_reason(
     }
 }
 
+/// Loads the repo's config and resolves its GitHub `owner/name` (see [`resolve_repo`]).
+pub fn github_repo(repo_root: &Path) -> Result<String> {
+    resolve_repo(&Config::load(repo_root)?, repo_root)
+}
+
 /// Resolves the GitHub `owner/name` for commands that are GitHub-only
 /// (`plan`, `learn`, `objective`, `compact`, `memory migrate`). Fails loudly with a
 /// "requires GitHub" error in local-only repos instead of degrading silently.
@@ -441,7 +439,7 @@ mod tests {
 
     #[rstest]
     #[case::no_section("[github]\n", &[])]
-    #[case::known_only("[dispatch]\nbranch = \"x\"\npr_title = \"y\"\n", &[])]
+    #[case::known_only("[dispatch]\nbranch = \"x\"\npr_title = \"y\"\nclaude = \"c\"\n", &[])]
     #[case::kdispatch_style("[dispatch]\nprTitle = \"y\"\nbranch = \"x\"\n", &["prTitle"])]
     #[case::sorted("[dispatch]\nzeta = 1\nalpha = 2\n", &["alpha", "zeta"])]
     fn unknown_dispatch_keys_are_reported(#[case] text: &str, #[case] expected: &[&str]) {
@@ -451,12 +449,30 @@ mod tests {
 
     #[test]
     fn dispatch_keys_match_dispatch_config_fields() {
-        let table = toml::Table::try_from(DispatchConfig::default()).unwrap();
+        let all_set = DispatchConfig {
+            claude: Some("claude".into()),
+            ..DispatchConfig::default()
+        };
+        let table = toml::Table::try_from(all_set).unwrap();
         let mut fields: Vec<&str> = table.keys().map(String::as_str).collect();
-        fields.sort();
+        fields.sort_unstable();
         let mut keys = DISPATCH_KEYS.to_vec();
-        keys.sort();
+        keys.sort_unstable();
         assert_eq!(fields, keys);
+    }
+
+    #[test]
+    fn save_keeps_the_retired_memory_table_for_older_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".engram")).unwrap();
+        let text = "[github]\nrepo = \"o/r\"\n\n[memory]\ndefault_categories = [\"patterns\"]\n";
+        std::fs::write(dir.path().join(CONFIG_PATH), text).unwrap();
+        Config::load(dir.path()).unwrap().save(dir.path()).unwrap();
+        let saved = std::fs::read_to_string(dir.path().join(CONFIG_PATH)).unwrap();
+        assert!(
+            saved.contains("[memory]") && saved.contains("patterns"),
+            "{saved}"
+        );
     }
 
     #[test]

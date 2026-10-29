@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
-use crate::{index, memory};
+use crate::memory::{self, index};
 
 /// Separator between the action and warning halves of a `--tripwire` value.
 const TRIPWIRE_SEP: &str = "::";
@@ -17,11 +17,30 @@ pub struct Capture {
     pub read_when: Vec<String>,
     pub tripwires: Vec<memory::Tripwire>,
     pub body: String,
-    /// Extra frontmatter keys (e.g. a `source` marker) written alongside the OKF fields.
+    /// Extra frontmatter keys (e.g. the `origin` marker) written alongside the OKF fields.
     pub extra: BTreeMap<String, serde_yaml_ng::Value>,
 }
 
 impl Capture {
+    /// The entry `engram capture` describes: the slug defaults to the title's,
+    /// and the body to stdin when `--body` is absent.
+    pub fn from_args(args: crate::cli::CaptureArgs) -> Result<Self> {
+        let slug = args.slug.unwrap_or_else(|| slugify(&args.title));
+        let mut entry = Capture {
+            category: args.category,
+            slug,
+            title: args.title,
+            read_when: args.read_when,
+            tripwires: args.tripwires,
+            body: resolve_body(args.body)?,
+            extra: BTreeMap::new(),
+        };
+        if args.session {
+            entry.mark_session();
+        }
+        Ok(entry)
+    }
+
     /// Tags this entry as a mid-session observation (`origin: session`) so
     /// `compact` can tell it apart from `learn`-synthesized memory.
     pub fn mark_session(&mut self) {
@@ -41,7 +60,7 @@ impl Capture {
 pub fn slugify(s: &str) -> String {
     s.split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|w| !w.is_empty())
-        .map(|w| w.to_ascii_lowercase())
+        .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>()
         .join("-")
 }
@@ -85,7 +104,7 @@ pub fn write(repo_root: &Path, capture: &Capture) -> Result<PathBuf> {
         anyhow::bail!("body must not be empty");
     }
 
-    let cat_dir = repo_root.join(".engram/memory").join(&capture.category);
+    let cat_dir = memory::memory_dir(repo_root).join(&capture.category);
     let path = cat_dir.join(format!("{}.md", capture.slug));
     if path.exists() {
         anyhow::bail!(
@@ -95,8 +114,8 @@ pub fn write(repo_root: &Path, capture: &Capture) -> Result<PathBuf> {
     }
 
     let mut fm = memory::Frontmatter::new(&capture.category, &capture.title);
-    fm.read_when = capture.read_when.clone();
-    fm.tripwires = capture.tripwires.clone();
+    fm.read_when.clone_from(&capture.read_when);
+    fm.tripwires.clone_from(&capture.tripwires);
     fm.extra = capture.extra.clone();
     fm.touch();
     let content = memory::render(&fm, &capture.body)?;
@@ -107,23 +126,16 @@ pub fn write(repo_root: &Path, capture: &Capture) -> Result<PathBuf> {
     memory::rebuild_index(repo_root).context("rebuilding memory index")?;
     memory::write_claude_md_section(repo_root).context("updating CLAUDE.md")?;
     // `search` only rebuilds the FTS index when it's missing, so keep an existing one current.
-    if index::check_index_health(repo_root)? {
-        let rel_path = format!(".engram/memory/{}/{}.md", capture.category, capture.slug);
-        index::upsert_file(
-            repo_root,
-            &rel_path,
-            &capture.category,
-            &capture.slug,
-            &content,
-        )
-        .context("updating search index")?;
+    if index::exists(repo_root) {
+        index::upsert_file(repo_root, &capture.category, &capture.slug, &content)
+            .context("updating search index")?;
     }
 
     Ok(path)
 }
 
 /// Returns `body` if given, otherwise reads it from piped stdin.
-pub fn resolve_body(body: Option<String>) -> Result<String> {
+fn resolve_body(body: Option<String>) -> Result<String> {
     if let Some(body) = body {
         return Ok(body);
     }
@@ -194,7 +206,7 @@ mod tests {
         assert_eq!(fm.title, "Use bar");
         assert_eq!(fm.read_when, ["when calling foo"]);
         assert_eq!(fm.tripwires[0].warning, "Use bar()");
-        assert_eq!(fm.generated.unwrap().at, memory::today_iso());
+        assert_eq!(fm.generated.unwrap().at, crate::date::today_iso());
         assert!(fm.sources.is_empty());
         assert_eq!(fm.extra.get("source"), c.extra.get("source"));
         assert_eq!(body.trim(), "Prefer bar over foo.");
@@ -234,7 +246,7 @@ mod tests {
         c.mark_session();
         let path = write(root, &c).unwrap();
 
-        let item = crate::claude::LearningItem {
+        let item = crate::integrations::claude::LearningItem {
             category: "patterns".to_string(),
             slug: "observed".to_string(),
             title: "Synthesized".to_string(),

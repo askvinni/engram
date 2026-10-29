@@ -2,6 +2,22 @@
 
 Plan-based agentic development helper. CLI tool that wraps GitHub issues, Claude, and git into a structured learn/remember workflow.
 
+## Layout
+
+```
+src/
+  main.rs cli.rs        command routing and clap definitions only
+  config.rs init.rs     .engram/config.toml; `engram init`
+  guide.rs              the embedded guides behind `engram guide`
+  process.rs date.rs    running external commands; calendar dates
+  integrations/         the CLIs engram drives: github.rs (gh), claude.rs (claude -p), kata/
+  memory/               .engram/memory topic files (mod.rs), capture, index (search), compact
+  workflow/             the GitHub plan lifecycle: plan, objective, learn
+  dispatch/             `engram dispatch` (see Dispatch below)
+```
+
+New code goes in the module for its domain; a module that outgrows one file becomes a directory with a `mod.rs`.
+
 ## Error handling
 
 Use `anyhow::Result` and `anyhow::Error` everywhere. Never introduce `unwrap()` or `expect()` in non-test code.
@@ -42,20 +58,23 @@ pub body: Option<String>,
 
 ## External processes
 
-All external I/O goes through `std::process::Command`. Never use raw API tokens or HTTP clients — use the `gh`, `git`, and `claude` CLIs:
+All external I/O goes through `std::process::Command`. Never use raw API tokens or HTTP clients — use the `gh`, `git`, and `claude` CLIs, and run them through `src/process.rs`, which checks the exit status and puts stderr in the error:
 
 ```rust
-// GitHub — always via gh CLI
-let output = Command::new("gh").args([...]).output()?;
+// a command whose failure is an error: trimmed stdout, or `cmd` failed: <stderr>
+let head = process::run_checked(process::git(repo_root).args(["rev-parse", "HEAD"]))?;
 
-// Claude — always via claude -p, always from temp_dir()
-let output = Command::new("claude")
-    .args(["-p", &prompt, "--output-format", "text"])
-    .current_dir(std::env::temp_dir())   // avoid loading repo CLAUDE.md
-    .output()?;
+// GitHub — always via gh, with the configured identity (see github.rs `gh()`)
+process::run_checked(config::gh_command()?.args([...]))?;
+
+// git that talks to origin — process::git_remote applies the same identity
+process::run_checked(process::git_remote(repo_root)?.args(["push", "-u", "origin", branch]))?;
+
+// Claude — always claude::run_prompt, which runs `claude -p` from temp_dir()
+let text = claude::run_prompt(&prompt)?;
 ```
 
-Check `output.status.success()` and surface stderr as the error message.
+`process::run_tolerating` accepts one known benign failure (e.g. "already exists"); `process::spawn` + `process::failure` are for the rare caller that reads the exit code itself. Plain `Command::new(...).output()` is only for availability probes such as `gh --version`.
 
 ## kata (optional issue mirror)
 
@@ -72,11 +91,11 @@ Native kata mirroring for issue *creation* is implemented: `plan new`, `objectiv
 
 ## Skills and guides
 
-The workflow content behind the `engram-*` skills lives in `guides/<topic>.md`, embedded in the binary (`src/guide.rs`) and printed by `engram guide <topic>`. `.claude/skills/engram-*/SKILL.md` are thin stubs that call `engram guide`; `engram init` installs exactly those stubs (`SKILL_STUBS` in `src/main.rs`) and doctor compares only them. Edit the guides, not the stubs. Guides must not use `$ARGUMENTS`: only the stub has it substituted. The learn and compact prompts embed `guides/memory-quality.md` and `guides/memory.md`, so editing those changes `claude -p` behaviour too.
+The workflow content behind the `engram-*` skills lives in `guides/<topic>.md`, embedded in the binary (`src/guide.rs`) and printed by `engram guide <topic>`. `.claude/skills/engram-*/SKILL.md` are thin stubs that call `engram guide`; `engram init` installs exactly those stubs (`SKILL_STUBS` in `src/init.rs`) and doctor compares only them. Edit the guides, not the stubs. Guides must not use `$ARGUMENTS`: only the stub has it substituted. The learn and compact prompts embed `guides/memory-quality.md` and `guides/memory.md`, so editing those changes `claude -p` behaviour too.
 
 ## Dispatch
 
-`engram dispatch` lives in `src/dispatch.rs`: collect plan issues (`collect_work`, or `collect_stack_work` for `--stack`) → `plan_dispatch` → confirm → `carry_out`. A stack only adds an order (`order_for_stack`) and a base per node (`base_branch`). Planning never mutates anything: `--dry-run` is planning plus an early return, so every new check belongs there, not in `carry_out`. Keep pure logic (`fill_template`, `slugify`, `order_for_stack`, `straight_chains`, `ready_nodes`, `merge_node_progress`, `format_plan`, `build_prompt`, `launch_command`, kwt JSON parsing) in plain functions and unit-test those with literal inputs; never spawn or mock gh/git/kata/kwt/tmux in tests. Check side effects by hand with `--dry-run`, then `--no-launch` on a throwaway plan.
+`engram dispatch` lives in `src/dispatch/` (`mod.rs` runs the pipeline; `inspect.rs` plans a dispatch, `execute.rs` carries it out, `workspace.rs` owns kwt/tmux/the Claude launch, `stack.rs` is `--stack`, plus `preflight.rs`, `template.rs` and `render.rs`): collect plan issues (`collect_work`, or `collect_stack_work` for `--stack`) → `plan_dispatch` → confirm → `carry_out`. A stack only adds an order (`order_for_stack`) and a base per node (`base_branch`). Planning never mutates anything: `--dry-run` is planning plus an early return, so every new check belongs there, not in `carry_out`. Keep pure logic (`fill_template`, `branch_slug`, `order_for_stack`, `straight_chains`, `ready_nodes`, `merge_node_progress`, `format_plan`, `build_prompt`, `launch_command`, kwt JSON parsing) in plain functions and unit-test those with literal inputs; never spawn or mock gh/git/kata/kwt/tmux in tests. Check side effects by hand with `--dry-run`, then `--no-launch` on a throwaway plan.
 
 **Preflight is dispatch-only.** Only `cmd_dispatch` calls `preflight` (gh, kata, kwt, tmux, claude, `.kata.toml`); `doctor` shows `unavailable_reasons` as a non-failing line. kwt, tmux and claude are called through the resolved `Toolchain` paths.
 
@@ -89,7 +108,7 @@ The workflow content behind the `engram-*` skills lives in `guides/<topic>.md`, 
 - The prompt file lives under `$XDG_STATE_HOME/engram/dispatch/`, outside every worktree. The claude command is `ENGRAM_DISPATCH_CLAUDE` (tests), else `[dispatch] claude`, else the resolved claude path; the flags and prompt are always appended.
 - Branches are made with `git commit-tree` + `git branch` on the fetched `origin/<base>`, never by checkout. `gh stack` runs with `GH_REPO`, since gh-stack can't map SSH host aliases.
 
-**Plain command line.** `engram dispatch <args>` must work exactly as typed: auto mode denies command lines that configure an agent or pass a credential (a `Bash(engram dispatch:*)` allow rule is optional and never installed by engram). Configuration goes in `.engram/config.toml` or git config (`engram.githubUser`). GitHub-facing `gh` calls and `git` calls that talk to `origin` (`git_remote`) go through `config::gh_command()`/`with_github_identity`; the pane resolves its own token with `GH_TOKEN="$(gh auth token --user …)" && export GH_TOKEN && …` so a failed lookup never starts Claude. Never write a token into keystrokes, prompt files, logs or errors.
+**Plain command line.** `engram dispatch <args>` must work exactly as typed: auto mode denies command lines that configure an agent or pass a credential (a `Bash(engram dispatch:*)` allow rule is optional and never installed by engram). Configuration goes in `.engram/config.toml` or git config (`engram.githubUser`). GitHub-facing `gh` calls and `git` calls that talk to `origin` (`process::git_remote`) go through `config::gh_command()`/`with_github_identity`; the pane resolves its own token with `GH_TOKEN="$(gh auth token --user …)" && export GH_TOKEN && …` so a failed lookup never starts Claude. Never write a token into keystrokes, prompt files, logs or errors.
 
 **Idempotency.** Every `carry_out` step looks up existing state first, so a re-run resumes. Keep `Closes #N` in the draft PR body: GitHub never links stacked PRs, so re-runs find them by that line. Never steal another actor's kata claim.
 
