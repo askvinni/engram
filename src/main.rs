@@ -48,26 +48,26 @@ struct CaptureResultJson {
 
 /// The engram skill stubs `engram init` installs, by skill directory name. Only
 /// these are managed: other skills in `.claude/skills` (e.g. graft) are never touched.
-static SKILL_STUBS: &[(&str, Dir)] = &[
+static SKILL_STUBS: &[(&str, &str)] = &[
     (
         "engram-plan",
-        include_dir!("$CARGO_MANIFEST_DIR/.claude/skills/engram-plan"),
+        include_str!("../.claude/skills/engram-plan/SKILL.md"),
     ),
     (
         "engram-objective",
-        include_dir!("$CARGO_MANIFEST_DIR/.claude/skills/engram-objective"),
+        include_str!("../.claude/skills/engram-objective/SKILL.md"),
     ),
     (
         "engram-learn",
-        include_dir!("$CARGO_MANIFEST_DIR/.claude/skills/engram-learn"),
+        include_str!("../.claude/skills/engram-learn/SKILL.md"),
     ),
     (
         "engram-memory",
-        include_dir!("$CARGO_MANIFEST_DIR/.claude/skills/engram-memory"),
+        include_str!("../.claude/skills/engram-memory/SKILL.md"),
     ),
     (
         "engram-dispatch",
-        include_dir!("$CARGO_MANIFEST_DIR/.claude/skills/engram-dispatch"),
+        include_str!("../.claude/skills/engram-dispatch/SKILL.md"),
     ),
 ];
 /// Installed by engram before skills became stubs; its content is now `engram guide memory-quality`.
@@ -656,7 +656,7 @@ fn install_skills(repo_root: &std::path::Path) -> Result<()> {
     for (name, stub) in SKILL_STUBS {
         let dest = skills_root.join(name);
         std::fs::create_dir_all(&dest).with_context(|| format!("creating {}", dest.display()))?;
-        stub.extract(&dest)
+        std::fs::write(dest.join("SKILL.md"), stub)
             .with_context(|| format!("installing Claude skill {name}"))?;
     }
     for legacy in LEGACY_SKILL_FILES {
@@ -676,15 +676,10 @@ fn install_skills(repo_root: &std::path::Path) -> Result<()> {
 
 fn skills_current(repo_root: &std::path::Path) -> bool {
     SKILL_STUBS.iter().all(|(name, stub)| {
-        stub.files().all(|embedded| {
-            let dest = repo_root
-                .join(".claude/skills")
-                .join(name)
-                .join(embedded.path());
-            std::fs::read(dest)
-                .map(|bytes| bytes == embedded.contents())
-                .unwrap_or(false)
-        })
+        let dest = repo_root.join(".claude/skills").join(name).join("SKILL.md");
+        std::fs::read(dest)
+            .map(|bytes| bytes == stub.as_bytes())
+            .unwrap_or(false)
     })
 }
 
