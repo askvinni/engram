@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-use crate::{config, date, github, kata, learn, objective, process};
+use crate::integrations::{github, kata};
+use crate::workflow::{learn, objective};
+use crate::{config, date, process};
 
 /// Branch the learnings from `plan learn --all` are committed on.
 const LEARN_ALL_BRANCH: &str = "engram/learn-all";

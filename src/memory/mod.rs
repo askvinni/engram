@@ -1,12 +1,20 @@
+//! The memory directory (`.engram/memory`): topic files and their OKF
+//! frontmatter, the index and CLAUDE.md section, plus direct capture, the
+//! search index and compaction.
+
+pub mod capture;
+pub mod compact;
+pub mod index;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 
-use crate::claude::{CompactAction, CompactKind};
 use crate::date::today_iso;
-use crate::github;
+use crate::integrations::claude::{CompactAction, CompactKind};
+use crate::integrations::github;
 
 /// Repo-relative directory holding every memory topic file.
 pub const MEMORY_DIR: &str = ".engram/memory";
@@ -428,7 +436,7 @@ pub fn read_all(repo_root: &Path) -> Result<String> {
 pub fn write_topic_file(
     repo_root: &Path,
     repo: &str,
-    item: &crate::claude::LearningItem,
+    item: &crate::integrations::claude::LearningItem,
     issue_number: u64,
 ) -> Result<()> {
     let category = &item.category;
@@ -628,7 +636,7 @@ pub fn read_always_loaded_instructions(repo_root: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude::{LearningItem, Tripwire as ClaudeTripwire};
+    use crate::integrations::claude::{LearningItem, Tripwire as ClaudeTripwire};
 
     const REPO: &str = "acme/widgets";
     const LEGACY: &str = "---\ntitle: \"Legacy\"\nread_when: []\ntripwires: []\nlast_updated: \"2024-01-01\"\nsource_issues: [1]\n---\n\nOld body.\n";

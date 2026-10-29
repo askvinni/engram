@@ -13,7 +13,8 @@ use std::collections::BTreeMap;
 use std::process::Command;
 use std::sync::OnceLock;
 
-use crate::{github, process};
+use crate::integrations::github;
+use crate::process;
 
 pub use tracker::{parse_jira_arg, parse_type_arg, TrackerMeta, JIRA_META_KEY, TYPE_META_KEY};
 

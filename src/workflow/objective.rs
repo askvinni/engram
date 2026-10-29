@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
-use crate::{claude, github, kata, learn};
+use crate::integrations::{claude, github, kata};
+use crate::workflow::learn;
 
 const NODES_MARKER_START: &str = "<!-- engram:nodes ";
 const NODES_MARKER_END: &str = " -->";
@@ -357,7 +358,7 @@ fn create_plan_for_node(
 
     let plan_body_text = match body {
         Some(b) => {
-            crate::plan::warn_missing_sections(b);
+            crate::workflow::plan::warn_missing_sections(b);
             b.to_string()
         }
         None => generate_plan_body_for_node(obj.title, obj.body, &node.id, &node.description)?,

@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-use crate::{claude, github, kata, memory, process};
+use crate::integrations::{claude, github, kata};
+use crate::{memory, process};
 
 /// Marks the plan comment holding the planning conversation (see `plan new --conversation`).
 pub const CONVERSATION_SENTINEL: &str = "<!-- engram:conversation -->";

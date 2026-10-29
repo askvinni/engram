@@ -5,7 +5,8 @@ use anyhow::{Context, Result};
 use include_dir::{include_dir, Dir};
 use std::path::Path;
 
-use crate::{claude, config, github, memory};
+use crate::integrations::{claude, github};
+use crate::{config, memory};
 
 /// The engram skill stubs `engram init` installs, by skill directory name. Only
 /// these are managed: other skills in `.claude/skills` (e.g. graft) are never touched.

@@ -21,7 +21,7 @@ A learning passes if **all three** are true:
 Skip these, even if they're accurate and true:
 
 - **Import paths, function signatures, struct field lists** — agents use the compiler and the source
-- **Single-module implementation details** — e.g. exactly how `slugify()` works inside `src/memory.rs`; no other module cares
+- **Single-module implementation details** — e.g. exactly how `slugify()` works inside `src/memory/mod.rs`; no other module cares
 - **Things derivable from `cargo doc` or `--help`** — API docs belong in `///` comments; flags are in `engram --help`
 
 ---
@@ -56,17 +56,17 @@ What survives must record a failure, an external constraint, or a non-obvious WH
 **Cross-cutting CLI wiring decisions:**
 > `claude -p` must always run from `std::env::temp_dir()`, not from the repo root. This affects every module that shells out to Claude. If run from the repo, Claude Code loads CLAUDE.md and begins acting as an agent instead of returning JSON.
 >
-> Applies to: `src/claude.rs:synthesize_learnings`, `src/claude.rs:compact_learnings`, any future function that shells out to Claude.
+> Applies to: `src/integrations/claude.rs:synthesize_learnings`, `src/integrations/claude.rs:compact_learnings`, any future function that shells out to Claude.
 
 **Hidden external constraints:**
 > GitHub auto-closes an issue when a PR with `closes #N` in its body merges. If `cmd_land` calls `gh issue close N` after this has already happened, the gh CLI returns a non-zero exit code. Check issue state before closing.
 >
-> Applies to: `src/main.rs:cmd_land`, any future command that mutates issue state.
+> Applies to: `src/workflow/plan.rs:land`, any future command that mutates issue state.
 
 **Anti-patterns found the hard way:**
 > `write_claude_md_section` used `find()` to locate `<!-- engram:end -->`. If a memory file's body contained that string literally, the marker was found inside the content rather than after it, truncating the section. Use `rfind()` to always match the last occurrence.
 >
-> Applies to: `src/memory.rs:write_claude_md_section`, any future function that searches for HTML comment delimiters in file content.
+> Applies to: `src/memory/mod.rs:write_claude_md_section`, any future function that searches for HTML comment delimiters in file content.
 
 ---
 
@@ -76,7 +76,7 @@ Agents read memory files at decision time — they're about to do something and 
 
 - **Use the imperative**: "Always use `current_dir(std::env::temp_dir())` for `claude -p` invocations." Not: "The code uses temp_dir for Claude."
 - **Name the consequence of getting it wrong**: "...otherwise Claude Code loads CLAUDE.md and acts as an agent instead of returning JSON."
-- **Use source pointers instead of copying code**: `see src/claude.rs:synthesize_learnings`. Copied code rots; pointers stay accurate as long as the symbol exists.
+- **Use source pointers instead of copying code**: `see src/integrations/claude.rs:synthesize_learnings`. Copied code rots; pointers stay accurate as long as the symbol exists.
 - **One paragraph maximum** per body. If it needs more, split into two files.
 
 ---

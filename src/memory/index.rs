@@ -162,7 +162,7 @@ fn upsert_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude::LearningItem;
+    use crate::integrations::claude::LearningItem;
     use crate::memory::write_topic_file;
 
     fn make_item(category: &str, slug: &str) -> LearningItem {

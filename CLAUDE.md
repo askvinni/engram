@@ -2,6 +2,22 @@
 
 Plan-based agentic development helper. CLI tool that wraps GitHub issues, Claude, and git into a structured learn/remember workflow.
 
+## Layout
+
+```
+src/
+  main.rs cli.rs        command routing and clap definitions only
+  config.rs init.rs     .engram/config.toml; `engram init`
+  guide.rs              the embedded guides behind `engram guide`
+  process.rs date.rs    running external commands; calendar dates
+  integrations/         the CLIs engram drives: github.rs (gh), claude.rs (claude -p), kata/
+  memory/               .engram/memory topic files (mod.rs), capture, index (search), compact
+  workflow/             the GitHub plan lifecycle: plan, objective, learn
+  dispatch/             `engram dispatch` (see Dispatch below)
+```
+
+New code goes in the module for its domain; a module that outgrows one file becomes a directory with a `mod.rs`.
+
 ## Error handling
 
 Use `anyhow::Result` and `anyhow::Error` everywhere. Never introduce `unwrap()` or `expect()` in non-test code.
@@ -75,11 +91,11 @@ Native kata mirroring for issue *creation* is implemented: `plan new`, `objectiv
 
 ## Skills and guides
 
-The workflow content behind the `engram-*` skills lives in `guides/<topic>.md`, embedded in the binary (`src/guide.rs`) and printed by `engram guide <topic>`. `.claude/skills/engram-*/SKILL.md` are thin stubs that call `engram guide`; `engram init` installs exactly those stubs (`SKILL_STUBS` in `src/main.rs`) and doctor compares only them. Edit the guides, not the stubs. Guides must not use `$ARGUMENTS`: only the stub has it substituted. The learn and compact prompts embed `guides/memory-quality.md` and `guides/memory.md`, so editing those changes `claude -p` behaviour too.
+The workflow content behind the `engram-*` skills lives in `guides/<topic>.md`, embedded in the binary (`src/guide.rs`) and printed by `engram guide <topic>`. `.claude/skills/engram-*/SKILL.md` are thin stubs that call `engram guide`; `engram init` installs exactly those stubs (`SKILL_STUBS` in `src/init.rs`) and doctor compares only them. Edit the guides, not the stubs. Guides must not use `$ARGUMENTS`: only the stub has it substituted. The learn and compact prompts embed `guides/memory-quality.md` and `guides/memory.md`, so editing those changes `claude -p` behaviour too.
 
 ## Dispatch
 
-`engram dispatch` lives in `src/dispatch.rs`: collect plan issues (`collect_work`, or `collect_stack_work` for `--stack`) → `plan_dispatch` → confirm → `carry_out`. A stack only adds an order (`order_for_stack`) and a base per node (`base_branch`). Planning never mutates anything: `--dry-run` is planning plus an early return, so every new check belongs there, not in `carry_out`. Keep pure logic (`fill_template`, `branch_slug`, `order_for_stack`, `straight_chains`, `ready_nodes`, `merge_node_progress`, `format_plan`, `build_prompt`, `launch_command`, kwt JSON parsing) in plain functions and unit-test those with literal inputs; never spawn or mock gh/git/kata/kwt/tmux in tests. Check side effects by hand with `--dry-run`, then `--no-launch` on a throwaway plan.
+`engram dispatch` lives in `src/dispatch/` (`mod.rs` runs the pipeline; `inspect.rs` plans a dispatch, `execute.rs` carries it out, `workspace.rs` owns kwt/tmux/the Claude launch, `stack.rs` is `--stack`, plus `preflight.rs`, `template.rs` and `render.rs`): collect plan issues (`collect_work`, or `collect_stack_work` for `--stack`) → `plan_dispatch` → confirm → `carry_out`. A stack only adds an order (`order_for_stack`) and a base per node (`base_branch`). Planning never mutates anything: `--dry-run` is planning plus an early return, so every new check belongs there, not in `carry_out`. Keep pure logic (`fill_template`, `branch_slug`, `order_for_stack`, `straight_chains`, `ready_nodes`, `merge_node_progress`, `format_plan`, `build_prompt`, `launch_command`, kwt JSON parsing) in plain functions and unit-test those with literal inputs; never spawn or mock gh/git/kata/kwt/tmux in tests. Check side effects by hand with `--dry-run`, then `--no-launch` on a throwaway plan.
 
 **Preflight is dispatch-only.** Only `cmd_dispatch` calls `preflight` (gh, kata, kwt, tmux, claude, `.kata.toml`); `doctor` shows `unavailable_reasons` as a non-failing line. kwt, tmux and claude are called through the resolved `Toolchain` paths.
 

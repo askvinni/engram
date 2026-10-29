@@ -11,7 +11,8 @@ use super::{
     strip_ref_line, sync_close, with_ref_line, EditFields, KataIssue, Mirrors, STATUS_CLOSED,
     STATUS_OPEN,
 };
-use crate::{github, objective};
+use crate::integrations::github;
+use crate::workflow::objective;
 
 const SYNC_META_KEY: &str = "engram.sync";
 const CONFLICT_LABEL: &str = "kata-sync-conflict";

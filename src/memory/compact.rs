@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-use crate::claude::{CompactAction, CompactKind};
-use crate::{claude, config, date, learn, memory};
+use crate::integrations::claude::{self, CompactAction, CompactKind};
+use crate::workflow::learn;
+use crate::{config, date, memory};
 
 /// Branch prefix of a compaction PR; the date follows.
 const COMPACT_BRANCH_PREFIX: &str = "engram/compact-";

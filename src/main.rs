@@ -1,20 +1,13 @@
-mod capture;
-mod claude;
 mod cli;
-mod compact;
 mod config;
 mod date;
 mod dispatch;
-mod github;
 mod guide;
-mod index;
 mod init;
-mod kata;
-mod learn;
+mod integrations;
 mod memory;
-mod objective;
-mod plan;
 mod process;
+mod workflow;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -22,6 +15,10 @@ use cli::{Cli, Commands, OutputMode};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use integrations::kata;
+use memory::{capture, compact, index};
+use workflow::{objective, plan};
 
 /// JSON schema for `engram search --json`
 #[derive(Serialize)]

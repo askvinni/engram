@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
-use crate::{index, memory};
+use crate::memory::{self, index};
 
 /// Separator between the action and warning halves of a `--tripwire` value.
 const TRIPWIRE_SEP: &str = "::";
@@ -246,7 +246,7 @@ mod tests {
         c.mark_session();
         let path = write(root, &c).unwrap();
 
-        let item = crate::claude::LearningItem {
+        let item = crate::integrations::claude::LearningItem {
             category: "patterns".to_string(),
             slug: "observed".to_string(),
             title: "Synthesized".to_string(),

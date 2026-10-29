@@ -107,7 +107,7 @@ pub struct CaptureArgs {
     #[arg(long = "read-when")]
     pub read_when: Vec<String>,
     /// Tripwire as `ACTION::WARNING` (repeatable)
-    #[arg(long = "tripwire", value_parser = crate::capture::parse_tripwire)]
+    #[arg(long = "tripwire", value_parser = crate::memory::capture::parse_tripwire)]
     pub tripwires: Vec<crate::memory::Tripwire>,
     /// Markdown body; read from stdin if omitted
     #[arg(long)]
@@ -149,10 +149,10 @@ pub enum PlanCommands {
         #[arg(long)]
         conversation: Option<String>,
         /// Jira key for the kata mirror's `jira` metadata (e.g. ABC-123); otherwise read from a `Jira:` body line or the title
-        #[arg(long, value_parser = crate::kata::parse_jira_arg)]
+        #[arg(long, value_parser = crate::integrations::kata::parse_jira_arg)]
         jira: Option<String>,
         /// Change type for the kata mirror's `type` metadata (feat, fix, chore, ...); otherwise read from a `Type:` body line or a `feat:`-style title
-        #[arg(long = "type", value_parser = crate::kata::parse_type_arg)]
+        #[arg(long = "type", value_parser = crate::integrations::kata::parse_type_arg)]
         kind: Option<String>,
         /// Skip all kata calls for this invocation, even if kata is available
         #[arg(long)]
@@ -193,10 +193,10 @@ pub enum ObjectiveCommands {
         #[arg(long)]
         body: String,
         /// Jira key for the kata mirror's `jira` metadata (e.g. ABC-123); otherwise read from a `Jira:` body line or the title
-        #[arg(long, value_parser = crate::kata::parse_jira_arg)]
+        #[arg(long, value_parser = crate::integrations::kata::parse_jira_arg)]
         jira: Option<String>,
         /// Change type for the kata mirror's `type` metadata (feat, fix, chore, ...); otherwise read from a `Type:` body line or a `feat:`-style title
-        #[arg(long = "type", value_parser = crate::kata::parse_type_arg)]
+        #[arg(long = "type", value_parser = crate::integrations::kata::parse_type_arg)]
         kind: Option<String>,
         /// Skip all kata calls for this invocation, even if kata is available
         #[arg(long)]
@@ -227,10 +227,10 @@ pub enum ObjectiveCommands {
         #[arg(long)]
         body: Option<String>,
         /// Jira key for the kata mirror's `jira` metadata (e.g. ABC-123); otherwise read from a `Jira:` body line or the title
-        #[arg(long, value_parser = crate::kata::parse_jira_arg)]
+        #[arg(long, value_parser = crate::integrations::kata::parse_jira_arg)]
         jira: Option<String>,
         /// Change type for the kata mirror's `type` metadata (feat, fix, chore, ...); otherwise read from a `Type:` body line or a `feat:`-style title
-        #[arg(long = "type", value_parser = crate::kata::parse_type_arg)]
+        #[arg(long = "type", value_parser = crate::integrations::kata::parse_type_arg)]
         kind: Option<String>,
         /// Skip all kata calls for this invocation, even if kata is available
         #[arg(long)]
