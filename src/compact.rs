@@ -42,8 +42,7 @@ pub fn run(repo_root: &Path) -> Result<()> {
         commit_message: &format!("engram: compact memory ({deleted} deleted, {merged} merged)"),
         title: "engram: compact memory",
         body: &format!(
-            "Compacted memory: {deleted} files deleted, {merged} files merged.{}",
-            learn::PR_FOOTER
+            "Compacted memory: {deleted} files deleted, {merged} files merged.\n\n---\n*Created by engram compact*"
         ),
     };
     if let Some(url) = learn::open_memory_pr(repo_root, &repo, &pr)? {

@@ -140,8 +140,11 @@ pub fn land(repo_root: &Path, issue: u64) -> Result<()> {
     if gh_issue.is_closed() {
         println!("Issue #{issue} already closed.");
     } else {
-        github::close_issue(&repo, issue)?;
-        println!("Closed issue #{issue}.");
+        match github::close_issue(&repo, issue) {
+            Ok(()) => println!("Closed issue #{issue}."),
+            // The learnings PR is already open; finish landing, then report.
+            Err(e) => eprintln!("warning: could not close issue #{issue}: {e:#}"),
+        }
     }
 
     let pr = match github::find_linked_pr(&repo, issue) {

@@ -523,7 +523,10 @@ pub fn closed_issues(body: &str, repo: &str) -> Vec<u64> {
         .collect();
     words
         .windows(2)
-        .filter(|w| CLOSING_KEYWORDS.contains(&w[0].trim_end_matches(':')))
+        .filter(|w| {
+            let keyword = w[0].trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+            CLOSING_KEYWORDS.contains(&keyword.trim_end_matches(':'))
+        })
         .filter_map(|w| {
             let target = w[1]
                 .strip_prefix('#')
@@ -969,6 +972,7 @@ mod tests {
     #[case::several("Fixes #1, closes #2", &[1, 2])]
     #[case::none("no issue reference here", &[])]
     #[case::keyword_inside_a_word("prefixes #12", &[])]
+    #[case::after_punctuation("Done (closes #12)", &[12])]
     // Lower-casing changes this body's byte length; a byte offset taken from
     // the lower-cased copy must never be used to slice the original.
     #[case::non_ascii("İstanbul: closes #5", &[5])]

@@ -55,15 +55,17 @@ pub fn with_ref_line(gh_body: &str, kata_ref: &str) -> String {
     format!("{gh_body}\n{KATA_REF_KEY} {kata_ref}")
 }
 
+/// A `Kata:` ref line starts its line; an indented one (say, an example in a
+/// code block) is body text.
 fn is_ref_line(line: &str) -> bool {
-    line.trim_start().starts_with(KATA_REF_KEY)
+    line.starts_with(KATA_REF_KEY)
 }
 
 /// The ref in a GitHub body's `Kata: <ref>` line, which links it to its kata mirror.
 pub fn parse_ref(gh_body: &str) -> Option<&str> {
     gh_body
         .lines()
-        .find_map(|line| line.trim().strip_prefix(KATA_REF_KEY))
+        .find_map(|line| line.strip_prefix(KATA_REF_KEY))
         .map(str::trim)
         .filter(|s| !s.is_empty())
 }
@@ -522,9 +524,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_ref_trims_and_accepts_indentation() {
+    fn parse_ref_trims_the_ref_but_ignores_indented_lines() {
         assert_eq!(parse_ref("body text\nKata:   zzzz9  \n"), Some("zzzz9"));
-        assert_eq!(parse_ref("body\n  Kata: abc4"), Some("abc4"));
+        assert_eq!(parse_ref("Kata:abc4"), Some("abc4"));
+        assert_eq!(
+            parse_ref("example:\n    Kata: ex1\nKata: real"),
+            Some("real")
+        );
     }
 
     #[test]
@@ -541,10 +547,9 @@ mod tests {
     }
 
     #[test]
-    fn strip_ref_line_removes_an_indented_line_parse_ref_reads() {
-        let body = "Body.\n  Kata: abc4";
-        assert_eq!(parse_ref(body), Some("abc4"));
-        assert_eq!(strip_ref_line(body), "Body.");
+    fn strip_ref_line_keeps_indented_examples() {
+        let body = "Body.\n    Kata: ex1\nKata: abc4";
+        assert_eq!(strip_ref_line(body), "Body.\n    Kata: ex1");
     }
 
     #[test]

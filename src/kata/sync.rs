@@ -383,8 +383,14 @@ fn derive_links(repo: &str, mirrors: &Mirrors, plan_gh_body: &str) -> Result<Opt
             .find(|n| n.id == dep_id)
             .and_then(|n| n.plan_issue);
         if let Some(dep_plan) = dep_plan {
-            if let Some(dep_ref) = mirrors.find_for_issue(repo, dep_plan)? {
-                blocked_by.push(dep_ref);
+            // One unreadable dependency (e.g. a deleted plan issue) must not
+            // block syncing the rest of the pair.
+            match mirrors.find_for_issue(repo, dep_plan) {
+                Ok(Some(dep_ref)) => blocked_by.push(dep_ref),
+                Ok(None) => {}
+                Err(e) => eprintln!(
+                    "warning: skipping blocked-by link to node {dep_id} (#{dep_plan}): {e:#}"
+                ),
             }
         }
     }
@@ -489,6 +495,9 @@ pub fn sync_pair(
         kata_ref,
         &mut report,
     );
+    // Derived before anything is written, so a failing lookup can't leave the
+    // pair half-synced.
+    let derived = derive_links(repo, mirrors, gh_raw_body)?;
     let status_resolved = apply_status(
         repo,
         github_number,
@@ -497,7 +506,6 @@ pub fn sync_pair(
         gh_raw_body,
         &mut report,
     )?;
-    let derived = derive_links(repo, mirrors, gh_raw_body)?;
     let (parent, blocked_by_add, blocked_by_remove) = link_changes(derived.as_ref(), &kata_issue);
 
     github::update_issue(

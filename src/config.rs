@@ -7,12 +7,15 @@ use std::sync::OnceLock;
 /// Repo-relative path of engram's committed config file.
 pub const CONFIG_PATH: &str = ".engram/config.toml";
 
-/// `.engram/config.toml`. Tables a newer or older engram wrote and this one
-/// doesn't know (such as the retired `[memory]`) are ignored.
+/// `.engram/config.toml`. Tables this engram doesn't know are ignored.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub github: GitHubConfig,
+    /// The retired `[memory]` table, unused but written back as found:
+    /// engram builds before its retirement fail to parse a config without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory: Option<toml::Table>,
     #[serde(default)]
     pub dispatch: DispatchConfig,
 }
@@ -456,6 +459,20 @@ mod tests {
         let mut keys = DISPATCH_KEYS.to_vec();
         keys.sort_unstable();
         assert_eq!(fields, keys);
+    }
+
+    #[test]
+    fn save_keeps_the_retired_memory_table_for_older_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".engram")).unwrap();
+        let text = "[github]\nrepo = \"o/r\"\n\n[memory]\ndefault_categories = [\"patterns\"]\n";
+        std::fs::write(dir.path().join(CONFIG_PATH), text).unwrap();
+        Config::load(dir.path()).unwrap().save(dir.path()).unwrap();
+        let saved = std::fs::read_to_string(dir.path().join(CONFIG_PATH)).unwrap();
+        assert!(
+            saved.contains("[memory]") && saved.contains("patterns"),
+            "{saved}"
+        );
     }
 
     #[test]
