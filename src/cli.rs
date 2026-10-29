@@ -52,6 +52,11 @@ pub enum Commands {
     },
     /// Check that all engram dependencies are installed and configured
     Doctor,
+    /// Print an engram workflow guide (the content behind the engram-* skills)
+    Guide {
+        /// Guide topic; lists the topics when omitted
+        topic: Option<String>,
+    },
     /// Prune and merge memory files that don't meet the future-looking standard
     Compact,
     /// Coordinate multiple related plans toward a shared goal

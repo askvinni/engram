@@ -103,7 +103,7 @@ cd your-project
 engram init
 ```
 
-`engram init` creates `.engram/` config and memory directories, ensures the required GitHub labels exist, and installs Claude Code skills into `.claude/skills/`. After upgrading engram, re-run `engram init` to update the installed skills. `engram doctor` will flag stale skills with `✗ claude skills current`.
+`engram init` creates `.engram/` config and memory directories, ensures the required GitHub labels exist, and installs the `engram-*` Claude Code skills into `.claude/skills/`. The skills are thin stubs that run `engram guide <topic>`, so their content always comes from the installed engram binary and upgrading engram updates every repo at once. `engram doctor` flags missing or modified stubs with `✗ claude skills current`; re-run `engram init` to fix it. Other skills in `.claude/skills/` (e.g. graft) are never touched.
 
 ---
 
@@ -111,6 +111,7 @@ engram init
 
 ```
 engram init                                Initialize in this repo; install Claude skills
+engram guide [<topic>]                     Print a workflow guide (plan, objective, learn, memory-quality, memory, dispatch)
 engram doctor                              Verify all dependencies and configuration
 engram compact                             Prune and merge stale memory files
 engram memory migrate                      Rewrite memory files into OKF v0.2 frontmatter
@@ -309,7 +310,7 @@ kata create "<same title as the GitHub issue>" \
 
 ## Claude Code skills
 
-`engram init` installs its skills into `.claude/skills/`. They are invocable as slash commands in Claude Code, among them:
+`engram init` installs its skills into `.claude/skills/`. Each is a short stub that tells Claude to run `engram guide <topic>` and follow it; the workflow content lives in `guides/*.md` in this repo, embedded in the binary. To change a skill's behaviour, edit its guide, not the stub. They are invocable as slash commands in Claude Code, among them:
 
 ### `/engram-plan <title>`
 
@@ -397,9 +398,11 @@ Files are loaded in alphabetical order. Only `.md` files are included. Commit th
 
 .claude/
   skills/
-    engram-plan/           /engram-plan slash command
-    engram-learn/          /engram-learn slash command
-    engram-memory/         /engram-memory slash command
+    engram-plan/           /engram-plan stub → engram guide plan
+    engram-objective/      /engram-objective stub → engram guide objective
+    engram-learn/          /engram-learn stub → engram guide learn
+    engram-memory/         /engram-memory stub → engram guide memory
+    engram-dispatch/       /engram-dispatch stub → engram guide dispatch
 
 CLAUDE.md                  Auto-updated with link to memory index
 ```
