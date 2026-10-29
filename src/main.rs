@@ -5,6 +5,7 @@ mod compact;
 mod config;
 mod dispatch;
 mod github;
+mod guide;
 mod index;
 mod kata;
 mod learn;
@@ -45,7 +46,32 @@ struct CaptureResultJson {
     origin: Option<String>,
 }
 
-static SKILLS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/.claude/skills");
+/// The engram skill stubs `engram init` installs, by skill directory name. Only
+/// these are managed: other skills in `.claude/skills` (e.g. graft) are never touched.
+static SKILL_STUBS: &[(&str, &str)] = &[
+    (
+        "engram-plan",
+        include_str!("../.claude/skills/engram-plan/SKILL.md"),
+    ),
+    (
+        "engram-objective",
+        include_str!("../.claude/skills/engram-objective/SKILL.md"),
+    ),
+    (
+        "engram-learn",
+        include_str!("../.claude/skills/engram-learn/SKILL.md"),
+    ),
+    (
+        "engram-memory",
+        include_str!("../.claude/skills/engram-memory/SKILL.md"),
+    ),
+    (
+        "engram-dispatch",
+        include_str!("../.claude/skills/engram-dispatch/SKILL.md"),
+    ),
+];
+/// Installed by engram before skills became stubs; its content is now `engram guide memory-quality`.
+const LEGACY_SKILL_FILES: &[&str] = &["engram-learn/references/memory-quality.md"];
 static ISSUE_TEMPLATES_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/.github/ISSUE_TEMPLATE");
 
 fn main() -> Result<()> {
@@ -56,6 +82,7 @@ fn main() -> Result<()> {
         Commands::Plan { subcommand } => cmd_plan(subcommand),
         Commands::Search { query } => cmd_search(mode, &query),
         Commands::Doctor => cmd_doctor(),
+        Commands::Guide { topic } => cmd_guide(topic.as_deref()),
         Commands::Compact => cmd_compact(),
         Commands::Objective { subcommand } => cmd_objective(subcommand),
         Commands::Read { permalink } => cmd_read(&permalink, mode),
@@ -625,29 +652,47 @@ fn install_issue_templates(repo_root: &std::path::Path) -> Result<()> {
 }
 
 fn install_skills(repo_root: &std::path::Path) -> Result<()> {
-    use anyhow::Context;
-    SKILLS_DIR
-        .extract(repo_root.join(".claude/skills"))
-        .context("installing Claude skills")?;
-    let skill_names: Vec<&str> = SKILLS_DIR
-        .dirs()
-        .map(|d| d.path().file_name().and_then(|n| n.to_str()).unwrap_or("?"))
-        .collect();
+    let skills_root = repo_root.join(".claude/skills");
+    for (name, stub) in SKILL_STUBS {
+        let dest = skills_root.join(name);
+        std::fs::create_dir_all(&dest).with_context(|| format!("creating {}", dest.display()))?;
+        std::fs::write(dest.join("SKILL.md"), stub)
+            .with_context(|| format!("installing Claude skill {name}"))?;
+    }
+    for legacy in LEGACY_SKILL_FILES {
+        let path = skills_root.join(legacy);
+        if path.exists() {
+            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+            if let Some(dir) = path.parent() {
+                // Only succeeds when empty, so files the user added there stay.
+                let _ = std::fs::remove_dir(dir);
+            }
+        }
+    }
+    let skill_names: Vec<&str> = SKILL_STUBS.iter().map(|(name, _)| *name).collect();
     println!("Installed Claude skills: {}", skill_names.join(", "));
     Ok(())
 }
 
 fn skills_current(repo_root: &std::path::Path) -> bool {
-    SKILLS_DIR
-        .find("**/*")
-        .expect("valid glob")
-        .filter_map(|e| e.as_file())
-        .all(|embedded| {
-            let dest = repo_root.join(".claude/skills").join(embedded.path());
-            std::fs::read(dest)
-                .map(|bytes| bytes == embedded.contents())
-                .unwrap_or(false)
-        })
+    SKILL_STUBS.iter().all(|(name, stub)| {
+        let dest = repo_root.join(".claude/skills").join(name).join("SKILL.md");
+        std::fs::read(dest)
+            .map(|bytes| bytes == stub.as_bytes())
+            .unwrap_or(false)
+    })
+}
+
+fn cmd_guide(topic: Option<&str>) -> Result<()> {
+    match topic {
+        Some(topic) => print!("{}", guide::render(topic)?),
+        None => print!(
+            "engram {} guides (run `engram guide <topic>`):\n{}",
+            env!("CARGO_PKG_VERSION"),
+            guide::list()
+        ),
+    }
+    Ok(())
 }
 
 pub(crate) fn days_ago(iso: &str) -> String {
@@ -760,19 +805,55 @@ mod tests {
     }
 
     #[test]
-    fn install_skills_writes_all_four_files() {
+    fn install_skills_writes_only_engram_stubs() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         install_skills(root).unwrap();
-        assert!(root.join(".claude/skills/engram-plan/SKILL.md").exists());
-        assert!(root.join(".claude/skills/engram-learn/SKILL.md").exists());
-        assert!(root
-            .join(".claude/skills/engram-learn/references/memory-quality.md")
-            .exists());
-        assert!(root.join(".claude/skills/engram-memory/SKILL.md").exists());
-        assert!(root
-            .join(".claude/skills/engram-dispatch/SKILL.md")
-            .exists());
+        for name in ["plan", "objective", "learn", "memory", "dispatch"] {
+            let stub = std::fs::read_to_string(
+                root.join(format!(".claude/skills/engram-{name}/SKILL.md")),
+            )
+            .unwrap();
+            assert!(
+                stub.contains(&format!("engram guide {name}")),
+                "engram-{name}"
+            );
+            assert!(stub.lines().count() <= 15, "engram-{name} is not a stub");
+        }
+        assert!(!root.join(".claude/skills/graft").exists());
+    }
+
+    #[test]
+    fn install_skills_replaces_old_full_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let skills = root.join(".claude/skills");
+        std::fs::create_dir_all(skills.join("engram-learn/references")).unwrap();
+        std::fs::write(skills.join("engram-learn/SKILL.md"), "old full skill").unwrap();
+        std::fs::write(
+            skills.join("engram-learn/references/memory-quality.md"),
+            "old",
+        )
+        .unwrap();
+        install_skills(root).unwrap();
+        let stub = std::fs::read_to_string(skills.join("engram-learn/SKILL.md")).unwrap();
+        assert!(stub.contains("engram guide learn"));
+        assert!(!skills.join("engram-learn/references").exists());
+        assert!(skills_current(root));
+    }
+
+    #[test]
+    fn skills_current_ignores_other_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        install_skills(root).unwrap();
+        std::fs::create_dir_all(root.join(".claude/skills/graft")).unwrap();
+        std::fs::write(
+            root.join(".claude/skills/graft/SKILL.md"),
+            b"rewritten by graft",
+        )
+        .unwrap();
+        assert!(skills_current(root));
     }
 
     #[test]

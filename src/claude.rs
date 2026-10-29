@@ -2,11 +2,10 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::process::Command;
 
-// Skill reference files are included here so the same quality rules that guide
-// interactive Claude Code sessions also govern the claude -p synthesis calls.
-const LEARN_QUALITY_GUIDE: &str =
-    include_str!("../.claude/skills/engram-learn/references/memory-quality.md");
-const COMPACT_QUALITY_GUIDE: &str = include_str!("../.claude/skills/engram-memory/SKILL.md");
+// The guides served by `engram guide` are included here so the same quality rules
+// that guide interactive Claude Code sessions also govern the claude -p synthesis calls.
+const LEARN_QUALITY_GUIDE: &str = crate::guide::MEMORY_QUALITY;
+const COMPACT_QUALITY_GUIDE: &str = crate::guide::MEMORY;
 
 /// Max chars of any one large prompt input (diff, conversation, instructions).
 const PROMPT_SECTION_CAP: usize = 8000;
@@ -419,5 +418,14 @@ mod tests {
         let with = build_compact_prompt(&topics, "### AGENTS.md\nRun cargo test.");
         assert!(with.contains(SECTION_HEADING));
         assert!(with.contains("Run cargo test."));
+    }
+
+    #[test]
+    fn prompts_embed_quality_guides() {
+        let learn = build_synthesis_prompt(&input(""));
+        assert!(learn.contains("## The extraction bar"));
+
+        let compact = build_compact_prompt(&[], "");
+        assert!(compact.contains("# engram memory guide"));
     }
 }
