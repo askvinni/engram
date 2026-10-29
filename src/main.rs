@@ -3,22 +3,24 @@ mod claude;
 mod cli;
 mod compact;
 mod config;
+mod date;
 mod dispatch;
 mod github;
 mod guide;
 mod index;
+mod init;
 mod kata;
 mod learn;
 mod memory;
 mod objective;
 mod plan;
+mod process;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use cli::{Cli, Commands, OutputMode};
-use include_dir::{include_dir, Dir};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// JSON schema for `engram search --json`
@@ -46,86 +48,41 @@ struct CaptureResultJson {
     origin: Option<String>,
 }
 
-/// The engram skill stubs `engram init` installs, by skill directory name. Only
-/// these are managed: other skills in `.claude/skills` (e.g. graft) are never touched.
-static SKILL_STUBS: &[(&str, &str)] = &[
-    (
-        "engram-plan",
-        include_str!("../.claude/skills/engram-plan/SKILL.md"),
-    ),
-    (
-        "engram-objective",
-        include_str!("../.claude/skills/engram-objective/SKILL.md"),
-    ),
-    (
-        "engram-learn",
-        include_str!("../.claude/skills/engram-learn/SKILL.md"),
-    ),
-    (
-        "engram-memory",
-        include_str!("../.claude/skills/engram-memory/SKILL.md"),
-    ),
-    (
-        "engram-dispatch",
-        include_str!("../.claude/skills/engram-dispatch/SKILL.md"),
-    ),
-];
-/// Installed by engram before skills became stubs; its content is now `engram guide memory-quality`.
-const LEGACY_SKILL_FILES: &[&str] = &["engram-learn/references/memory-quality.md"];
-static ISSUE_TEMPLATES_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/.github/ISSUE_TEMPLATE");
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let mode = cli.output_mode();
     match cli.command {
-        Commands::Init => cmd_init(),
+        Commands::Init => init::run(&config::find_repo_root()?),
         Commands::Plan { subcommand } => cmd_plan(subcommand),
         Commands::Search { query } => cmd_search(mode, &query),
         Commands::Doctor => cmd_doctor(),
         Commands::Guide { topic } => cmd_guide(topic.as_deref()),
-        Commands::Compact => cmd_compact(),
+        Commands::Compact => compact::run(&config::find_repo_root()?),
         Commands::Objective { subcommand } => cmd_objective(subcommand),
         Commands::Read { permalink } => cmd_read(&permalink, mode),
-        Commands::Kata { subcommand } => cmd_kata(subcommand),
-        Commands::Memory { subcommand } => cmd_memory(subcommand),
+        Commands::Kata { subcommand } => cmd_kata(&subcommand),
+        Commands::Memory { subcommand } => cmd_memory(&subcommand),
         Commands::Dispatch { issues, opts } => cmd_dispatch(&issues, opts, mode),
-        Commands::Capture {
-            category,
-            title,
-            slug,
-            read_when,
-            tripwires,
-            body,
-            session,
-        } => {
-            let slug = slug.unwrap_or_else(|| capture::slugify(&title));
-            let body = capture::resolve_body(body)?;
-            let mut entry = capture::Capture {
-                category,
-                slug,
-                title,
-                read_when,
-                tripwires,
-                body,
-                ..Default::default()
-            };
-            if session {
-                entry.mark_session();
-            }
-            cmd_capture(mode, entry)
-        }
+        Commands::Capture(args) => cmd_capture(mode, capture::Capture::from_args(args)?),
+    }
+}
+
+/// `--no-kata`: keep kata out of this invocation entirely.
+fn apply_no_kata(no_kata: bool) {
+    if no_kata {
+        kata::disable();
     }
 }
 
 fn cmd_capture(mode: OutputMode, entry: capture::Capture) -> Result<()> {
     let repo_root = config::find_repo_root()?;
     capture::write(&repo_root, &entry)?;
-    let rel = format!("{}/{}.md", entry.category, entry.slug);
+    let path = memory::topic_rel_path(&entry.category, &entry.slug);
     let origin = entry.origin().map(str::to_string);
     match mode {
         OutputMode::Json => {
             let out = CaptureResultJson {
-                path: format!(".engram/memory/{rel}"),
+                path,
                 category: entry.category,
                 slug: entry.slug,
                 origin,
@@ -133,74 +90,11 @@ fn cmd_capture(mode: OutputMode, entry: capture::Capture) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
         OutputMode::Agent => match origin {
-            Some(o) => println!("OK capture path=.engram/memory/{rel} origin={o}"),
-            None => println!("OK capture path=.engram/memory/{rel}"),
+            Some(o) => println!("OK capture path={path} origin={o}"),
+            None => println!("OK capture path={path}"),
         },
-        OutputMode::Human => println!("Captured .engram/memory/{rel} — {}", entry.title),
+        OutputMode::Human => println!("Captured {path} — {}", entry.title),
     }
-    Ok(())
-}
-
-fn cmd_init() -> Result<()> {
-    let repo_root = config::find_repo_root()?;
-    let mut cfg = config::Config::load(&repo_root)?;
-
-    if cfg.github.repo.is_none() {
-        cfg.github.repo = config::infer_repo(&repo_root)?;
-    }
-
-    cfg.save(&repo_root)?;
-    println!("Wrote .engram/config.toml");
-
-    std::fs::create_dir_all(repo_root.join(".engram/memory"))?;
-
-    let hooks_dir = repo_root.join(".engram/prompt-hooks");
-    if !hooks_dir.exists() {
-        std::fs::create_dir_all(&hooks_dir)?;
-        std::fs::write(hooks_dir.join("README.md"), PROMPT_HOOKS_README)?;
-        println!("Created .engram/prompt-hooks/");
-    }
-
-    memory::rebuild_index(&repo_root)?;
-
-    memory::write_claude_md_section(&repo_root)?;
-    println!("Updated CLAUDE.md");
-
-    install_skills(&repo_root)?;
-    install_issue_templates(&repo_root)?;
-
-    // GitHub setup is optional: local-only repos (no remote, or no `gh`) skip it
-    // and still get a fully working memory directory.
-    match cfg.repo() {
-        Some(repo) if config::gh_available() => {
-            github::ensure_label(
-                repo,
-                "engram-plan",
-                "0075ca",
-                "Plan issue created by engram",
-            )?;
-            github::ensure_label(
-                repo,
-                github::LEARNED_LABEL,
-                "e4e669",
-                "Learning PR created by engram",
-            )?;
-            github::ensure_label(
-                repo,
-                "engram-objective",
-                "5319e7",
-                "Objective issue created by engram",
-            )?;
-            println!("GitHub labels ensured: engram-plan, engram-learned, engram-objective");
-        }
-        Some(_) => println!("Skipped GitHub labels: `gh` CLI not found."),
-        None => println!(
-            "No GitHub repo detected — local-only mode. Memory capture works; \
-             `plan`/`learn`/`objective` require GitHub."
-        ),
-    }
-
-    println!("engram initialized.");
     Ok(())
 }
 
@@ -214,72 +108,65 @@ fn cmd_plan(subcmd: cli::PlanCommands) -> Result<()> {
             jira,
             kind,
             no_kata,
-        } => plan::new(
-            &repo_root,
-            &title,
-            body.as_deref(),
-            conversation.as_deref(),
-            &kata::TrackerMeta { jira, kind },
-            no_kata,
-        ),
+        } => {
+            apply_no_kata(no_kata);
+            plan::new(
+                &repo_root,
+                &title,
+                body.as_deref(),
+                conversation.as_deref(),
+                &kata::TrackerMeta { jira, kind },
+            )
+        }
         cli::PlanCommands::List => plan::list(&repo_root),
         cli::PlanCommands::Learn {
             issue,
             all,
             no_kata,
         } => {
-            if all {
-                plan::learn_all(&repo_root, no_kata)
-            } else if let Some(n) = issue {
-                plan::learn_single(&repo_root, n, no_kata)
-            } else {
-                anyhow::bail!("specify an issue number or pass --all")
+            apply_no_kata(no_kata);
+            match (issue, all) {
+                (_, true) => plan::learn_all(&repo_root),
+                (Some(n), false) => plan::learn_single(&repo_root, n),
+                (None, false) => anyhow::bail!("specify an issue number or pass --all"),
             }
         }
-        cli::PlanCommands::Land { issue, no_kata } => plan::land(&repo_root, issue, no_kata),
+        cli::PlanCommands::Land { issue, no_kata } => {
+            apply_no_kata(no_kata);
+            plan::land(&repo_root, issue)
+        }
         cli::PlanCommands::Status => plan::status(&repo_root),
     }
 }
 
-fn cmd_compact() -> Result<()> {
-    let repo_root = config::find_repo_root()?;
-    compact::run(&repo_root)
-}
-
-fn cmd_memory(subcmd: cli::MemoryCommands) -> Result<()> {
+fn cmd_memory(subcmd: &cli::MemoryCommands) -> Result<()> {
     let repo_root = config::find_repo_root()?;
     match subcmd {
-        cli::MemoryCommands::Migrate => cmd_memory_migrate(&repo_root),
+        cli::MemoryCommands::Migrate => {
+            let repo = config::github_repo(&repo_root)
+                .context("resolving GitHub repo for memory migrate")?;
+            let (processed, skipped) = memory::migrate_all(&repo_root, &repo)?;
+            println!("Migrated {processed} file(s), skipped {skipped}.");
+
+            memory::rebuild_index(&repo_root)?;
+            memory::write_claude_md_section(&repo_root)?;
+            println!("Rebuilt index and CLAUDE.md section.");
+            Ok(())
+        }
     }
 }
 
-fn cmd_memory_migrate(repo_root: &std::path::Path) -> Result<()> {
-    let cfg = config::Config::load(repo_root)?;
-    let repo = config::resolve_repo(&cfg, repo_root)
-        .context("resolving GitHub repo for memory migrate")?;
-
-    let (processed, skipped) = memory::migrate_all(repo_root, &repo)?;
-    println!("Migrated {processed} file(s), skipped {skipped}.");
-
-    memory::rebuild_index(repo_root)?;
-    memory::write_claude_md_section(repo_root)?;
-    println!("Rebuilt index and CLAUDE.md section.");
-
-    Ok(())
-}
-
-fn cmd_search(mode: cli::OutputMode, query: &str) -> Result<()> {
-    use cli::OutputMode;
+fn cmd_search(mode: OutputMode, query: &str) -> Result<()> {
     let repo_root = config::find_repo_root()?;
     let results = index::search(&repo_root, query)?;
     match mode {
         OutputMode::Json => {
             let out: Vec<SearchResultJson> = results
-                .iter()
+                .into_iter()
                 .map(|r| SearchResultJson {
-                    path: r.path.clone(),
-                    category: r.category.clone(),
-                    snippet: r.snippet.clone(),
+                    path: r.path,
+                    category: r.category,
+                    snippet: r.snippet,
                 })
                 .collect();
             println!("{}", serde_json::to_string_pretty(&out)?);
@@ -295,7 +182,7 @@ fn cmd_search(mode: cli::OutputMode, query: &str) -> Result<()> {
         }
         OutputMode::Human => {
             if results.is_empty() {
-                println!("No results for {:?}", query);
+                println!("No results for {query:?}");
             } else {
                 for r in &results {
                     println!("{} ({})\n  {}\n", r.path, r.category, r.snippet);
@@ -306,154 +193,91 @@ fn cmd_search(mode: cli::OutputMode, query: &str) -> Result<()> {
     Ok(())
 }
 
-fn scan_memory_matches(
-    memory_dir: &std::path::Path,
-    categories: &[String],
-    needle: &str,
-) -> Vec<std::path::PathBuf> {
-    let mut matches = Vec::new();
-    for cat in categories {
-        let cat_dir = memory_dir.join(cat);
-        if !cat_dir.exists() {
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(&cat_dir) else {
-            continue;
-        };
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "md") {
-                let stem = path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                if stem == needle {
-                    matches.push(path);
-                }
-            }
-        }
-    }
-    matches
-}
-
+/// `engram read`: print the one memory file `permalink` names. Not found and
+/// ambiguous are reported in the output mode's own format on stderr, and the
+/// process exits 1 without anyhow's extra error line.
 fn cmd_read(permalink: &str, mode: OutputMode) -> Result<()> {
     let repo_root = config::find_repo_root()?;
-    let memory_dir = repo_root.join(".engram/memory");
+    let memory_dir = memory::memory_dir(&repo_root);
+    let matches = memory::find_topics(&repo_root, permalink)?;
+    let relative = |p: &Path| {
+        p.strip_prefix(&memory_dir)
+            .unwrap_or(p)
+            .display()
+            .to_string()
+    };
 
-    // 1. Try exact path under memory_dir
-    let exact = memory_dir.join(permalink);
-    if exact.exists() {
-        let content = std::fs::read_to_string(&exact)?;
-        if mode == OutputMode::Json {
-            let out = ReadResultJson {
-                path: permalink.to_string(),
-                content,
-            };
-            println!("{}", serde_json::to_string_pretty(&out)?);
-        } else {
-            print!("{content}");
-        }
-        return Ok(());
-    }
-
-    // 2. Scan all categories for stem match
-    let needle = std::path::Path::new(permalink)
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| permalink.to_string());
-
-    let cfg = config::Config::load(&repo_root)?;
-    let matches = scan_memory_matches(&memory_dir, &cfg.memory.default_categories, &needle);
-
-    match matches.len() {
-        0 => {
-            match mode {
-                OutputMode::Json => eprintln!("{{\"error\":\"not_found\",\"id\":\"{permalink}\"}}"),
-                OutputMode::Agent => eprintln!("ERR not_found: {permalink}"),
-                OutputMode::Human => eprintln!("not found: {permalink}"),
-            }
-            std::process::exit(1);
-        }
-        1 => {
-            let rel = matches[0].strip_prefix(&memory_dir).unwrap_or(&matches[0]);
-            let content = std::fs::read_to_string(&matches[0])?;
+    let candidates: Vec<String> = match matches.as_slice() {
+        [path] => {
+            let content = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
             if mode == OutputMode::Json {
                 let out = ReadResultJson {
-                    path: rel.display().to_string(),
+                    path: relative(path),
                     content,
                 };
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
                 print!("{content}");
             }
-            Ok(())
+            return Ok(());
         }
-        _ => {
-            let candidates: Vec<String> = matches
-                .iter()
-                .map(|p| {
-                    p.strip_prefix(&memory_dir)
-                        .unwrap_or(p)
-                        .display()
-                        .to_string()
-                })
-                .collect();
-            match mode {
-                OutputMode::Json => {
-                    eprintln!(
-                        "{{\"error\":\"ambiguous\",\"id\":\"{permalink}\",\"candidates\":{}}}",
-                        serde_json::to_string(&candidates)?
-                    );
-                }
-                OutputMode::Agent => {
-                    eprintln!("ERR ambiguous: {permalink} matches multiple files:");
-                    for c in &candidates {
-                        eprintln!("  {c}");
-                    }
-                }
-                OutputMode::Human => {
-                    eprintln!("ambiguous: {permalink} matches multiple files:");
-                    for c in &candidates {
-                        eprintln!("  {c}");
-                    }
-                }
+        many => many.iter().map(|p| relative(p)).collect(),
+    };
+
+    match (mode, candidates.is_empty()) {
+        (OutputMode::Json, true) => {
+            eprintln!(
+                "{}",
+                serde_json::json!({ "error": "not_found", "id": permalink })
+            );
+        }
+        (OutputMode::Json, false) => eprintln!(
+            "{}",
+            serde_json::json!({ "error": "ambiguous", "id": permalink, "candidates": candidates })
+        ),
+        (OutputMode::Agent, true) => eprintln!("ERR not_found: {permalink}"),
+        (OutputMode::Human, true) => eprintln!("not found: {permalink}"),
+        (OutputMode::Agent | OutputMode::Human, false) => {
+            let prefix = if mode == OutputMode::Agent {
+                "ERR "
+            } else {
+                ""
+            };
+            eprintln!("{prefix}ambiguous: {permalink} matches multiple files:");
+            for c in &candidates {
+                eprintln!("  {c}");
             }
-            std::process::exit(1);
         }
     }
+    std::process::exit(1);
 }
-
-const PROMPT_HOOKS_README: &str = r#"# Prompt Hooks
-
-Markdown files in this directory are injected into the Claude prompt during
-`engram plan learn` under a "Project-Specific Rules" section.
-
-Use hooks to customize how learnings are classified for this repo. Examples:
-
-- "Always classify Rust lifetime errors as tripwires."
-- "This repo uses pytest — testing learnings should reference pytest patterns."
-- "Prefer architecture entries for any change to the public API surface."
-
-Files are loaded in alphabetical order. Only `.md` files are included.
-This directory is committed to the repo so rules are shared across the team.
-"#;
 
 type Check = (&'static str, Box<dyn Fn() -> bool>);
 
-fn cmd_doctor() -> Result<()> {
-    let mut all_ok = true;
+fn tool_runs(program: &str) -> bool {
+    Command::new(program)
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
 
-    let checks: &[Check] = &[
-        ("git repo", Box::new(|| config::find_repo_root().is_ok())),
+fn cmd_doctor() -> Result<()> {
+    let repo_root = config::find_repo_root().ok();
+    let in_repo = |f: fn(&Path) -> bool| {
+        let root = repo_root.clone();
+        Box::new(move || root.as_deref().is_some_and(f)) as Box<dyn Fn() -> bool>
+    };
+
+    let checks: Vec<Check> = vec![
         (
-            "gh installed",
-            Box::new(|| {
-                Command::new("gh")
-                    .arg("--version")
-                    .output()
-                    .is_ok_and(|o| o.status.success())
+            "git repo",
+            Box::new({
+                let found = repo_root.is_some();
+                move || found
             }),
         ),
+        ("gh installed", Box::new(config::gh_available)),
         (
             "gh authenticated",
             Box::new(|| {
@@ -464,43 +288,20 @@ fn cmd_doctor() -> Result<()> {
                 })
             }),
         ),
-        (
-            "claude installed",
-            Box::new(|| {
-                Command::new("claude")
-                    .arg("--version")
-                    .output()
-                    .is_ok_and(|o| o.status.success())
-            }),
-        ),
+        ("claude installed", Box::new(|| tool_runs("claude"))),
         (
             ".engram/config.toml exists",
-            Box::new(|| {
-                config::find_repo_root()
-                    .map(|r| r.join(".engram/config.toml").exists())
-                    .unwrap_or(false)
-            }),
+            in_repo(|r| r.join(config::CONFIG_PATH).exists()),
         ),
         (
             "github repo configured",
-            Box::new(|| {
-                config::find_repo_root()
-                    .and_then(|r| config::Config::load(&r))
-                    .map(|c| c.repo().is_some())
-                    .unwrap_or(false)
-            }),
+            in_repo(|r| config::Config::load(r).is_ok_and(|c| c.repo().is_some())),
         ),
-        (
-            "claude skills current",
-            Box::new(|| {
-                config::find_repo_root()
-                    .map(|r| skills_current(&r))
-                    .unwrap_or(false)
-            }),
-        ),
+        ("claude skills current", in_repo(init::skills_current)),
     ];
 
-    for (label, check) in checks {
+    let mut all_ok = true;
+    for (label, check) in &checks {
         let ok = check();
         // A bad `engram.githubUser` fails `gh` auth; say how to fix it.
         let why = (!ok && *label == "gh authenticated")
@@ -509,13 +310,11 @@ fn cmd_doctor() -> Result<()> {
             .map(|e| format!(" ({e:#})"))
             .unwrap_or_default();
         println!("{} {label}{why}", if ok { "✓" } else { "✗" });
-        if !ok {
-            all_ok = false;
-        }
+        all_ok &= ok;
     }
 
     // Only `engram dispatch` needs kwt/tmux/kata, so this line never fails doctor.
-    let dispatch_root = config::find_repo_root().unwrap_or_else(|_| PathBuf::from("."));
+    let dispatch_root = repo_root.unwrap_or_else(|| PathBuf::from("."));
     match dispatch::unavailable_reasons(&dispatch_root).as_slice() {
         [] => println!("✓ dispatch available"),
         reasons => println!("- dispatch unavailable ({})", reasons.join("; ")),
@@ -529,8 +328,7 @@ fn cmd_doctor() -> Result<()> {
 
 fn cmd_objective(subcmd: cli::ObjectiveCommands) -> Result<()> {
     let repo_root = config::find_repo_root()?;
-    let cfg = config::Config::load(&repo_root)?;
-    let repo = config::resolve_repo(&cfg, &repo_root)?;
+    let repo = config::github_repo(&repo_root)?;
 
     match subcmd {
         cli::ObjectiveCommands::New {
@@ -539,13 +337,10 @@ fn cmd_objective(subcmd: cli::ObjectiveCommands) -> Result<()> {
             jira,
             kind,
             no_kata,
-        } => objective::new(
-            &repo,
-            &title,
-            &body,
-            &kata::TrackerMeta { jira, kind },
-            no_kata,
-        ),
+        } => {
+            apply_no_kata(no_kata);
+            objective::new(&repo, &title, &body, &kata::TrackerMeta { jira, kind })
+        }
         cli::ObjectiveCommands::List => objective::list_open(&repo),
         cli::ObjectiveCommands::View { number } => objective::view(&repo, number),
         cli::ObjectiveCommands::Plan {
@@ -556,15 +351,21 @@ fn cmd_objective(subcmd: cli::ObjectiveCommands) -> Result<()> {
             jira,
             kind,
             no_kata,
-        } => objective::plan(
-            &repo,
-            number,
-            node.as_deref(),
-            all_unblocked,
-            body.as_deref(),
-            &kata::TrackerMeta { jira, kind },
-            no_kata,
-        ),
+        } => {
+            apply_no_kata(no_kata);
+            let target = match (node.as_deref(), all_unblocked) {
+                (_, true) => objective::PlanTarget::AllUnblocked,
+                (Some(id), false) => objective::PlanTarget::Node(id),
+                (None, false) => anyhow::bail!("pass --node <id> or --all-unblocked"),
+            };
+            objective::plan(
+                &repo,
+                number,
+                target,
+                body.as_deref(),
+                &kata::TrackerMeta { jira, kind },
+            )
+        }
         cli::ObjectiveCommands::Land { number } => objective::land(&repo_root, &repo, number),
         cli::ObjectiveCommands::Append {
             number,
@@ -586,101 +387,18 @@ fn cmd_dispatch(issues: &[u64], opts: dispatch::DispatchOptions, mode: OutputMod
     dispatch::dispatch(&repo_root, &repo, &cfg, &toolchain, issues, opts)
 }
 
-fn cmd_kata(subcmd: cli::KataCommands) -> Result<()> {
-    let repo_root = config::find_repo_root()?;
-    let cfg = config::Config::load(&repo_root)?;
-    let repo = config::resolve_repo(&cfg, &repo_root)?;
-
+fn cmd_kata(subcmd: &cli::KataCommands) -> Result<()> {
+    let repo = config::github_repo(&config::find_repo_root()?)?;
     match subcmd {
-        cli::KataCommands::Sync { issue, all } => {
-            if all {
-                let results = kata::sync_all(&repo)?;
-                let mut failed = 0usize;
-                for result in results {
-                    match result {
-                        Ok(report) => print_sync_report(&report),
-                        Err(e) => {
-                            eprintln!("warning: {e:#}");
-                            failed += 1;
-                        }
-                    }
-                }
-                if failed > 0 {
-                    anyhow::bail!("{failed} pair(s) failed to sync — see warnings above");
-                }
-                Ok(())
-            } else if let Some(number) = issue {
-                let kata_ref = kata::find_kata_ref_for_issue(&repo, number)?;
-                let report = kata::sync_pair(&repo, number, &kata_ref)?;
-                print_sync_report(&report);
-                Ok(())
-            } else {
-                anyhow::bail!("specify --issue <N> or pass --all")
-            }
+        &cli::KataCommands::Sync { issue, all } => {
+            let target = match (issue, all) {
+                (_, true) => kata::sync::Target::All,
+                (Some(n), false) => kata::sync::Target::Issue(n),
+                (None, false) => anyhow::bail!("specify --issue <N> or pass --all"),
+            };
+            kata::sync::run(&repo, target)
         }
     }
-}
-
-fn print_sync_report(report: &kata::SyncReport) {
-    println!("#{} <-> {}", report.github_number, report.kata_ref);
-    if report.synced_fields.is_empty()
-        && report.conflicts.is_empty()
-        && report.blocked_close_note.is_none()
-    {
-        println!("  no changes");
-    }
-    for field in &report.synced_fields {
-        println!("  synced: {field}");
-    }
-    for conflict in &report.conflicts {
-        println!("  conflict: {conflict}");
-    }
-    if let Some(note) = &report.blocked_close_note {
-        println!("  blocked: {note}");
-    }
-}
-
-fn install_issue_templates(repo_root: &std::path::Path) -> Result<()> {
-    use anyhow::Context;
-    let dest = repo_root.join(".github/ISSUE_TEMPLATE");
-    std::fs::create_dir_all(&dest).context("creating .github/ISSUE_TEMPLATE")?;
-    ISSUE_TEMPLATES_DIR
-        .extract(&dest)
-        .context("installing GitHub issue templates")?;
-    println!("Installed GitHub issue template: engram-plan");
-    Ok(())
-}
-
-fn install_skills(repo_root: &std::path::Path) -> Result<()> {
-    let skills_root = repo_root.join(".claude/skills");
-    for (name, stub) in SKILL_STUBS {
-        let dest = skills_root.join(name);
-        std::fs::create_dir_all(&dest).with_context(|| format!("creating {}", dest.display()))?;
-        std::fs::write(dest.join("SKILL.md"), stub)
-            .with_context(|| format!("installing Claude skill {name}"))?;
-    }
-    for legacy in LEGACY_SKILL_FILES {
-        let path = skills_root.join(legacy);
-        if path.exists() {
-            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
-            if let Some(dir) = path.parent() {
-                // Only succeeds when empty, so files the user added there stay.
-                let _ = std::fs::remove_dir(dir);
-            }
-        }
-    }
-    let skill_names: Vec<&str> = SKILL_STUBS.iter().map(|(name, _)| *name).collect();
-    println!("Installed Claude skills: {}", skill_names.join(", "));
-    Ok(())
-}
-
-fn skills_current(repo_root: &std::path::Path) -> bool {
-    SKILL_STUBS.iter().all(|(name, stub)| {
-        let dest = repo_root.join(".claude/skills").join(name).join("SKILL.md");
-        std::fs::read(dest)
-            .map(|bytes| bytes == stub.as_bytes())
-            .unwrap_or(false)
-    })
 }
 
 fn cmd_guide(topic: Option<&str>) -> Result<()> {
@@ -693,193 +411,4 @@ fn cmd_guide(topic: Option<&str>) -> Result<()> {
         ),
     }
     Ok(())
-}
-
-pub(crate) fn days_ago(iso: &str) -> String {
-    let date_part = iso.split('T').next().unwrap_or(iso);
-    let parts: Vec<u32> = date_part
-        .split('-')
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    if parts.len() != 3 {
-        return iso.to_string();
-    }
-    let created_days = days_from_ymd(parts[0] as i32, parts[1], parts[2]);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.as_secs() / 86400) as i32)
-        .unwrap_or(0);
-    let diff = now - created_days;
-    match diff {
-        0 => "today".to_string(),
-        1 => "1 day ago".to_string(),
-        d => format!("{d} days ago"),
-    }
-}
-
-pub(crate) fn days_from_ymd(y: i32, m: u32, d: u32) -> i32 {
-    let m = m as i32;
-    let d = d as i32;
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn days_from_ymd_epoch() {
-        assert_eq!(days_from_ymd(1970, 1, 1), 0);
-    }
-
-    #[test]
-    fn days_from_ymd_next_day() {
-        assert_eq!(days_from_ymd(1970, 1, 2), 1);
-    }
-
-    #[test]
-    fn days_from_ymd_y2k() {
-        assert_eq!(days_from_ymd(2000, 1, 1), 10957);
-    }
-
-    #[test]
-    fn days_from_ymd_leap_day() {
-        assert_eq!(days_from_ymd(2000, 2, 29), 11016);
-    }
-
-    #[test]
-    fn days_from_ymd_end_of_year() {
-        assert_eq!(days_from_ymd(1970, 12, 31), 364);
-    }
-
-    #[test]
-    fn days_ago_malformed_returns_input() {
-        assert_eq!(days_ago("not-a-date"), "not-a-date");
-    }
-
-    #[test]
-    fn days_ago_epoch_is_many_days() {
-        let result = days_ago("1970-01-01T00:00:00Z");
-        assert!(
-            result.ends_with("days ago"),
-            "expected 'N days ago', got {result}"
-        );
-    }
-
-    fn write_memory_file(root: &std::path::Path, cat: &str, slug: &str, body: &str) {
-        let dir = root.join(format!(".engram/memory/{cat}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{slug}.md")), body).unwrap();
-    }
-
-    fn cats(names: &[&str]) -> Vec<String> {
-        names.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn scan_memory_matches_finds_and_misses() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        write_memory_file(root, "patterns", "foo", "foo body");
-        write_memory_file(root, "tripwires", "foo", "tripwires body");
-        let memory_dir = root.join(".engram/memory");
-
-        let found = scan_memory_matches(&memory_dir, &cats(&["patterns", "tripwires"]), "foo");
-        assert_eq!(found.len(), 2);
-
-        let missing = scan_memory_matches(&memory_dir, &cats(&["patterns"]), "nope");
-        assert!(missing.is_empty());
-    }
-
-    #[test]
-    fn install_issue_template_creates_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        install_issue_templates(root).unwrap();
-        assert!(root.join(".github/ISSUE_TEMPLATE/engram-plan.md").exists());
-    }
-
-    #[test]
-    fn install_skills_writes_only_engram_stubs() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        install_skills(root).unwrap();
-        for name in ["plan", "objective", "learn", "memory", "dispatch"] {
-            let stub = std::fs::read_to_string(
-                root.join(format!(".claude/skills/engram-{name}/SKILL.md")),
-            )
-            .unwrap();
-            assert!(
-                stub.contains(&format!("engram guide {name}")),
-                "engram-{name}"
-            );
-            assert!(stub.lines().count() <= 15, "engram-{name} is not a stub");
-        }
-        assert!(!root.join(".claude/skills/graft").exists());
-    }
-
-    #[test]
-    fn install_skills_replaces_old_full_skills() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let skills = root.join(".claude/skills");
-        std::fs::create_dir_all(skills.join("engram-learn/references")).unwrap();
-        std::fs::write(skills.join("engram-learn/SKILL.md"), "old full skill").unwrap();
-        std::fs::write(
-            skills.join("engram-learn/references/memory-quality.md"),
-            "old",
-        )
-        .unwrap();
-        install_skills(root).unwrap();
-        let stub = std::fs::read_to_string(skills.join("engram-learn/SKILL.md")).unwrap();
-        assert!(stub.contains("engram guide learn"));
-        assert!(!skills.join("engram-learn/references").exists());
-        assert!(skills_current(root));
-    }
-
-    #[test]
-    fn skills_current_ignores_other_skills() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        install_skills(root).unwrap();
-        std::fs::create_dir_all(root.join(".claude/skills/graft")).unwrap();
-        std::fs::write(
-            root.join(".claude/skills/graft/SKILL.md"),
-            b"rewritten by graft",
-        )
-        .unwrap();
-        assert!(skills_current(root));
-    }
-
-    #[test]
-    fn skills_current_true_after_install() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        install_skills(root).unwrap();
-        assert!(skills_current(root));
-    }
-
-    #[test]
-    fn skills_current_false_when_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(!skills_current(dir.path()));
-    }
-
-    #[test]
-    fn skills_current_false_when_stale() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        install_skills(root).unwrap();
-        std::fs::write(
-            root.join(".claude/skills/engram-plan/SKILL.md"),
-            b"outdated",
-        )
-        .unwrap();
-        assert!(!skills_current(root));
-    }
 }

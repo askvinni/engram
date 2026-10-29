@@ -17,13 +17,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::config::{self, Config};
-use crate::github::{self, OpenPr, PrWithBody};
+use crate::github::{self, OpenPr, PrState, PrWithBody, OBJECTIVE_LABEL, PLAN_LABEL};
 use crate::kata;
 use crate::objective::{self, NodeStatus, ObjectiveNode};
+use crate::process::{self, git, git_remote, run_checked};
 
 /// kwt is often only a shell alias to the copy bundled with Ghosthub, which
 /// `Command::new("kwt")` can't see.
@@ -36,22 +37,30 @@ const TOOLS: &[(&str, &str)] = &[
     ("claude", "--version"),
 ];
 const SLUG_MAX: usize = 40;
-const PLAN_LABEL: &str = "engram-plan";
-const OBJECTIVE_LABEL: &str = "engram-objective";
 const SHELLS: &[&str] = &["zsh", "bash", "fish", "sh", "dash", "ksh"];
 /// How long to wait for Claude to replace the shell in a pane, then to stay there.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
 const LAUNCH_SETTLE: Duration = Duration::from_secs(3);
 const LAUNCH_POLL: Duration = Duration::from_millis(500);
-/// `kwt open --start-session` attempts; backoff is 1s, then 2s.
+/// `kwt open --start-session` attempts, waiting `KWT_OPEN_BACKOFF` times
+/// the attempt number between them (1s, then 2s).
 const KWT_OPEN_ATTEMPTS: u64 = 3;
+const KWT_OPEN_BACKOFF: Duration = Duration::from_secs(1);
 const PANE_TAIL_LINES: usize = 5;
 /// Overrides the launched command above `[dispatch] claude` (verbatim; for tests).
 const CLAUDE_OVERRIDE_ENV: &str = "ENGRAM_DISPATCH_CLAUDE";
 /// Prompt files live under `$XDG_STATE_HOME/<PROMPT_SUBDIR>`, outside every worktree.
 const PROMPT_SUBDIR: &str = "engram/dispatch";
+const XDG_STATE_HOME: &str = "XDG_STATE_HOME";
+/// `$XDG_STATE_HOME` when unset, relative to `$HOME`.
+const DEFAULT_STATE_HOME: &str = ".local/state";
 const READY_NO_RELAUNCH: &str = "PR is ready for review \u{2014} not relaunching";
-const LAUNCHED: &str = "launched";
+/// Where kata reads the actor from, in its order (then git's `user.name`).
+const ACTOR_ENV_VARS: [&str; 2] = ["KATA_AUTHOR", "USER"];
+/// `NAME=value` words whose name contains one of these are redacted for display.
+const CREDENTIAL_MARKERS: &[&str] = &["TOKEN", "SECRET", "KEY", "PASSWORD"];
+/// Permission mode the dispatched Claude session starts in.
+const PERMISSION_MODE: &str = "auto";
 /// `git ls-remote --exit-code` exits 2 when the ref is absent.
 const LS_REMOTE_NO_MATCH: i32 = 2;
 
@@ -104,7 +113,7 @@ fn check_tools(repo_root: &Path) -> (BTreeMap<&'static str, PathBuf>, Vec<String
             None => missing.push(name),
         }
     }
-    let kata_bound = repo_root.join(".kata.toml").exists();
+    let kata_bound = repo_root.join(kata::KATA_CONFIG).exists();
     let problems = tool_problems(&missing, found.contains_key("kata"), kata_bound);
     (found, problems)
 }
@@ -175,7 +184,8 @@ fn strip_node_prefix(title: &str) -> &str {
 
 /// Branch-safe slug: lowercase ASCII letters, digits and single dashes, at
 /// most `SLUG_MAX` long (cut at a word boundary), node-id prefix dropped.
-fn slugify(title: &str) -> String {
+/// (`capture::slugify` makes memory file names and keeps every word.)
+fn branch_slug(title: &str) -> String {
     let kept: String = strip_node_prefix(title)
         .to_ascii_lowercase()
         .chars()
@@ -258,7 +268,7 @@ fn placeholder_value(name: &str, plan: &PlanFields) -> Option<String> {
     match name {
         "number" => Some(plan.number.to_string()),
         "title" => Some(plan.title.clone()),
-        "slug" => Some(slugify(&plan.title)),
+        "slug" => Some(branch_slug(&plan.title)),
         _ => None,
     }
 }
@@ -335,32 +345,56 @@ impl PlacedNode {
     }
 }
 
-/// Refuse anything but an open plan (plan label) or objective (node list; the
-/// objective label alone is an error), including plain kata issues.
-fn require_plan_or_objective(number: u64, issue: &github::Issue, has_nodes: bool) -> Result<()> {
+/// Refuse a pull request or an issue that isn't open.
+fn require_open_issue(number: u64, issue: &github::Issue) -> Result<()> {
     if issue.is_pull_request() {
         anyhow::bail!("#{number} is a pull request, not an engram-plan or engram-objective issue");
     }
-    let state = &issue.state;
-    if !state.eq_ignore_ascii_case("open") {
+    if !issue.is_open() {
         let hint = if issue.has_label(PLAN_LABEL) {
             format!("; if its work merged, run `engram plan land {number}`")
         } else {
             String::new()
         };
-        anyhow::bail!("#{number} is not open (state: {state}){hint}");
+        anyhow::bail!("#{number} is not open (state: {}){hint}", issue.state);
     }
-    if !has_nodes && issue.has_label(OBJECTIVE_LABEL) {
+    Ok(())
+}
+
+fn neither_plan_nor_objective(number: u64) -> anyhow::Error {
+    anyhow::anyhow!(
+        "#{number} is neither an engram-plan nor an engram-objective issue \
+         (no `{PLAN_LABEL}` label and no objective node list)"
+    )
+}
+
+/// Refuse anything but an open plan (plan label) or objective (node list; the
+/// objective label alone is an error), including plain kata issues.
+fn require_plan_or_objective(number: u64, issue: &github::Issue, has_nodes: bool) -> Result<()> {
+    require_open_issue(number, issue)?;
+    if has_nodes {
+        return Ok(());
+    }
+    if issue.has_label(OBJECTIVE_LABEL) {
         anyhow::bail!(
             "#{number} is an engram-objective without a node list — \
              was it created with `engram objective new`?"
         );
     }
-    if !has_nodes && !issue.has_label(PLAN_LABEL) {
-        anyhow::bail!(
-            "#{number} is neither an engram-plan nor an engram-objective issue \
-             (no `{PLAN_LABEL}` label and no objective node list)"
-        );
+    if !issue.has_label(PLAN_LABEL) {
+        return Err(neither_plan_nor_objective(number));
+    }
+    Ok(())
+}
+
+/// Refuse anything but an open plan issue.
+fn require_plan(number: u64, issue: &github::Issue) -> Result<()> {
+    if issue.has_label(OBJECTIVE_LABEL) {
+        anyhow::bail!("#{number} is an engram-objective, not a plan issue");
+    }
+    require_open_issue(number, issue)?;
+    if !issue.has_label(PLAN_LABEL) {
+        return Err(neither_plan_nor_objective(number));
     }
     Ok(())
 }
@@ -394,12 +428,17 @@ fn order_for_stack(nodes: &[ObjectiveNode]) -> Result<StackOrder> {
         .iter()
         .filter(|n| n.status != NodeStatus::Done)
         .collect();
-    let deps_of = |n| {
-        let mut seen = BTreeSet::new();
-        let mut deps: Vec<&str> = objective::blocked_by(n, nodes);
-        deps.retain(|d| seen.insert(*d));
-        deps
-    };
+    // Each node's unfinished dependencies, deduplicated, in declaration order.
+    let deps: BTreeMap<&str, Vec<&str>> = unfinished
+        .iter()
+        .map(|n| {
+            let mut seen = BTreeSet::new();
+            let mut d = objective::blocked_by(n, nodes);
+            d.retain(|id| seen.insert(*id));
+            (n.id.as_str(), d)
+        })
+        .collect();
+    let deps_of = |n: &ObjectiveNode| deps[n.id.as_str()].as_slice();
     let mut ordered: Vec<&ObjectiveNode> = Vec::new();
     let mut placed: BTreeSet<&str> = BTreeSet::new();
     while let Some(next) = unfinished
@@ -433,7 +472,7 @@ fn order_for_stack(nodes: &[ObjectiveNode]) -> Result<StackOrder> {
             let above = objective::unfinished_ancestors(d, nodes);
             deps.iter().all(|o| o == *d || above.contains(*o))
         });
-        let base = match (deps.as_slice(), covering) {
+        let base = match (deps, covering) {
             ([], _) => Base::Main,
             (_, Some(d)) => Base::OnNode(d.to_string()),
             (_, None) => {
@@ -517,20 +556,69 @@ fn confirm() -> Result<bool> {
     ))
 }
 
+/// Where a plan's branch already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchState {
+    /// A local branch (whether or not origin has it).
+    Local,
+    /// Only on origin, e.g. dispatched from another machine.
+    Remote,
+    /// Nowhere yet.
+    Missing,
+}
+
+impl BranchState {
+    fn of(local: bool, on_origin: bool) -> Self {
+        match (local, on_origin) {
+            (true, _) => BranchState::Local,
+            (false, true) => BranchState::Remote,
+            (false, false) => BranchState::Missing,
+        }
+    }
+
+    /// What dispatch will do with the branch.
+    fn plan(self) -> &'static str {
+        match self {
+            BranchState::Local => "reuse local branch",
+            BranchState::Remote => "track existing origin branch",
+            BranchState::Missing => "create from origin with an empty wip commit",
+        }
+    }
+}
+
+/// How an open PR closing the plan was found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrLink {
+    /// GitHub links it as closing the plan.
+    Linked,
+    /// Its body says `Closes #N` (stacked PRs, which GitHub never links).
+    BodyKeyword,
+}
+
+impl PrLink {
+    fn describe(self, number: u64) -> String {
+        match self {
+            PrLink::Linked => format!("linked to #{number}"),
+            PrLink::BodyKeyword => format!("found by `Closes #{number}` in its body"),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct DispatchPlan {
     number: u64,
     title: String,
     body: String,
-    /// The plan's kata mirror; without one, carry_out creates it as `plan new`
+    /// The plan's kata mirror; without one, `carry_out` creates it as `plan new`
     /// would, with `meta` and `parent`.
     kata_ref: Option<String>,
     claimed_by_me: bool,
     meta: kata::TrackerMeta,
     parent: Option<String>,
     branch: String,
-    local: bool,
-    remote: bool,
+    branch_state: BranchState,
+    /// Whether origin has the branch (a local branch may be pushed or not).
+    on_origin: bool,
     pr_title: String,
     /// The base the PR targets: the default branch, a found PR's base, or in a
     /// stack the dependency's branch.
@@ -538,7 +626,7 @@ struct DispatchPlan {
     pr: Option<OpenPr>,
     /// How an open PR closing the plan was found; its branch and title then
     /// replace the templates'.
-    pr_link: Option<String>,
+    pr_link: Option<PrLink>,
     worktree: Option<PathBuf>,
     /// `(objective, node ID)` when the plan's marker names an existing node.
     objective_node: Option<(u64, String)>,
@@ -568,10 +656,10 @@ impl DispatchPlan {
         Some(format!("targets {}, not {}", pr.base, self.base))
     }
 
-    fn warn_base_mismatch(&self) {
-        if let (Some(pr), Some(why)) = (&self.pr, self.base_mismatch()) {
-            eprintln!("warning: existing PR {} {why}", pr.url);
-        }
+    /// The warning to print when reusing a PR whose base isn't the planned one.
+    fn base_mismatch_warning(&self) -> Option<String> {
+        let (pr, why) = (self.pr.as_ref()?, self.base_mismatch()?);
+        Some(format!("warning: existing PR {} {why}", pr.url))
     }
 }
 
@@ -581,11 +669,7 @@ fn format_plan(t: &DispatchPlan, no_launch: bool, claude: &str) -> String {
         Some(r) => format!("{r} (will claim)"),
         None => "(no mirror, will create and claim)".to_string(),
     };
-    let state = match (t.local, t.remote) {
-        (true, _) => "reuse local branch",
-        (false, true) => "track existing origin branch",
-        (false, false) => "create from origin with an empty wip commit",
-    };
+    let state = t.branch_state.plan();
     let branch_note = if t.pr_link.is_some() {
         format!("reused from the existing PR; {state}")
     } else {
@@ -595,7 +679,7 @@ fn format_plan(t: &DispatchPlan, no_launch: bool, claude: &str) -> String {
     let pr = match (&t.pr, t.base_mismatch(), &t.pr_link) {
         (None, ..) => "(will open a draft)".to_string(),
         (Some(pr), Some(why), _) => format!("{} (reuse; {why})", pr.url),
-        (Some(pr), None, Some(how)) => format!("{} (reuse; {how})", pr.url),
+        (Some(pr), None, Some(how)) => format!("{} (reuse; {})", pr.url, how.describe(t.number)),
         (Some(pr), None, None) => format!("{} (reuse)", pr.url),
     };
     let worktree = t
@@ -682,8 +766,9 @@ fn record_node_progress(repo: &str, number: u64, updates: &[(String, u64)]) -> R
     github::update_issue_body(
         repo,
         number,
-        &objective::build_objective_body(&body, &nodes),
-    )?;
+        &objective::build_objective_body(&body, &nodes)?,
+    )
+    .with_context(|| format!("updating objective #{number}"))?;
     println!(
         "Objective #{number}: recorded node(s) {} as in progress",
         changed.join(", ")
@@ -691,19 +776,83 @@ fn record_node_progress(repo: &str, number: u64, updates: &[(String, u64)]) -> R
     Ok(())
 }
 
-/// The line printed once planning is done: how many plans will be dispatched,
-/// how many of those are reused as already ready, and how many failed to plan.
-fn count_line(planned: usize, ready: usize, failed: usize, no_launch: bool) -> String {
-    let launches = if no_launch { 0 } else { planned - ready };
-    let failed = if failed > 0 {
-        format!("; {failed} failed to plan")
-    } else {
-        String::new()
-    };
-    format!(
-        "{planned} plan(s) to dispatch ({ready} already ready for review, not relaunched); \
-         up to {launches} Claude session(s) will start{failed}"
-    )
+/// How planning went: plans to dispatch, how many of those are reused as
+/// already ready, and how many failed to plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlanCounts {
+    planned: usize,
+    ready: usize,
+    failed: usize,
+}
+
+impl PlanCounts {
+    fn of<'a>(plans: impl IntoIterator<Item = &'a DispatchPlan>, failed: usize) -> Self {
+        let (mut planned, mut ready) = (0, 0);
+        for p in plans {
+            planned += 1;
+            ready += usize::from(p.ready());
+        }
+        PlanCounts {
+            planned,
+            ready,
+            failed,
+        }
+    }
+
+    /// The line printed once planning is done.
+    fn line(self, no_launch: bool) -> String {
+        let PlanCounts {
+            planned,
+            ready,
+            failed,
+        } = self;
+        let launches = if no_launch { 0 } else { planned - ready };
+        let failed = if failed > 0 {
+            format!("; {failed} failed to plan")
+        } else {
+            String::new()
+        };
+        format!(
+            "{planned} plan(s) to dispatch ({ready} already ready for review, not relaunched); \
+             up to {launches} Claude session(s) will start{failed}"
+        )
+    }
+}
+
+/// How carrying out the plans went.
+#[derive(Debug, Default, Clone, Copy)]
+struct Tally {
+    launched: usize,
+    reused: usize,
+    failed: usize,
+}
+
+impl Tally {
+    /// Count one plan's result (`Ok(true)` when it launched a session),
+    /// reporting a failure as `error: <what>: ...`.
+    fn record(&mut self, result: &Result<bool>, what: &str) {
+        match result {
+            Ok(true) => self.launched += 1,
+            Ok(false) => self.reused += 1,
+            Err(e) => {
+                eprintln!("error: {what}: {e:#}");
+                self.failed += 1;
+            }
+        }
+    }
+}
+
+fn plans_failed(n: usize) -> String {
+    format!("{n} plan(s) failed — see errors above")
+}
+
+/// Fail when anything failed to plan or dispatch.
+fn ensure_none_failed(failed: usize) -> Result<()> {
+    anyhow::ensure!(
+        failed == 0,
+        "{failed} dispatch(es) failed — see errors above"
+    );
+    Ok(())
 }
 
 /// The kata actor, resolved like kata does: the first non-empty of
@@ -720,7 +869,7 @@ fn pick_actor(
 
 /// Refuse a mirror kata no longer treats as open (closed, or drifted from GitHub).
 fn check_mirror_open(number: u64, kata_ref: &str, status: &str) -> Result<()> {
-    if !status.eq_ignore_ascii_case("open") {
+    if !status.eq_ignore_ascii_case(kata::STATUS_OPEN) {
         anyhow::bail!(
             "kata mirror {kata_ref} of #{number} is {status}, not open — \
              run `engram kata sync --issue {number}` to reconcile it"
@@ -755,6 +904,63 @@ fn queue_node_progress(plan: &DispatchPlan, progress: &mut NodeProgress) {
     }
 }
 
+/// An objective issue's title and body, as fetched for its node plans.
+#[derive(Debug, Clone)]
+struct ObjectiveText {
+    title: String,
+    body: String,
+}
+
+/// The objective node a plan implements.
+#[derive(Debug, Clone)]
+struct ObjectiveRef {
+    number: u64,
+    node_id: String,
+    text: ObjectiveText,
+}
+
+/// What launching Claude in a plan's workspace came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Launch {
+    /// A new session took over the pane.
+    Launched,
+    /// The pane already runs something else (most likely Claude).
+    AlreadyRunning(String),
+    /// `--no-launch`.
+    Skipped,
+    /// The PR is ready for review, so its session isn't relaunched.
+    Ready,
+}
+
+impl std::fmt::Display for Launch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Launch::Launched => f.write_str("launched"),
+            Launch::AlreadyRunning(cmd) => write!(f, "already running ({cmd})"),
+            Launch::Skipped => f.write_str("not launched (--no-launch)"),
+            Launch::Ready => f.write_str(READY_NO_RELAUNCH),
+        }
+    }
+}
+
+/// How carrying out one plan went. `pr_url` is set once the branch and PR
+/// exist, even when a later step failed; `launched` is `Ok(true)` when a new
+/// Claude session started.
+#[derive(Debug)]
+struct Outcome {
+    pr_url: Option<String>,
+    launched: Result<bool>,
+}
+
+/// A plan's existing branch, PR and worktree, as `inspect_branch` finds them.
+#[derive(Debug)]
+struct BranchInfo {
+    state: BranchState,
+    on_origin: bool,
+    pr: Option<OpenPr>,
+    worktree: Option<PathBuf>,
+}
+
 struct Run<'a> {
     root: &'a Path,
     repo: &'a str,
@@ -764,8 +970,9 @@ struct Run<'a> {
     open_prs: OnceCell<Vec<PrWithBody>>,
     default: OnceCell<String>,
     actor: OnceCell<String>,
-    /// Objective issues' (title, body), fetched at most once per run.
-    objectives: RefCell<BTreeMap<u64, (String, String)>>,
+    mirrors: kata::Mirrors,
+    /// Objective issues, fetched at most once per run.
+    objectives: RefCell<BTreeMap<u64, ObjectiveText>>,
 }
 
 fn cached<T>(cell: &OnceCell<T>, init: impl FnOnce() -> Result<T>) -> Result<&T> {
@@ -797,6 +1004,7 @@ pub fn dispatch(
         open_prs: OnceCell::new(),
         default: OnceCell::new(),
         actor: OnceCell::new(),
+        mirrors: kata::Mirrors::default(),
         objectives: RefCell::new(BTreeMap::new()),
     };
     if opts.stack {
@@ -811,29 +1019,30 @@ pub fn dispatch(
     if plans.is_empty() {
         anyhow::bail!("nothing to dispatch \u{2014} see errors above");
     }
-    if opts.dry_run {
-        anyhow::ensure!(
-            plan_failed == 0,
-            "{plan_failed} plan(s) failed — see errors above"
-        );
+    if !run.confirmed(plan_failed)? {
         return Ok(());
     }
-    if !opts.yes && !confirm()? {
-        anyhow::bail!("dispatch cancelled");
-    }
-    let failed = plan_failed + run.run_all(plans);
-    anyhow::ensure!(
-        failed == 0,
-        "{failed} dispatch(es) failed — see errors above"
-    );
-    Ok(())
+    ensure_none_failed(plan_failed + run.run_all(plans))
 }
 
 impl Run<'_> {
+    /// After planning: on `--dry-run` stop (failing if any plan failed),
+    /// else ask for confirmation unless `--yes`. True when dispatch goes ahead.
+    fn confirmed(&self, plan_failed: usize) -> Result<bool> {
+        if self.opts.dry_run {
+            anyhow::ensure!(plan_failed == 0, plans_failed(plan_failed));
+            return Ok(false);
+        }
+        if !self.opts.yes && !confirm()? {
+            anyhow::bail!("dispatch cancelled");
+        }
+        Ok(true)
+    }
+
     /// Open PRs with bodies, listed once per run.
     fn open_prs(&self) -> Result<&[PrWithBody]> {
         cached(&self.open_prs, || {
-            github::list_prs_with_body(self.repo, "open").context("listing open PRs")
+            github::list_prs_with_body(self.repo, PrState::Open).context("listing open PRs")
         })
         .map(Vec::as_slice)
     }
@@ -855,14 +1064,14 @@ impl Run<'_> {
                      asking GitHub for the default branch (git remote set-head origin --auto)"
                 );
             }
-            github::default_branch(self.repo)
+            github::default_branch(self.repo).context("asking GitHub for the default branch")
         })
         .map(String::as_str)
     }
 
     fn actor(&self) -> Result<&str> {
         cached(&self.actor, || {
-            let env = ["KATA_AUTHOR", "USER"].map(|v| std::env::var(v).ok());
+            let env = ACTOR_ENV_VARS.map(|v| std::env::var(v).ok());
             pick_actor(env, || {
                 run_checked(git(self.root).args(["config", "user.name"])).ok()
             })
@@ -873,13 +1082,23 @@ impl Run<'_> {
         .map(String::as_str)
     }
 
+    /// Cache an objective issue fetched while collecting work.
+    fn remember_objective(&self, number: u64, issue: github::Issue) -> ObjectiveText {
+        let text = ObjectiveText {
+            title: issue.title,
+            body: issue.body.unwrap_or_default(),
+        };
+        self.objectives.borrow_mut().insert(number, text.clone());
+        text
+    }
+
     fn fetch_argument_issue(
         &self,
         number: u64,
     ) -> Result<(github::Issue, Option<Vec<ObjectiveNode>>)> {
         let issue = github::get_issue(self.repo, number)
             .with_context(|| format!("fetching issue #{number}"))?;
-        let nodes = objective::parse_nodes_from_comment(issue.body.as_deref().unwrap_or(""));
+        let nodes = objective::parse_nodes_from_comment(issue.body_text());
         require_plan_or_objective(number, &issue, nodes.is_some())?;
         Ok((issue, nodes))
     }
@@ -923,9 +1142,7 @@ impl Run<'_> {
                     ),
                 }
             }
-            self.objectives
-                .borrow_mut()
-                .insert(number, (issue.title, issue.body.unwrap_or_default()));
+            self.remember_objective(number, issue);
         }
         Ok(plans)
     }
@@ -950,10 +1167,9 @@ impl Run<'_> {
                 }
             }
         }
-        let ready = plans.iter().filter(|p| p.ready()).count();
         println!(
             "{}",
-            count_line(plans.len(), ready, failed, self.opts.no_launch)
+            PlanCounts::of(&plans, failed).line(self.opts.no_launch)
         );
         (plans, failed)
     }
@@ -962,36 +1178,29 @@ impl Run<'_> {
     /// and print the tally. Returns how many failed.
     fn run_all(&self, plans: Vec<DispatchPlan>) -> usize {
         let mut progress = NodeProgress::new();
-        let (mut launched, mut reused, mut failed) = (0usize, 0usize, 0usize);
-        for mut plan in plans {
-            match self.dispatch_one(&mut plan, &mut progress, &mut None) {
-                Ok(true) => launched += 1,
-                Ok(false) => reused += 1,
-                Err(e) => {
-                    eprintln!("error: #{}: {e:#}", plan.number);
-                    failed += 1;
-                }
-            }
+        let mut tally = Tally::default();
+        for plan in plans {
+            let outcome = self.dispatch_one(&plan, &mut progress);
+            tally.record(&outcome.launched, &format!("#{}", plan.number));
         }
-        self.finish(progress, launched, reused, failed)
+        self.finish(&progress, tally)
     }
 
     /// Mark dispatched objective nodes in progress and print the tally.
     /// Returns how many dispatches and objective updates failed.
-    fn finish(
-        &self,
-        progress: NodeProgress,
-        launched: usize,
-        reused: usize,
-        failed: usize,
-    ) -> usize {
+    fn finish(&self, progress: &NodeProgress, tally: Tally) -> usize {
         let mut objective_failed = 0;
-        for (number, nodes) in &progress {
+        for (number, nodes) in progress {
             if let Err(e) = record_node_progress(self.repo, *number, nodes) {
                 eprintln!("error: updating objective #{number}: {e:#}");
                 objective_failed += 1;
             }
         }
+        let Tally {
+            launched,
+            reused,
+            failed,
+        } = tally;
         println!(
             "Dispatched {} plan(s): {launched} newly launched, {reused} reused, {failed} failed",
             launched + reused
@@ -1011,34 +1220,19 @@ impl Run<'_> {
         // Done or only reused as a base: nothing to confirm or link.
         if planned.iter().all(|(_, t)| t.ready()) {
             println!("Nothing to dispatch.");
-            anyhow::ensure!(
-                plan_failed == 0,
-                "{plan_failed} plan(s) failed — see errors above"
-            );
+            anyhow::ensure!(plan_failed == 0, plans_failed(plan_failed));
             return Ok(());
         }
-        let chains = self.preview_links(&planned, &main);
-        let ready = planned.iter().filter(|(_, t)| t.ready()).count();
-        println!(
-            "{}",
-            count_line(planned.len(), ready, plan_failed, self.opts.no_launch)
-        );
-        if self.opts.dry_run {
-            anyhow::ensure!(
-                plan_failed == 0,
-                "{plan_failed} plan(s) failed — see errors above"
-            );
+        let mut chains = self.chains_to_link(&planned, &main);
+        if !chains.is_empty() && !self.gh_stack_available() {
+            chains.clear();
+        }
+        let counts = PlanCounts::of(planned.iter().map(|(_, t)| t), plan_failed);
+        println!("{}", counts.line(self.opts.no_launch));
+        if !self.confirmed(plan_failed)? {
             return Ok(());
         }
-        if !self.opts.yes && !confirm()? {
-            anyhow::bail!("dispatch cancelled");
-        }
-        let failed = plan_failed + self.run_stack(planned, &chains, &main);
-        anyhow::ensure!(
-            failed == 0,
-            "{failed} dispatch(es) failed — see errors above"
-        );
-        Ok(())
+        ensure_none_failed(plan_failed + self.run_stack(planned, &chains, &main))
     }
 
     /// The objective's unfinished nodes in stack order, with their plan
@@ -1066,9 +1260,7 @@ impl Run<'_> {
         for (id, why) in &skipped {
             println!("  skip node {id}: {why}");
         }
-        self.objectives
-            .borrow_mut()
-            .insert(number, (issue.title, issue.body.unwrap_or_default()));
+        self.remember_objective(number, issue);
         let mut out = Vec::new();
         for s in stacked {
             let id = &s.node_id;
@@ -1125,9 +1317,9 @@ impl Run<'_> {
         (planned, failed)
     }
 
-    /// Print the `gh stack link` commands the run will try. Returns the chains
-    /// to link, none when gh-stack is unavailable.
-    fn preview_links(
+    /// The chains the run will `gh stack link`, each printed as the command
+    /// it will try.
+    fn chains_to_link(
         &self,
         planned: &[(StackedNode, DispatchPlan)],
         main: &str,
@@ -1143,7 +1335,7 @@ impl Run<'_> {
             .filter(|(_, t)| !t.ready())
             .map(|(s, _)| s.node_id.clone())
             .collect();
-        let mut chains = chains_to_link(&nodes, &fresh);
+        let chains = chains_to_link(&nodes, &fresh);
         for (base, chain) in &chains {
             let base = base_branch(base, main, &placed).unwrap_or_default();
             let prs: Vec<&str> = chain
@@ -1156,17 +1348,21 @@ impl Run<'_> {
                 prs.join(" ")
             );
         }
-        if chains.is_empty() {
-            return chains;
-        }
-        if let Err(e) = github::gh_stack(self.root, self.repo, &["--help"]) {
-            eprintln!(
-                "warning: gh-stack is unavailable ({e:#}), so `gh stack link` will be skipped; \
-                 the PRs are still chained by their base branches"
-            );
-            chains.clear();
-        }
         chains
+    }
+
+    /// Whether `gh stack` works; warns that linking is skipped when it doesn't.
+    fn gh_stack_available(&self) -> bool {
+        match github::gh_stack(self.root, self.repo, &["--help"]) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!(
+                    "warning: gh-stack is unavailable ({e:#}), so `gh stack link` will be skipped; \
+                     the PRs are still chained by their base branches"
+                );
+                false
+            }
+        }
     }
 
     /// Carry out each stack node, skipping nodes whose dependency got no
@@ -1182,90 +1378,87 @@ impl Run<'_> {
         let mut progress = NodeProgress::new();
         // Nodes whose branch and PR exist, even if their session then failed.
         let mut placed: BTreeMap<String, PlacedNode> = BTreeMap::new();
-        let (mut launched, mut reused, mut failed) = (0usize, 0usize, 0usize);
-        for (s, mut plan) in planned {
+        let mut tally = Tally::default();
+        for (s, plan) in planned {
             let id = s.node_id;
             if base_branch(&s.base, main, &placed).is_none() {
                 eprintln!("skip: node {id}: its dependency was not dispatched");
                 continue;
             }
-            let mut pr_url = None;
-            let result = if plan.ready() {
-                plan.warn_base_mismatch();
-                pr_url = plan.pr.as_ref().map(|pr| pr.url.clone());
-                queue_node_progress(&plan, &mut progress);
-                println!(
-                    "#{}  {READY_NO_RELAUNCH}; used as a base ({} \u{2190} {})",
-                    plan.number, plan.branch, plan.base
-                );
-                Ok(false)
+            let outcome = if plan.ready() {
+                use_as_base(&plan, &mut progress)
             } else {
-                self.dispatch_one(&mut plan, &mut progress, &mut pr_url)
+                self.dispatch_one(&plan, &mut progress)
             };
-            match result {
-                Ok(true) => launched += 1,
-                Ok(false) => reused += 1,
-                Err(e) => {
-                    eprintln!("error: node {id} (#{}): {e:#}", plan.number);
-                    if pr_url.is_some() {
-                        eprintln!("  its branch and PR exist; dependents still stack on it");
-                    }
-                    failed += 1;
+            tally.record(&outcome.launched, &format!("node {id} (#{})", plan.number));
+            if let Some(pr) = outcome.pr_url {
+                if outcome.launched.is_err() {
+                    eprintln!("  its branch and PR exist; dependents still stack on it");
                 }
-            }
-            if let Some(pr) = pr_url {
-                let branch = plan.branch;
-                placed.insert(id, PlacedNode { branch, pr });
+                placed.insert(
+                    id,
+                    PlacedNode {
+                        branch: plan.branch,
+                        pr,
+                    },
+                );
             }
         }
-
         for (base, chain) in chains {
-            // Only the dispatched bottom of a chain can be linked.
-            let prs: Vec<&str> = chain
-                .iter()
-                .map_while(|id| placed.get(id).map(|p| p.pr.as_str()))
-                .collect();
-            let Some(base) = base_branch(base, main, &placed).filter(|_| prs.len() >= 2) else {
-                continue;
-            };
-            let mut args = vec!["link", "--base", &base];
-            args.extend(&prs);
-            match github::gh_stack(self.root, self.repo, &args) {
-                Ok(()) => println!("Linked stack on {base}: {}", prs.join(" ")),
-                Err(e) => eprintln!(
-                    "warning: `gh stack link` failed: {e:#}\n  \
-                     the PRs are still chained by their base branches"
-                ),
-            }
+            self.link_chain(base, chain, main, &placed);
         }
-        self.finish(progress, launched, reused, failed)
+        self.finish(&progress, tally)
     }
 
-    /// For a plan with an `Objective: #N (node X)` marker: the objective's
-    /// (number, node, title, body). Fails when the objective or node can't be
-    /// found, or (unless `stacked`) node X still waits on others.
+    /// `gh stack link` the placed bottom of `chain` (warnings only).
+    fn link_chain(
+        &self,
+        base: &Base,
+        chain: &[String],
+        main: &str,
+        placed: &BTreeMap<String, PlacedNode>,
+    ) {
+        // Only the dispatched bottom of a chain can be linked.
+        let prs: Vec<&str> = chain
+            .iter()
+            .map_while(|id| placed.get(id).map(|p| p.pr.as_str()))
+            .collect();
+        let Some(base) = base_branch(base, main, placed).filter(|_| prs.len() >= 2) else {
+            return;
+        };
+        let mut args = vec!["link", "--base", &base];
+        args.extend(&prs);
+        match github::gh_stack(self.root, self.repo, &args) {
+            Ok(()) => println!("Linked stack on {base}: {}", prs.join(" ")),
+            Err(e) => eprintln!(
+                "warning: `gh stack link` failed: {e:#}\n  \
+                 the PRs are still chained by their base branches"
+            ),
+        }
+    }
+
+    /// For a plan with an `Objective: #N (node X)` marker: that objective and
+    /// node. Fails when the objective or node can't be found, or (unless
+    /// `stacked`) node X still waits on others.
     fn objective_of(
         &self,
         number: u64,
         plan_body: &str,
         stacked: bool,
-    ) -> Result<Option<(u64, String, String, String)>> {
+    ) -> Result<Option<ObjectiveRef>> {
         let Some((obj, node_id)) = objective::parse_objective_marker(plan_body) else {
             return Ok(None);
         };
         let cached = self.objectives.borrow().get(&obj).cloned();
-        let (title, body) = match cached {
-            Some(v) => v,
-            None => {
-                let issue = github::get_issue(self.repo, obj).with_context(|| {
-                    format!("reading objective #{obj} of plan #{number} (node {node_id})")
-                })?;
-                let v = (issue.title, issue.body.unwrap_or_default());
-                self.objectives.borrow_mut().insert(obj, v.clone());
-                v
-            }
+        let text = if let Some(text) = cached {
+            text
+        } else {
+            let issue = github::get_issue(self.repo, obj).with_context(|| {
+                format!("reading objective #{obj} of plan #{number} (node {node_id})")
+            })?;
+            self.remember_objective(obj, issue)
         };
-        let nodes = objective::parse_nodes_from_comment(&body).unwrap_or_default();
+        let nodes = objective::parse_nodes_from_comment(&text.body).unwrap_or_default();
         let node = nodes.iter().find(|n| n.id == node_id).with_context(|| {
             format!(
                 "plan #{number} names node {node_id} of objective #{obj}, which has no such node"
@@ -1279,19 +1472,16 @@ impl Run<'_> {
                 blockers.join(", ")
             );
         }
-        Ok(Some((obj, node_id, title, body)))
+        Ok(Some(ObjectiveRef {
+            number: obj,
+            node_id,
+            text,
+        }))
     }
 
-    fn mirror_claimed_by_me(
-        &self,
-        number: u64,
-        kata_ref: &str,
-    ) -> Result<(bool, BTreeMap<String, String>)> {
-        let issue = kata::show(kata_ref)
-            .with_context(|| format!("reading kata mirror {kata_ref} of #{number}"))?;
-        check_mirror_open(number, kata_ref, &issue.status)?;
-        let needs = needs_claim(issue.owner.as_deref(), self.actor()?, kata_ref)?;
-        Ok((!needs, kata::metadata_map(&issue.metadata)))
+    /// Whether the mirror still needs claiming by this actor (see [`needs_claim`]).
+    fn needs_claim(&self, mirror: &kata::KataIssue, kata_ref: &str) -> Result<bool> {
+        needs_claim(mirror.owner.as_deref(), self.actor()?, kata_ref)
     }
 
     /// Work out everything dispatch will do for plan `number`, changing
@@ -1299,10 +1489,7 @@ impl Run<'_> {
     fn plan_dispatch(&self, number: u64, stacked: bool) -> Result<DispatchPlan> {
         let issue = github::get_issue(self.repo, number)
             .with_context(|| format!("fetching issue #{number}"))?;
-        if issue.has_label(OBJECTIVE_LABEL) {
-            anyhow::bail!("#{number} is an engram-objective, not a plan issue");
-        }
-        require_plan_or_objective(number, &issue, false)?;
+        require_plan(number, &issue)?;
         let body = issue.body.unwrap_or_default();
         let objective = self.objective_of(number, &body, stacked)?;
         let mirror = self.find_mirror(number, &issue.title, &body, objective.as_ref())?;
@@ -1312,7 +1499,20 @@ impl Run<'_> {
             title: issue.title.clone(),
             meta: mirror.template_meta,
         };
-        let mut t = DispatchPlan {
+        // The templates only matter for a plan without a PR yet, so a broken
+        // one can't block re-running a plan that is already under way.
+        let template_branch = fill_template(&self.cfg.dispatch.branch, &fields);
+        let found = self.find_existing_pr(number, template_branch.as_deref().ok())?;
+        let (branch, base, pr_link) = match &found {
+            Some((pr, how)) => (pr.head.clone(), pr.base.clone(), Some(*how)),
+            None => (template_branch?, self.default_branch()?.to_string(), None),
+        };
+        let info = self.inspect_branch(number, &branch, found.map(|(pr, _)| pr))?;
+        let pr_title = match &info.pr {
+            Some(pr) => pr.title.clone(),
+            None => fill_pr_title(&self.cfg.dispatch.pr_title, &fields)?,
+        };
+        Ok(DispatchPlan {
             number,
             title: issue.title,
             body,
@@ -1320,40 +1520,17 @@ impl Run<'_> {
             claimed_by_me: mirror.claimed_by_me,
             meta: mirror.create_meta,
             parent: mirror.parent,
-            branch: String::new(),
-            local: false,
-            remote: false,
-            pr_title: String::new(),
-            base: String::new(),
-            pr: None,
-            pr_link: None,
-            worktree: None,
-            objective_node: objective.map(|(o, id, ..)| (o, id)),
+            branch,
+            branch_state: info.state,
+            on_origin: info.on_origin,
+            pr_title,
+            base,
+            pr: info.pr,
+            pr_link,
+            worktree: info.worktree,
+            objective_node: objective.map(|o| (o.number, o.node_id)),
             stacked_on: None,
-        };
-        // The templates only matter for a plan without a PR yet, so a broken
-        // one can't block re-running a plan that is already under way.
-        let branch = fill_template(&self.cfg.dispatch.branch, &fields);
-        match self.find_existing_pr(number, branch.as_deref().ok())? {
-            Some((pr, how)) => {
-                t.branch = pr.head.clone();
-                t.pr_title = pr.title.clone();
-                t.base = pr.base.clone();
-                t.pr_link = Some(how);
-                t.pr = Some(pr);
-                self.find_existing_branch(&mut t)?;
-            }
-            None => {
-                t.branch = branch?;
-                t.base = self.default_branch()?.to_string();
-                self.find_existing_branch(&mut t)?;
-                t.pr_title = match &t.pr {
-                    Some(pr) => pr.title.clone(),
-                    None => fill_pr_title(&self.cfg.dispatch.pr_title, &fields)?,
-                };
-            }
-        }
-        Ok(t)
+        })
     }
 
     /// The plan's kata mirror and the metadata its templates see. Without a
@@ -1364,30 +1541,37 @@ impl Run<'_> {
         number: u64,
         title: &str,
         body: &str,
-        objective: Option<&(u64, String, String, String)>,
+        objective: Option<&ObjectiveRef>,
     ) -> Result<MirrorInfo> {
-        if let Some(r) = kata::find_mirror(self.repo, number, body)? {
-            let (claimed_by_me, template_meta) = self.mirror_claimed_by_me(number, &r)?;
+        if let Some(r) = self
+            .mirrors
+            .find(self.repo, number, body)
+            .with_context(|| format!("looking up the kata mirror of #{number}"))?
+        {
+            let mirror =
+                kata::show(&r).with_context(|| format!("reading kata mirror {r} of #{number}"))?;
+            check_mirror_open(number, &r, &mirror.status)?;
+            let claimed_by_me = !self.needs_claim(&mirror, &r)?;
             return Ok(MirrorInfo {
                 kata_ref: Some(r),
                 claimed_by_me,
-                template_meta,
+                template_meta: kata::metadata_map(&mirror.metadata),
                 create_meta: kata::TrackerMeta::default(),
                 parent: None,
             });
         }
         let (create_meta, parent) = match objective {
-            Some((_, _, obj_title, obj_body)) => {
-                let parent = kata::parse_ref(obj_body);
+            Some(o) => {
+                let parent = kata::parse_ref(&o.text.body);
                 let meta = objective::node_tracker_meta(
                     &kata::TrackerMeta::default(),
                     title,
                     body,
-                    obj_title,
-                    obj_body,
-                    parent.as_deref(),
+                    &o.text.title,
+                    &o.text.body,
+                    parent,
                 );
-                (meta, parent)
+                (meta, parent.map(str::to_string))
             }
             None => (kata::TrackerMeta::resolve(None, None, title, body), None),
         };
@@ -1409,103 +1593,125 @@ impl Run<'_> {
         &self,
         number: u64,
         branch: Option<&str>,
-    ) -> Result<Option<(OpenPr, String)>> {
+    ) -> Result<Option<(OpenPr, PrLink)>> {
         let linked = github::open_closing_pr(self.repo, number)
             .with_context(|| format!("looking up open PRs linked to #{number}"))?;
         if let Some(pr) = linked {
-            return Ok(Some((pr, format!("linked to #{number}"))));
+            return Ok(Some((pr, PrLink::Linked)));
         }
         Ok(
             github::select_body_closing_pr(self.open_prs()?, self.repo, number, branch)
                 .cloned()
-                .map(|pr| (pr, format!("found by `Closes #{number}` in its body"))),
+                .map(|pr| (pr, PrLink::BodyKeyword)),
         )
     }
 
     fn remote_has_branch(&self, b: &str) -> Result<bool> {
-        let output = git_remote(self.root)?
-            .args([
-                "ls-remote",
-                "--exit-code",
-                "--heads",
-                "origin",
-                &format!("refs/heads/{b}"),
-            ])
-            .stdin(Stdio::null())
-            .output()
-            .context("running git ls-remote")?;
+        let mut cmd = git_remote(self.root)?;
+        cmd.args([
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            "origin",
+            &format!("refs/heads/{b}"),
+        ]);
+        let output = process::spawn(&mut cmd)?;
         match output.status.code() {
             Some(0) => Ok(true),
             Some(LS_REMOTE_NO_MATCH) => Ok(false),
-            _ => anyhow::bail!(
-                "git ls-remote origin failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
+            _ => Err(process::failure(&cmd, &output)),
         }
     }
 
-    fn find_existing_branch(&self, t: &mut DispatchPlan) -> Result<()> {
-        let b = &t.branch;
-        if run_checked(git(self.root).args(["check-ref-format", "--branch", b])).is_err() {
+    /// Where plan `number`'s `branch` already exists, its open PR (`pr` when
+    /// one was already found) and its worktree. Fails on an invalid branch
+    /// name, or a branch whose PR already merged.
+    fn inspect_branch(&self, number: u64, branch: &str, pr: Option<OpenPr>) -> Result<BranchInfo> {
+        if run_checked(git(self.root).args(["check-ref-format", "--branch", branch])).is_err() {
             anyhow::bail!(
-                "`{b}` is not a valid branch name — check the [dispatch] branch template"
+                "`{branch}` is not a valid branch name — check the [dispatch] branch template"
             );
         }
-        t.local = run_checked(git(self.root).args([
+        let local = run_checked(git(self.root).args([
             "show-ref",
             "--verify",
             "--quiet",
-            &format!("refs/heads/{b}"),
+            &format!("refs/heads/{branch}"),
         ]))
         .is_ok();
-        t.remote = self.remote_has_branch(b)?;
-        if t.pr.is_none() {
-            t.pr = github::pr_for_branch(self.repo, b, "open")?;
-        }
+        let on_origin = self.remote_has_branch(branch)?;
+        let pr = match pr {
+            Some(pr) => Some(pr),
+            None => github::pr_for_branch(self.repo, branch, PrState::Open)
+                .with_context(|| format!("looking up the open PR from {branch}"))?
+                .map(|p| p.pr),
+        };
         // A branch whose PR already merged (e.g. into a stacked base, which
         // leaves the plan open) must not get a second PR from the merged head.
-        if t.pr.is_none() && (t.local || t.remote) {
-            if let Some(pr) = github::pr_for_branch(self.repo, b, "merged")? {
+        if pr.is_none() && (local || on_origin) {
+            let merged = github::pr_for_branch(self.repo, branch, PrState::Merged)
+                .with_context(|| format!("looking up a merged PR from {branch}"))?;
+            if let Some(merged) = merged {
                 anyhow::bail!(
-                    "{b} was already merged into {} ({}); not opening another PR from it \u{2014} \
-                     mark the plan's node done or run `engram plan land {}`",
-                    pr.base,
-                    pr.url,
-                    t.number
+                    "{branch} was already merged into {} ({}); not opening another PR from it \
+                     \u{2014} mark the plan's node done or run `engram plan land {number}`",
+                    merged.pr.base,
+                    merged.pr.url
                 );
             }
         }
-        t.worktree = self.kwt_worktree(&t.branch)?;
-        Ok(())
+        Ok(BranchInfo {
+            state: BranchState::of(local, on_origin),
+            on_origin,
+            pr,
+            worktree: self.kwt_worktree(branch)?,
+        })
     }
 
-    /// Carry out one plan. `pr_url` is set once the branch and PR exist, even
-    /// if a later step fails; from then on its objective node is queued to be
-    /// marked in progress.
-    fn dispatch_one(
-        &self,
-        plan: &mut DispatchPlan,
-        progress: &mut NodeProgress,
-        pr_url: &mut Option<String>,
-    ) -> Result<bool> {
-        let result = self.carry_out(plan, pr_url);
-        if pr_url.is_some() {
+    /// Carry out one plan; once its branch and PR exist, its objective node is
+    /// queued to be marked in progress, even if a later step failed.
+    fn dispatch_one(&self, plan: &DispatchPlan, progress: &mut NodeProgress) -> Outcome {
+        let outcome = self.carry_out(plan);
+        if outcome.pr_url.is_some() {
             queue_node_progress(plan, progress);
         }
-        result
+        outcome
     }
 
-    /// Carry out a confirmed plan and print its report; `Ok(true)` when it
-    /// launched a new Claude session. `pr_url` is set once the branch and PR
-    /// exist. Every step looks up existing state first, so a re-run after a
-    /// partial failure resumes.
-    fn carry_out(&self, t: &mut DispatchPlan, pr_url_out: &mut Option<String>) -> Result<bool> {
+    /// Carry out a confirmed plan and print its report. Every step looks up
+    /// existing state first, so a re-run after a partial failure resumes.
+    fn carry_out(&self, t: &DispatchPlan) -> Outcome {
+        let placed = self
+            .ensure_mirror_claimed(t)
+            .and_then(|kata_ref| Ok((self.place_branch_and_pr(t, &kata_ref)?, kata_ref)));
+        let (pr_url, kata_ref) = match placed {
+            Ok(v) => v,
+            Err(e) => {
+                return Outcome {
+                    pr_url: None,
+                    launched: Err(e),
+                }
+            }
+        };
+        let launched = self
+            .open_workspace(t, &kata_ref, &pr_url)
+            .map(|launch| launch == Launch::Launched);
+        Outcome {
+            pr_url: Some(pr_url),
+            launched,
+        }
+    }
+
+    /// The plan's kata mirror, created (as `plan new` would) when it has none,
+    /// and claimed by this actor. Only once the claim holds does a new
+    /// mirror's `Kata:` line go onto the GitHub issue.
+    fn ensure_mirror_claimed(&self, t: &DispatchPlan) -> Result<String> {
         let (kata_ref, claimed_by_me, created) = match &t.kata_ref {
             Some(r) => (r.clone(), t.claimed_by_me, false),
             // Same idempotency key as `plan new`, so the two paths can't
             // duplicate the mirror; it may return one someone already claimed.
             None => {
-                let url = format!("https://github.com/{}/issues/{}", self.repo, t.number);
+                let url = github::issue_url(self.repo, t.number);
                 let kata_ref = kata::create(
                     &t.title,
                     &kata::mirror_body(&url, &t.body),
@@ -1515,10 +1721,9 @@ impl Run<'_> {
                 )
                 .context("creating kata mirror")?;
                 eprintln!("kata: created mirror {kata_ref}");
-                let owner = kata::show(&kata_ref)
-                    .with_context(|| format!("reading kata mirror {kata_ref}"))?
-                    .owner;
-                let claimed = !needs_claim(owner.as_deref(), self.actor()?, &kata_ref)?;
+                let mirror = kata::show(&kata_ref)
+                    .with_context(|| format!("reading kata mirror {kata_ref}"))?;
+                let claimed = !self.needs_claim(&mirror, &kata_ref)?;
                 (kata_ref, claimed, true)
             }
         };
@@ -1528,69 +1733,66 @@ impl Run<'_> {
             kata::claim(&kata_ref).with_context(|| format!("claiming kata {kata_ref}"))?;
             eprintln!("kata: claimed {kata_ref}");
         }
-        // Only once the claim holds does anything change on GitHub.
         if created {
             let body = kata::with_ref_line(&t.body, &kata_ref);
             if let Err(e) = github::update_issue_body(self.repo, t.number, &body) {
                 eprintln!("warning: could not append Kata ref to GitHub issue: {e:#}");
             }
         }
+        Ok(kata_ref)
+    }
 
+    /// Create and push the plan's branch and open its draft PR (or reuse
+    /// them). Returns the PR URL.
+    fn place_branch_and_pr(&self, t: &DispatchPlan, kata_ref: &str) -> Result<String> {
         run_checked(git_remote(self.root)?.args(["fetch", "origin", &t.base]))?;
         self.create_branch_if_missing(t)?;
-        if t.remote {
+        if t.on_origin {
             eprintln!("push: skipped, origin already has {}", t.branch);
         } else {
             run_checked(git_remote(self.root)?.args(["push", "-u", "origin", &t.branch]))?;
             eprintln!("push: pushed {} to origin", t.branch);
         }
 
-        let pr_url = match &t.pr {
-            Some(pr) => {
-                t.warn_base_mismatch();
-                eprintln!("pr: reusing {}", pr.url);
-                pr.url.clone()
+        if let Some(pr) = &t.pr {
+            if let Some(warning) = t.base_mismatch_warning() {
+                eprintln!("{warning}");
             }
-            None => {
-                let body = pr_body(t.number, &kata_ref, t.stacked_on.as_deref());
-                let url =
-                    github::create_draft_pr(self.repo, &t.branch, &t.base, &t.pr_title, &body)?;
-                eprintln!("pr: opened draft {url}");
-                url
-            }
-        };
-        *pr_url_out = Some(pr_url.clone());
+            eprintln!("pr: reusing {}", pr.url);
+            return Ok(pr.url.clone());
+        }
+        let body = pr_body(t.number, kata_ref, t.stacked_on.as_deref());
+        let url = github::create_draft_pr(self.repo, &t.branch, &t.base, &t.pr_title, &body)
+            .with_context(|| format!("opening a draft PR from {}", t.branch))?;
+        eprintln!("pr: opened draft {url}");
+        Ok(url)
+    }
 
-        let worktree = match &t.worktree {
-            Some(path) => {
-                eprintln!("worktree: reusing {}", path.display());
-                path.clone()
-            }
-            None => {
-                run_checked(self.kwt().args(["add", &t.branch, "--no-launch"]))?;
-                let path = self.kwt_worktree(&t.branch)?.with_context(|| {
-                    format!("kwt added {} but `kwt list` can't find it", t.branch)
-                })?;
-                eprintln!("worktree: created {}", path.display());
-                path
-            }
+    /// Create or reuse the plan's worktree and tmux session, launch Claude in
+    /// it (unless `--no-launch` or the PR is ready), and print the report.
+    fn open_workspace(&self, t: &DispatchPlan, kata_ref: &str, pr_url: &str) -> Result<Launch> {
+        let worktree = if let Some(path) = &t.worktree {
+            eprintln!("worktree: reusing {}", path.display());
+            path.clone()
+        } else {
+            run_checked(self.kwt().args(["add", &t.branch, "--no-launch"]))?;
+            let path = self
+                .kwt_worktree(&t.branch)?
+                .with_context(|| format!("kwt added {} but `kwt list` can't find it", t.branch))?;
+            eprintln!("worktree: created {}", path.display());
+            path
         };
         let endpoint = self.start_session(&worktree)?;
         let (session, socket) = (&endpoint.session_name, &endpoint.tmux_socket_name);
         eprintln!("tmux: session {session} (socket {socket})");
 
         let launch = if self.opts.no_launch {
-            "not launched (--no-launch)".to_string()
+            Launch::Skipped
         } else if t.ready() {
             eprintln!("claude: {READY_NO_RELAUNCH}");
-            READY_NO_RELAUNCH.to_string()
+            Launch::Ready
         } else {
-            self.launch_claude(
-                t,
-                &worktree,
-                &endpoint,
-                &build_prompt(t, &kata_ref, &pr_url),
-            )?
+            self.launch_claude(t, &worktree, &endpoint, &build_prompt(t, kata_ref, pr_url))?
         };
         print!(
             "#{}  kata {kata_ref}  {} \u{2190} {}\n      pr: {pr_url}\n      worktree: {}\n      \
@@ -1600,39 +1802,42 @@ impl Run<'_> {
             t.base,
             worktree.display()
         );
-        Ok(launch == LAUNCHED)
+        Ok(launch)
     }
 
     /// Create the branch without checking anything out, so the user's checkout
     /// and HEAD stay untouched.
     fn create_branch_if_missing(&self, t: &DispatchPlan) -> Result<()> {
         let b = &t.branch;
-        if t.local {
-            eprintln!("branch: {b} exists, reusing it");
-        } else if t.remote {
-            // Dispatched from another machine: track the remote branch rather
-            // than creating a divergent wip commit.
-            let refspec = format!("refs/heads/{b}:refs/remotes/origin/{b}");
-            run_checked(git_remote(self.root)?.args(["fetch", "origin", &refspec]))?;
-            run_checked(git(self.root).args(["branch", "--track", b, &format!("origin/{b}")]))?;
-            eprintln!("branch: {b} tracks origin/{b}");
-        } else {
-            // Base the wip commit on the freshly fetched remote ref, not local
-            // <default>, which can hold unpushed or stale commits.
-            let base_ref = format!("origin/{}", t.base);
-            let tree =
-                run_checked(git(self.root).args(["rev-parse", &format!("{base_ref}^{{tree}}")]))?;
-            let msg = format!("wip: #{} {}", t.number, t.title);
-            let commit = run_checked(git(self.root).args([
-                "commit-tree",
-                &tree,
-                "-p",
-                &base_ref,
-                "-m",
-                &msg,
-            ]))?;
-            run_checked(git(self.root).args(["branch", b, &commit]))?;
-            eprintln!("branch: created {b} on {base_ref}");
+        match t.branch_state {
+            BranchState::Local => eprintln!("branch: {b} exists, reusing it"),
+            BranchState::Remote => {
+                // Dispatched from another machine: track the remote branch rather
+                // than creating a divergent wip commit.
+                let refspec = format!("refs/heads/{b}:refs/remotes/origin/{b}");
+                run_checked(git_remote(self.root)?.args(["fetch", "origin", &refspec]))?;
+                run_checked(git(self.root).args(["branch", "--track", b, &format!("origin/{b}")]))?;
+                eprintln!("branch: {b} tracks origin/{b}");
+            }
+            BranchState::Missing => {
+                // Base the wip commit on the freshly fetched remote ref, not local
+                // <default>, which can hold unpushed or stale commits.
+                let base_ref = format!("origin/{}", t.base);
+                let tree = run_checked(
+                    git(self.root).args(["rev-parse", &format!("{base_ref}^{{tree}}")]),
+                )?;
+                let msg = format!("wip: #{} {}", t.number, t.title);
+                let commit = run_checked(git(self.root).args([
+                    "commit-tree",
+                    &tree,
+                    "-p",
+                    &base_ref,
+                    "-m",
+                    &msg,
+                ]))?;
+                run_checked(git(self.root).args(["branch", b, &commit]))?;
+                eprintln!("branch: created {b} on {base_ref}");
+            }
         }
         Ok(())
     }
@@ -1670,7 +1875,7 @@ impl Run<'_> {
                     eprintln!(
                         "kwt open failed (attempt {attempt}/{KWT_OPEN_ATTEMPTS}), retrying: {e:#}"
                     );
-                    std::thread::sleep(Duration::from_secs(attempt));
+                    std::thread::sleep(KWT_OPEN_BACKOFF * u32::try_from(attempt).unwrap_or(1));
                 }
             }
         }
@@ -1685,42 +1890,49 @@ impl Run<'_> {
         )
     }
 
+    /// Run `tmux` against kwt's server for `endpoint`. kwt (and Ghosthub) run
+    /// tmux with `TMUX_TMPDIR` unset; honouring it here would address a
+    /// different server than the one holding the workspace.
+    fn tmux(&self, endpoint: &Endpoint, args: &[&str]) -> Result<String> {
+        run_checked(
+            Command::new(&self.tools.tmux)
+                .env_remove("TMUX_TMPDIR")
+                .args(["-L", &endpoint.tmux_socket_name])
+                .args(args),
+        )
+    }
+
+    /// Type the claude command into the session's pane, then wait until
+    /// Claude has taken the pane over and is still there a moment later.
     fn launch_claude(
         &self,
         t: &DispatchPlan,
         worktree: &Path,
         endpoint: &Endpoint,
         prompt: &str,
-    ) -> Result<String> {
+    ) -> Result<Launch> {
         let session = endpoint.session_name.as_str();
-        // kwt (and Ghosthub) run tmux with TMUX_TMPDIR unset; honouring it here
-        // would address a different server than the one holding the workspace.
-        let tmux = |args: &[&str]| {
-            run_checked(
-                Command::new(&self.tools.tmux)
-                    .env_remove("TMUX_TMPDIR")
-                    .args(["-L", &endpoint.tmux_socket_name])
-                    .args(args),
-            )
-        };
         let pane = || {
-            tmux(&[
-                "display-message",
-                "-p",
-                "-t",
-                session,
-                "#{pane_current_command}",
-            ])
+            self.tmux(
+                endpoint,
+                &[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    session,
+                    "#{pane_current_command}",
+                ],
+            )
         };
         let current = pane()?;
         if !is_shell(&current) {
-            return Ok(format!("already running ({current})"));
+            return Ok(Launch::AlreadyRunning(current));
         }
 
         // The prompt lives outside the worktree so nothing from the dispatch
         // can be committed, and the keystrokes stay short and quoting-safe.
         let prompt_file = prompt_path(
-            std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+            std::env::var_os(XDG_STATE_HOME).map(PathBuf::from),
             std::env::var_os("HOME").map(PathBuf::from),
             self.repo,
             t.number,
@@ -1731,11 +1943,10 @@ impl Run<'_> {
         std::fs::write(&prompt_file, prompt)
             .with_context(|| format!("writing {}", prompt_file.display()))?;
 
-        let claude = self.claude();
         let user = config::github_user();
-        let cmd = launch_command(&claude, user.as_deref(), worktree, &prompt_file);
-        tmux(&["send-keys", "-t", session, "-l", &cmd])?;
-        tmux(&["send-keys", "-t", session, "Enter"])?;
+        let cmd = launch_command(&self.claude(), user.as_deref(), worktree, &prompt_file);
+        self.tmux(endpoint, &["send-keys", "-t", session, "-l", &cmd])?;
+        self.tmux(endpoint, &["send-keys", "-t", session, "Enter"])?;
 
         // Keystrokes landing is not a launch: wait for Claude to take over the
         // pane and still be there a moment later, so an immediate exit is reported.
@@ -1747,7 +1958,7 @@ impl Run<'_> {
             std::thread::sleep(LAUNCH_SETTLE);
         }
         if is_shell(&pane()?) {
-            let out = tmux(&["capture-pane", "-p", "-t", session])?;
+            let out = self.tmux(endpoint, &["capture-pane", "-p", "-t", session])?;
             let lines: Vec<&str> = out.lines().collect();
             let tail = &lines[lines.len().saturating_sub(PANE_TAIL_LINES)..];
             anyhow::bail!(
@@ -1755,7 +1966,23 @@ impl Run<'_> {
                 tail.join("\n        ")
             );
         }
-        Ok(LAUNCHED.to_string())
+        Ok(Launch::Launched)
+    }
+}
+
+/// A ready PR in a stack: nothing to dispatch, only its branch to stack on.
+fn use_as_base(plan: &DispatchPlan, progress: &mut NodeProgress) -> Outcome {
+    if let Some(warning) = plan.base_mismatch_warning() {
+        eprintln!("{warning}");
+    }
+    queue_node_progress(plan, progress);
+    println!(
+        "#{}  {READY_NO_RELAUNCH}; used as a base ({} \u{2190} {})",
+        plan.number, plan.branch, plan.base
+    );
+    Outcome {
+        pr_url: plan.pr.as_ref().map(|pr| pr.url.clone()),
+        launched: Ok(false),
     }
 }
 
@@ -1832,12 +2059,18 @@ fn is_shell(pane_command: &str) -> bool {
     SHELLS.contains(&pane_command.trim().trim_start_matches('-'))
 }
 
+/// `s` in single quotes for a POSIX shell, whatever it contains.
+fn single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r#"'"'"'"#))
+}
+
+/// `s` as one shell word: as it is when it needs no quoting, else single-quoted.
 fn shell_quote(s: &str) -> String {
     let safe = |c: char| c.is_ascii_alphanumeric() || "@%+=:,./-_".contains(c);
     if !s.is_empty() && s.chars().all(safe) {
         return s.to_string();
     }
-    format!("'{}'", s.replace('\'', r#"'"'"'"#))
+    single_quote(s)
 }
 
 /// `$XDG_STATE_HOME/engram/dispatch/<owner>-<name>-<N>.md`, the state home
@@ -1852,7 +2085,7 @@ fn prompt_path(
         Some(p) => p,
         None => home
             .context("HOME is not set, so the dispatch prompt file has nowhere to go")?
-            .join(".local/state"),
+            .join(DEFAULT_STATE_HOME),
     };
     Ok(state_home
         .join(PROMPT_SUBDIR)
@@ -1878,7 +2111,7 @@ fn redact_secrets(cmd: &str) -> String {
     cmd.split(' ')
         .map(|word| match word.split_once('=') {
             Some((name, _))
-                if ["TOKEN", "SECRET", "KEY", "PASSWORD"]
+                if CREDENTIAL_MARKERS
                     .iter()
                     .any(|s| name.to_ascii_uppercase().contains(s)) =>
             {
@@ -1908,52 +2141,16 @@ fn launch_command(
     // starting Claude as the active gh account.
     let token = github_user
         .map(|u| {
-            let quoted = format!("'{}'", u.replace('\'', r#"'"'"'"#));
-            format!("GH_TOKEN=\"$(gh auth token --user {quoted})\" && export GH_TOKEN && ")
+            format!(
+                "GH_TOKEN=\"$(gh auth token --user {})\" && export GH_TOKEN && ",
+                single_quote(u)
+            )
         })
         .unwrap_or_default();
     format!(
-        "{cd}{token}{claude} --permission-mode auto \"$(cat {})\"",
+        "{cd}{token}{claude} --permission-mode {PERMISSION_MODE} \"$(cat {})\"",
         shell_quote(&prompt_file.to_string_lossy()),
     )
-}
-
-fn git(repo_root: &Path) -> Command {
-    let mut cmd = Command::new("git");
-    cmd.current_dir(repo_root);
-    cmd
-}
-
-/// `git` for commands that talk to `origin`, with the configured GitHub
-/// identity applied: an HTTPS remote using gh as credential helper would
-/// otherwise authenticate as the active gh account.
-fn git_remote(repo_root: &Path) -> Result<Command> {
-    let mut cmd = git(repo_root);
-    config::with_github_identity(&mut cmd)?;
-    Ok(cmd)
-}
-
-fn run_checked(cmd: &mut Command) -> Result<String> {
-    let desc = std::iter::once(cmd.get_program())
-        .chain(cmd.get_args())
-        .map(|a| a.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let output = cmd
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("running `{desc}`"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = if stderr.trim().is_empty() {
-            &stdout
-        } else {
-            stderr.trim()
-        };
-        anyhow::bail!("`{desc}` failed: {detail}");
-    }
-    Ok(stdout)
 }
 
 #[cfg(test)]
@@ -2074,8 +2271,8 @@ mod tests {
     // An empty id part means it isn't a node id.
     #[case::not_a_node_id("[5.] Fix", "5-fix")]
     #[case::one_long_word_cut_hard(&"x".repeat(50), &"x".repeat(SLUG_MAX))]
-    fn slugify_cases(#[case] title: &str, #[case] slug: &str) {
-        assert_eq!(slugify(title), slug);
+    fn branch_slug_cases(#[case] title: &str, #[case] slug: &str) {
+        assert_eq!(branch_slug(title), slug);
     }
 
     const WORKTREES: &str = r#"[
@@ -2109,7 +2306,7 @@ mod tests {
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
             p
         };
-        let [bin, other, empty] = [(); 3].map(|_| tempfile::tempdir().unwrap());
+        let [bin, other, empty] = [(); 3].map(|()| tempfile::tempdir().unwrap());
         let (on_path, fallback) = (exe(bin.path()), exe(other.path()));
         let path = |d: &tempfile::TempDir| std::env::join_paths([d.path()]).unwrap();
         let kwt = |d| resolve_tool("kwt", Some(&path(d)), Some(&fallback));
@@ -2144,8 +2341,8 @@ mod tests {
             meta: kata::TrackerMeta::default(),
             parent: None,
             branch: "143-add-engram-dispatch".into(),
-            local: false,
-            remote: false,
+            branch_state: BranchState::Missing,
+            on_origin: false,
             pr_title: "[5.2] Add engram dispatch".into(),
             base: "main".into(),
             pr: None,
@@ -2158,6 +2355,7 @@ mod tests {
 
     fn with_pr(mut t: DispatchPlan, base: &str, draft: bool) -> DispatchPlan {
         t.pr = Some(OpenPr {
+            number: 9,
             url: "https://github.com/o/r/pull/9".into(),
             base: base.into(),
             head: t.branch.clone(),
@@ -2171,8 +2369,8 @@ mod tests {
     /// the computed one, the PR's own is `main`.
     fn reused(base: &str) -> DispatchPlan {
         let mut t = with_pr(target(), "main", false);
-        t.pr_link = Some("found by `Closes #143` in its body".into());
-        t.local = true;
+        t.pr_link = Some(PrLink::BodyKeyword);
+        t.branch_state = BranchState::Local;
         t.base = base.into();
         t
     }
@@ -2322,7 +2520,7 @@ mod tests {
             status,
             plan_issue: None,
             pr_url: None,
-            depends_on: deps.iter().map(|d| d.to_string()).collect(),
+            depends_on: deps.iter().map(std::string::ToString::to_string).collect(),
         }
     }
 
@@ -2416,7 +2614,9 @@ mod tests {
         let chain = |base: Option<&str>, ids: &[&str]| {
             (
                 on("", base).base,
-                ids.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                ids.iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>(),
             )
         };
         assert_eq!(
@@ -2448,13 +2648,13 @@ mod tests {
             on("e", Some("b")),
             on("r", None),
         ];
-        let fresh = fresh.iter().map(|s| s.to_string()).collect();
+        let fresh = fresh.iter().map(std::string::ToString::to_string).collect();
         let want: Vec<_> = want
             .iter()
             .map(|(base, ids)| {
                 (
                     on("", *base).base,
-                    ids.iter().map(|s| s.to_string()).collect(),
+                    ids.iter().map(std::string::ToString::to_string).collect(),
                 )
             })
             .collect();
@@ -2529,7 +2729,12 @@ mod tests {
         #[case] no_launch: bool,
         #[case] want: &str,
     ) {
-        assert_eq!(count_line(planned, ready, failed, no_launch), want);
+        let counts = PlanCounts {
+            planned,
+            ready,
+            failed,
+        };
+        assert_eq!(counts.line(no_launch), want);
     }
 
     #[rstest]

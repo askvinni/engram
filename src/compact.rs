@@ -1,12 +1,14 @@
 use anyhow::{Context, Result};
 use std::path::Path;
-use std::process::Command;
 
-use crate::{claude, memory};
+use crate::claude::{CompactAction, CompactKind};
+use crate::{claude, config, date, learn, memory};
+
+/// Branch prefix of a compaction PR; the date follows.
+const COMPACT_BRANCH_PREFIX: &str = "engram/compact-";
 
 pub fn run(repo_root: &Path) -> Result<()> {
-    let cfg = crate::config::Config::load(repo_root)?;
-    let repo = crate::config::resolve_repo(&cfg, repo_root)?;
+    let repo = config::github_repo(repo_root)?;
 
     println!("Reading memory files...");
     let topics = memory::list_all_topics(repo_root)?;
@@ -21,46 +23,7 @@ pub fn run(repo_root: &Path) -> Result<()> {
         .context("reading always-loaded instructions")?;
     let actions = claude::compact_learnings(&topics, &instructions)?;
 
-    let deletes: Vec<_> = actions.iter().filter(|a| a.action == "delete").collect();
-    let merges: Vec<_> = actions
-        .iter()
-        .filter(|a| a.action == "merge_into")
-        .collect();
-    let keeps: Vec<_> = actions.iter().filter(|a| a.action == "keep").collect();
-
-    println!(
-        "  {} keep, {} delete, {} merge",
-        keeps.len(),
-        deletes.len(),
-        merges.len()
-    );
-
-    if !deletes.is_empty() {
-        println!("Deleting:");
-        for a in &deletes {
-            println!(
-                "  [-] {}/{} — {}",
-                a.category,
-                a.slug,
-                a.reason.as_deref().unwrap_or("")
-            );
-        }
-    }
-    if !merges.is_empty() {
-        println!("Merging:");
-        for a in &merges {
-            println!(
-                "  [~] {}/{} → {}/{} — {}",
-                a.category,
-                a.slug,
-                a.target_category.as_deref().unwrap_or("?"),
-                a.target_slug.as_deref().unwrap_or("?"),
-                a.reason.as_deref().unwrap_or("")
-            );
-        }
-    }
-
-    if deletes.is_empty() && merges.is_empty() {
+    if !print_summary(&actions) {
         println!("Nothing to compact.");
         return Ok(());
     }
@@ -74,50 +37,57 @@ pub fn run(repo_root: &Path) -> Result<()> {
     println!("Updating CLAUDE.md...");
     memory::write_claude_md_section(repo_root)?;
 
-    let branch = format!("engram/compact-{}", memory::today_iso());
-    git(repo_root, &["checkout", "-b", &branch])?;
-    git(repo_root, &["add", ".engram/memory", "CLAUDE.md"])?;
-
-    let staged = Command::new("git")
-        .args(["diff", "--cached", "--quiet"])
-        .current_dir(repo_root)
-        .status()?;
-    if staged.success() {
-        println!("Nothing to commit — memory unchanged.");
-        return Ok(());
+    let pr = learn::MemoryPr {
+        branch: &format!("{COMPACT_BRANCH_PREFIX}{}", date::today_iso()),
+        commit_message: &format!("engram: compact memory ({deleted} deleted, {merged} merged)"),
+        title: "engram: compact memory",
+        body: &format!(
+            "Compacted memory: {deleted} files deleted, {merged} files merged.{}",
+            learn::PR_FOOTER
+        ),
+    };
+    if let Some(url) = learn::open_memory_pr(repo_root, &repo, &pr)? {
+        println!("PR created: {url}");
     }
-
-    git(
-        repo_root,
-        &[
-            "commit",
-            "-m",
-            &format!("engram: compact memory ({deleted} deleted, {merged} merged)"),
-        ],
-    )?;
-    git(repo_root, &["push", "-u", "origin", &branch])?;
-
-    let pr_body = format!(
-        "Compacted memory: {deleted} files deleted, {merged} files merged.\n\n---\n*Created by engram compact*"
-    );
-    let pr_url = crate::github::create_pr(
-        &repo,
-        "engram: compact memory",
-        &pr_body,
-        crate::github::LEARNED_LABEL,
-    )?;
-
-    println!("PR created: {}", pr_url.trim());
     Ok(())
 }
 
-fn git(repo_root: &Path, args: &[&str]) -> Result<()> {
-    let status = Command::new("git")
-        .args(args)
-        .current_dir(repo_root)
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("git {} failed", args.join(" "));
+/// Print what compaction will do. Returns false when it would change nothing.
+fn print_summary(actions: &[CompactAction]) -> bool {
+    let of = |kind: CompactKind| -> Vec<&CompactAction> {
+        actions.iter().filter(|a| a.action == kind).collect()
+    };
+    let (keeps, deletes, merges) = (
+        of(CompactKind::Keep),
+        of(CompactKind::Delete),
+        of(CompactKind::MergeInto),
+    );
+    println!(
+        "  {} keep, {} delete, {} merge",
+        keeps.len(),
+        deletes.len(),
+        merges.len()
+    );
+
+    let reason = |a: &CompactAction| a.reason.clone().unwrap_or_default();
+    if !deletes.is_empty() {
+        println!("Deleting:");
+        for a in &deletes {
+            println!("  [-] {}/{} — {}", a.category, a.slug, reason(a));
+        }
     }
-    Ok(())
+    if !merges.is_empty() {
+        println!("Merging:");
+        for a in &merges {
+            println!(
+                "  [~] {}/{} → {}/{} — {}",
+                a.category,
+                a.slug,
+                a.target_category.as_deref().unwrap_or("?"),
+                a.target_slug.as_deref().unwrap_or("?"),
+                reason(a)
+            );
+        }
+    }
+    !(deletes.is_empty() && merges.is_empty())
 }

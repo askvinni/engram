@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use std::path::Path;
-use std::process::Command;
 
-use crate::{config, github, kata, learn, objective};
+use crate::{config, date, github, kata, learn, objective, process};
+
+/// Branch the learnings from `plan learn --all` are committed on.
+const LEARN_ALL_BRANCH: &str = "engram/learn-all";
 
 pub fn new(
     repo_root: &Path,
@@ -10,11 +12,36 @@ pub fn new(
     body: Option<&str>,
     conversation: Option<&str>,
     tracker: &kata::TrackerMeta,
-    no_kata: bool,
 ) -> Result<()> {
-    let cfg = config::Config::load(repo_root)?;
-    let repo = config::resolve_repo(&cfg, repo_root)?;
+    let repo = config::github_repo(repo_root)?;
     let body = body.unwrap_or("");
+    warn_missing_sections(body);
+    let issue = github::create_issue(&repo, title, body, github::PLAN_LABEL)?;
+
+    kata::mirror_new_issue(
+        &repo,
+        &issue,
+        &kata::MirrorSpec {
+            title,
+            body,
+            idempotency_key: kata::plan_idempotency_key(issue.number),
+            parent: None,
+            meta: tracker.resolve_for(title, body),
+        },
+    );
+
+    if let Some(conv) = conversation.filter(|c| !c.is_empty()) {
+        let comment_body = format!("{}\n{conv}", learn::CONVERSATION_SENTINEL);
+        github::add_issue_comment(&repo, issue.number, &comment_body)
+            .context("posting conversation comment")?;
+    }
+
+    println!("{}", issue.url);
+    Ok(())
+}
+
+/// Warn, without failing, when a plan body lacks some of the seven sections.
+pub fn warn_missing_sections(body: &str) {
     let missing = missing_plan_sections(body);
     if !missing.is_empty() {
         eprintln!(
@@ -22,72 +49,32 @@ pub fn new(
             missing.join(", ")
         );
     }
-    let url = github::create_issue(&repo, title, body, "engram-plan")?;
-    let url = url.trim();
-
-    let issue_number = url
-        .rsplit('/')
-        .next()
-        .and_then(|s| s.parse::<u64>().ok())
-        .with_context(|| format!("could not parse issue number from URL: {url}"))?;
-
-    if !no_kata && kata::kata_available() {
-        let kata_body = kata::mirror_body(url, body);
-        let idempotency_key = kata::plan_idempotency_key(issue_number);
-        let meta = kata::TrackerMeta::resolve(
-            tracker.jira.as_deref(),
-            tracker.kind.as_deref(),
-            title,
-            body,
-        );
-        match kata::create(title, &kata_body, &idempotency_key, None, &meta) {
-            Ok(kata_ref) => {
-                let updated_body = kata::with_ref_line(body, &kata_ref);
-                if let Err(e) = github::update_issue_body(&repo, issue_number, &updated_body) {
-                    eprintln!("warning: could not append Kata ref to GitHub issue: {e:#}");
-                }
-            }
-            Err(e) => {
-                eprintln!("warning: kata create failed (continuing): {e:#}");
-            }
-        }
-    }
-
-    if let Some(conv) = conversation {
-        if !conv.is_empty() {
-            let comment_body = format!("<!-- engram:conversation -->\n{conv}");
-            github::add_issue_comment(&repo, issue_number, &comment_body)
-                .context("posting conversation comment")?;
-        }
-    }
-
-    println!("{url}");
-    Ok(())
 }
 
 pub fn list(repo_root: &Path) -> Result<()> {
-    let cfg = config::Config::load(repo_root)?;
-    let repo = config::resolve_repo(&cfg, repo_root)?;
-    let plans = github::list_open_plans(&repo)?;
+    let repo = config::github_repo(repo_root)?;
+    let plans = github::list_open_issues(&repo, github::PLAN_LABEL)?;
     if plans.is_empty() {
         println!("No open plans.");
         return Ok(());
     }
     for p in &plans {
-        let age = crate::days_ago(&p.created_at);
-        println!("#{:<4} {} ({})", p.number, p.title, age);
+        println!(
+            "#{:<4} {} ({})",
+            p.number,
+            p.title,
+            date::days_ago(&p.created_at)
+        );
     }
     Ok(())
 }
 
-pub fn learn_single(repo_root: &Path, issue: u64, no_kata: bool) -> Result<()> {
-    let cfg = config::Config::load(repo_root)?;
-    learn::run(repo_root, &cfg, issue, no_kata)
+pub fn learn_single(repo_root: &Path, issue: u64) -> Result<()> {
+    learn::run(repo_root, &config::github_repo(repo_root)?, issue)
 }
 
-pub fn learn_all(repo_root: &Path, no_kata: bool) -> Result<()> {
-    let cfg = config::Config::load(repo_root)?;
-    let repo = config::resolve_repo(&cfg, repo_root)?;
+pub fn learn_all(repo_root: &Path) -> Result<()> {
+    let repo = config::github_repo(repo_root)?;
 
     let issues = github::list_unlearned_plans(&repo)?;
     if issues.is_empty() {
@@ -100,9 +87,9 @@ pub fn learn_all(repo_root: &Path, no_kata: bool) -> Result<()> {
     let mut failed = 0usize;
     for issue in &issues {
         println!("\nLearning from issue #{}: {}", issue.number, issue.title);
-        // Issues that wrote learnings are labelled by commit_memory_pr once the
+        // Issues that wrote learnings are labelled by commit_learned once the
         // PR exists (or memory turned out unchanged); the rest are settled here.
-        let outcome = match learn::write_memory(repo_root, issue.number, &repo, no_kata) {
+        let outcome = match learn::write_memory(repo_root, issue.number, &repo) {
             Ok(true) => {
                 learned.push(issue.number);
                 continue;
@@ -119,29 +106,21 @@ pub fn learn_all(repo_root: &Path, no_kata: bool) -> Result<()> {
 
     if learned.is_empty() {
         println!("\nNo learnings extracted from any issue.");
-        if failed > 0 {
-            anyhow::bail!("{failed} issue(s) failed — see errors above");
+    } else {
+        let issue_list = learn::issue_list(&learned);
+        let title = format!("engram: learn from {issue_list}");
+        let pr = learn::MemoryPr {
+            branch: LEARN_ALL_BRANCH,
+            commit_message: &title,
+            title: &title,
+            body: &format!(
+                "Learnings extracted from: {issue_list}.{}",
+                learn::PR_FOOTER
+            ),
+        };
+        if let Some(pr_url) = learn::commit_learned(repo_root, &repo, &learned, &pr)? {
+            println!("\nPR created: {pr_url}");
         }
-        return Ok(());
-    }
-
-    let issue_list = learned
-        .iter()
-        .map(|n| format!("#{n}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let pr_title = format!("engram: learn from {issue_list}");
-    let pr_body = format!("Learnings extracted from: {issue_list}.\n\n---\n*Created by engram*");
-
-    if let Some(pr_url) = learn::commit_memory_pr(
-        repo_root,
-        &repo,
-        "engram/learn-all",
-        &learned,
-        &pr_title,
-        &pr_body,
-    )? {
-        println!("\nPR created: {pr_url}");
     }
 
     if failed > 0 {
@@ -150,126 +129,116 @@ pub fn learn_all(repo_root: &Path, no_kata: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn land(repo_root: &Path, issue: u64, no_kata: bool) -> Result<()> {
-    let cfg = config::Config::load(repo_root)?;
-    let repo = config::resolve_repo(&cfg, repo_root)?;
+/// `engram plan land`: learn from a merged plan, close it and its kata mirror,
+/// mark its objective node done and delete its local branch.
+pub fn land(repo_root: &Path, issue: u64) -> Result<()> {
+    let repo = config::github_repo(repo_root)?;
 
-    learn::run(repo_root, &cfg, issue, no_kata)?;
+    learn::run(repo_root, &repo, issue)?;
 
     let gh_issue = github::get_issue(&repo, issue)?;
-    if gh_issue.state != "CLOSED" {
-        config::gh_command()?
-            .args(["issue", "close", &issue.to_string(), "--repo", &repo])
-            .status()?;
-        println!("Closed issue #{issue}.");
-    } else {
+    if gh_issue.is_closed() {
         println!("Issue #{issue} already closed.");
+    } else {
+        github::close_issue(&repo, issue)?;
+        println!("Closed issue #{issue}.");
     }
 
-    let linked_pr = github::find_linked_pr(&repo, issue);
+    let pr = match github::find_linked_pr(&repo, issue) {
+        Ok(Some(pr)) => Some(pr),
+        Ok(None) => {
+            eprintln!(
+                "warning: no merged PR found for issue #{issue}; skipping kata close and branch cleanup"
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: could not look up the PR for issue #{issue}; skipping kata close and \
+                 branch cleanup: {e:#}"
+            );
+            None
+        }
+    };
 
-    if let Some(kata_ref) = parse_kata_ref(gh_issue.body.as_deref().unwrap_or("")) {
-        match &linked_pr {
-            Ok(Some(pr)) => match &pr.merge_commit_sha {
-                Some(sha) => {
-                    let message = format!(
-                        "Closed by engram plan land for GitHub issue #{issue}, merged in PR #{}.",
-                        pr.number
-                    );
-                    match kata::close(&kata_ref, &message, sha) {
-                        Ok(()) => println!("Closed kata issue {kata_ref}."),
-                        Err(e) => {
-                            eprintln!("warning: could not close kata issue {kata_ref}: {e:#}")
-                        }
-                    }
-                }
-                None => eprintln!(
-                    "warning: no merge commit found for PR #{}; skipping kata close for {kata_ref}",
-                    pr.number
-                ),
-            },
-            Ok(None) => eprintln!(
-                "warning: no merged PR found for issue #{issue}; skipping kata close for {kata_ref}"
-            ),
-            Err(e) => eprintln!(
-                "warning: could not look up PR for issue #{issue}; skipping kata close for {kata_ref}: {e:#}"
-            ),
+    if let (Some(pr), Some(kata_ref)) = (&pr, kata::parse_ref(gh_issue.body_text())) {
+        if kata::kata_available() {
+            close_kata_mirror(issue, kata_ref, pr);
         }
     }
 
-    if let Err(e) = objective::maybe_mark_node_done(&repo, gh_issue.body.as_deref().unwrap_or("")) {
+    if let Err(e) = objective::maybe_mark_node_done(&repo, gh_issue.body_text()) {
         eprintln!("warning: could not update objective node: {e:#}");
     }
 
-    match linked_pr {
-        Ok(Some(pr)) => {
-            if let Some(branch_name) = pr.head_ref_name {
-                let result = Command::new("git")
-                    .args(["branch", "-d", &branch_name])
-                    .current_dir(repo_root)
-                    .status();
-                match result {
-                    Ok(s) if s.success() => println!("Deleted local branch {branch_name}."),
-                    Ok(_) => eprintln!(
-                        "warning: could not delete branch {branch_name} (may have unmerged commits or not exist locally)"
-                    ),
-                    Err(e) => eprintln!("warning: could not delete branch {branch_name}: {e:#}"),
-                }
-            } else {
-                eprintln!(
-                    "warning: PR #{} has no branch name recorded; skipping branch cleanup",
-                    pr.number
-                );
-            }
-        }
-        Ok(None) => {
-            eprintln!("warning: no merged PR found for issue #{issue}; skipping branch cleanup");
-        }
-        Err(e) => {
-            eprintln!("warning: could not look up PR for issue #{issue}: {e:#}");
-        }
+    if let Some(pr) = &pr {
+        delete_local_branch(repo_root, pr);
     }
-
     Ok(())
 }
 
+/// Close plan `issue`'s kata mirror with the merge commit as evidence (warnings only).
+fn close_kata_mirror(issue: u64, kata_ref: &str, pr: &github::PullRequest) {
+    let Some(sha) = &pr.merge_commit_sha else {
+        eprintln!(
+            "warning: no merge commit found for PR #{}; skipping kata close for {kata_ref}",
+            pr.number
+        );
+        return;
+    };
+    let message = format!(
+        "Closed by engram plan land for GitHub issue #{issue}, merged in PR #{}.",
+        pr.number
+    );
+    match kata::close(kata_ref, &message, sha) {
+        Ok(()) => println!("Closed kata issue {kata_ref}."),
+        Err(e) => eprintln!("warning: could not close kata issue {kata_ref}: {e:#}"),
+    }
+}
+
+/// Delete the merged PR's local branch, if git agrees it is merged (warnings only).
+fn delete_local_branch(repo_root: &Path, pr: &github::PullRequest) {
+    let Some(branch) = &pr.head_ref_name else {
+        eprintln!(
+            "warning: PR #{} has no branch name recorded; skipping branch cleanup",
+            pr.number
+        );
+        return;
+    };
+    match process::run_checked(process::git(repo_root).args(["branch", "-d", branch])) {
+        Ok(_) => println!("Deleted local branch {branch}."),
+        Err(e) => eprintln!(
+            "warning: could not delete branch {branch} (it may have unmerged commits or not \
+             exist locally): {e:#}"
+        ),
+    }
+}
+
 pub fn status(repo_root: &Path) -> Result<()> {
-    let cfg = config::Config::load(repo_root)?;
-    let repo = config::resolve_repo(&cfg, repo_root)?;
+    let repo = config::github_repo(repo_root)?;
 
-    let branch = Command::new("git")
-        .args(["branch", "--show-current"])
-        .current_dir(repo_root)
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-
+    let branch = process::run_checked(process::git(repo_root).args(["branch", "--show-current"]))
+        .context("reading the current branch")?;
     if branch.is_empty() {
         println!("Not on a branch.");
         return Ok(());
     }
     println!("Branch: {branch}");
 
-    let pr = github::find_pr_for_branch(&repo, &branch)?;
-    if let Some(ref pr) = pr {
-        println!(
+    let pr = github::pr_for_branch(&repo, &branch, github::PrState::Open)?;
+    match &pr {
+        Some(p) => println!(
             "PR:     #{} {} [{}]",
-            pr.number,
-            pr.title,
-            pr.body
-                .as_deref()
-                .unwrap_or("")
-                .lines()
-                .next()
-                .unwrap_or("")
-        );
-    } else {
-        println!("PR:     none");
+            p.pr.number,
+            p.pr.title,
+            p.body.lines().next().unwrap_or("")
+        ),
+        None => println!("PR:     none"),
     }
 
     let issue_num = pr
         .as_ref()
-        .and_then(|p| parse_closes_issue(p.body.as_deref().unwrap_or("")))
+        .and_then(|p| github::closed_issues(&p.body, &repo).first().copied())
         .or_else(|| {
             branch
                 .split(|c: char| !c.is_ascii_digit())
@@ -278,16 +247,16 @@ pub fn status(repo_root: &Path) -> Result<()> {
 
     if let Some(n) = issue_num {
         if let Ok(issue) = github::get_issue(&repo, n) {
-            if issue.state != "CLOSED" {
+            if !issue.is_closed() {
                 println!("Issue:  #{n} {} [{}]", issue.title, issue.state);
                 return Ok(());
             }
         }
     }
 
-    let plans = github::list_open_plans(&repo)?;
+    let plans = github::list_open_issues(&repo, github::PLAN_LABEL)?;
     if plans.is_empty() {
-        println!("Issue:  no open engram-plan issues");
+        println!("Issue:  no open {} issues", github::PLAN_LABEL);
     } else {
         println!("Open plans:");
         for p in &plans {
@@ -295,29 +264,6 @@ pub fn status(repo_root: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Parse the `Kata: <ref>` marker that `engram plan new` appends to the issue
-/// body when a linked kata issue was created (see `plan::new`).
-fn parse_kata_ref(body: &str) -> Option<String> {
-    body.lines()
-        .find_map(|line| line.trim().strip_prefix("Kata:"))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-fn parse_closes_issue(body: &str) -> Option<u64> {
-    let lower = body.to_lowercase();
-    for keyword in ["closes #", "fixes #", "resolves #"] {
-        if let Some(pos) = lower.find(keyword) {
-            let rest = &body[pos + keyword.len()..];
-            let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let Ok(n) = num_str.parse::<u64>() {
-                return Some(n);
-            }
-        }
-    }
-    None
 }
 
 pub fn missing_plan_sections(body: &str) -> Vec<&'static str> {
@@ -340,51 +286,6 @@ pub fn missing_plan_sections(body: &str) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_closes_issue_finds_closes() {
-        assert_eq!(parse_closes_issue("closes #42"), Some(42));
-    }
-
-    #[test]
-    fn parse_closes_issue_finds_fixes() {
-        assert_eq!(parse_closes_issue("Fixes #7"), Some(7));
-    }
-
-    #[test]
-    fn parse_closes_issue_finds_resolves() {
-        assert_eq!(parse_closes_issue("Resolves #100"), Some(100));
-    }
-
-    #[test]
-    fn parse_closes_issue_returns_none_for_no_match() {
-        assert_eq!(parse_closes_issue("no issue reference here"), None);
-    }
-
-    #[test]
-    fn parse_closes_issue_in_pr_body_multiline() {
-        let body = "## Summary\nDoes some stuff.\n\nCloses #55\n";
-        assert_eq!(parse_closes_issue(body), Some(55));
-    }
-
-    #[test]
-    fn parse_kata_ref_finds_marker() {
-        let body = "**Why** x\n**Scope** x\nKata: abc4";
-        assert_eq!(parse_kata_ref(body), Some("abc4".to_string()));
-    }
-
-    #[test]
-    fn parse_kata_ref_returns_none_when_absent() {
-        assert_eq!(parse_kata_ref("**Why** x\n**Scope** x"), None);
-    }
-
-    #[test]
-    fn parse_kata_ref_trims_whitespace() {
-        assert_eq!(
-            parse_kata_ref("body text\nKata:   zzzz9  \n"),
-            Some("zzzz9".to_string())
-        );
-    }
 
     #[test]
     fn missing_plan_sections_empty_body() {

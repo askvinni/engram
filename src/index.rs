@@ -4,6 +4,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 const DB_RELATIVE: &str = ".engram/index.db";
+/// Characters of a matching file shown as a search result's snippet.
+const SNIPPET_CHARS: usize = 120;
 
 static MIGRATIONS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/migrations");
 
@@ -39,7 +41,6 @@ fn open_db(repo_root: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-#[allow(dead_code)]
 pub fn rebuild_index(repo_root: &Path) -> Result<()> {
     let conn = open_db(repo_root)?;
     let topics = crate::memory::list_all_topics(repo_root).context("listing memory files")?;
@@ -48,7 +49,7 @@ pub fn rebuild_index(repo_root: &Path) -> Result<()> {
         .context("clearing index")?;
 
     for topic in &topics {
-        let rel_path = format!(".engram/memory/{}/{}.md", topic.category, topic.slug);
+        let rel_path = crate::memory::topic_rel_path(&topic.category, &topic.slug);
         insert_row(
             &conn,
             &rel_path,
@@ -60,21 +61,16 @@ pub fn rebuild_index(repo_root: &Path) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
-pub fn upsert_file(
-    repo_root: &Path,
-    rel_path: &str,
-    category: &str,
-    slug: &str,
-    content: &str,
-) -> Result<()> {
+/// Index (or re-index) the topic file `<category>/<slug>.md` with `content`.
+pub fn upsert_file(repo_root: &Path, category: &str, slug: &str, content: &str) -> Result<()> {
     let conn = open_db(repo_root)?;
-    upsert_row(&conn, rel_path, category, slug, content)
+    let rel_path = crate::memory::topic_rel_path(category, slug);
+    upsert_row(&conn, &rel_path, category, slug, content)
 }
 
-#[allow(dead_code)]
-pub fn check_index_health(repo_root: &Path) -> Result<bool> {
-    Ok(repo_root.join(DB_RELATIVE).exists())
+/// Whether the search index has been built (`search` builds it on demand).
+pub fn exists(repo_root: &Path) -> bool {
+    repo_root.join(DB_RELATIVE).exists()
 }
 
 #[derive(Debug)]
@@ -86,7 +82,7 @@ pub struct SearchResult {
 
 /// Query the FTS index, ranked by bm25. Rebuilds the index on demand if missing.
 pub fn search(repo_root: &Path, query: &str) -> Result<Vec<SearchResult>> {
-    if !repo_root.join(DB_RELATIVE).exists() {
+    if !exists(repo_root) {
         rebuild_index(repo_root)?;
     }
     let conn = open_db(repo_root)?;
@@ -101,7 +97,7 @@ pub fn search(repo_root: &Path, query: &str) -> Result<Vec<SearchResult>> {
     let results = stmt
         .query_map(params![query], |row| {
             let content: String = row.get(2)?;
-            let snippet: String = content.chars().take(120).collect();
+            let snippet: String = content.chars().take(SNIPPET_CHARS).collect();
             Ok(SearchResult {
                 path: row.get(0)?,
                 category: row.get(1)?,
@@ -135,7 +131,6 @@ fn insert_row(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn upsert_row(
     conn: &Connection,
     path: &str,
@@ -194,9 +189,9 @@ mod tests {
         write_topic_file(root, "acme/widgets", &make_item("patterns", "foo"), 1).unwrap();
         write_topic_file(root, "acme/widgets", &make_item("tripwires", "bar"), 2).unwrap();
 
-        assert!(!check_index_health(root).unwrap());
+        assert!(!exists(root));
         rebuild_index(root).unwrap();
-        assert!(check_index_health(root).unwrap());
+        assert!(exists(root));
         assert_eq!(fts_count(root), 2);
 
         rebuild_index(root).unwrap();
@@ -209,24 +204,10 @@ mod tests {
         let root = dir.path();
         std::fs::create_dir_all(root.join(".engram/memory")).unwrap();
 
-        upsert_file(
-            root,
-            ".engram/memory/patterns/foo.md",
-            "patterns",
-            "foo",
-            "first",
-        )
-        .unwrap();
+        upsert_file(root, "patterns", "foo", "first").unwrap();
         assert_eq!(fts_count(root), 1);
 
-        upsert_file(
-            root,
-            ".engram/memory/patterns/foo.md",
-            "patterns",
-            "foo",
-            "updated",
-        )
-        .unwrap();
+        upsert_file(root, "patterns", "foo", "updated").unwrap();
         assert_eq!(fts_count(root), 1);
 
         let conn = Connection::open(root.join(".engram/index.db")).unwrap();
