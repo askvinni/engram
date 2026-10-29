@@ -100,8 +100,12 @@ pub fn run(repo_root: &Path) -> Result<()> {
     let pr_body = format!(
         "Compacted memory: {deleted} files deleted, {merged} files merged.\n\n---\n*Created by engram compact*"
     );
-    let pr_url =
-        crate::github::create_pr(&repo, "engram: compact memory", &pr_body, "engram-learned")?;
+    let pr_url = crate::github::create_pr(
+        &repo,
+        "engram: compact memory",
+        &pr_body,
+        crate::github::LEARNED_LABEL,
+    )?;
 
     println!("PR created: {}", pr_url.trim());
     Ok(())

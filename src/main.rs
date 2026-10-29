@@ -181,7 +181,7 @@ fn cmd_init() -> Result<()> {
             )?;
             github::ensure_label(
                 repo,
-                "engram-learned",
+                github::LEARNED_LABEL,
                 "e4e669",
                 "Learning PR created by engram",
             )?;

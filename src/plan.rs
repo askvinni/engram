@@ -100,14 +100,21 @@ pub fn learn_all(repo_root: &Path, no_kata: bool) -> Result<()> {
     let mut failed = 0usize;
     for issue in &issues {
         println!("\nLearning from issue #{}: {}", issue.number, issue.title);
-        match learn::write_memory(repo_root, issue.number, &repo, no_kata) {
-            Ok(true) => learned.push(issue.number),
-            Ok(false) => {}
+        // Issues that wrote learnings are labelled by commit_memory_pr once the
+        // PR exists (or memory turned out unchanged); the rest are settled here.
+        let outcome = match learn::write_memory(repo_root, issue.number, &repo, no_kata) {
+            Ok(true) => {
+                learned.push(issue.number);
+                continue;
+            }
+            Ok(false) => learn::LearnOutcome::NoLearnings,
             Err(e) => {
                 eprintln!("  skipping #{}: {e:#}", issue.number);
                 failed += 1;
+                learn::LearnOutcome::Failed
             }
-        }
+        };
+        learn::mark_learned_or_warn(&repo, issue.number, outcome);
     }
 
     if learned.is_empty() {
