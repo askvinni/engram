@@ -1,12 +1,29 @@
+//! The memory directory (`.engram/memory`): topic files and their OKF
+//! frontmatter, the index and CLAUDE.md section, plus direct capture, the
+//! search index and compaction.
+
+pub mod capture;
+pub mod compact;
+pub mod index;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::ops::Range;
+use std::path::{Component, Path, PathBuf};
 
+use crate::date::today_iso;
+use crate::integrations::claude::{CompactAction, CompactKind};
+use crate::integrations::github;
+
+/// Repo-relative directory holding every memory topic file.
+pub const MEMORY_DIR: &str = ".engram/memory";
+/// The instruction file engram keeps its managed memory section in.
+pub const CLAUDE_MD: &str = "CLAUDE.md";
 const ENGRAM_START: &str = "<!-- engram:start -->";
 const ENGRAM_END: &str = "<!-- engram:end -->";
 /// Instruction files every agent session loads; learnings must never restate them.
-const INSTRUCTION_FILES: &[&str] = &["CLAUDE.md", "AGENTS.md"];
+const INSTRUCTION_FILES: &[&str] = &[CLAUDE_MD, "AGENTS.md"];
 
 /// Memory categories and their OKF v0.2 `type` value.
 pub const CATEGORIES: &[(&str, &str)] = &[
@@ -22,12 +39,21 @@ pub const ORIGIN_KEY: &str = "origin";
 /// `origin` value for observations an agent recorded mid-session.
 pub const ORIGIN_SESSION: &str = "session";
 
+/// `<repo_root>/.engram/memory`.
+pub fn memory_dir(repo_root: &Path) -> PathBuf {
+    repo_root.join(MEMORY_DIR)
+}
+
+/// Repo-relative path of a topic file: `.engram/memory/<category>/<slug>.md`.
+pub fn topic_rel_path(category: &str, slug: &str) -> String {
+    format!("{MEMORY_DIR}/{category}/{slug}.md")
+}
+
 fn okf_type_for(category: &str) -> &'static str {
     CATEGORIES
         .iter()
         .find(|(c, _)| *c == category)
-        .map(|(_, t)| *t)
-        .unwrap_or("pattern")
+        .map_or("pattern", |(_, t)| *t)
 }
 
 /// Rejects categories outside `CATEGORIES`; files written elsewhere are never indexed or read.
@@ -129,7 +155,7 @@ impl Frontmatter {
                     .into_iter()
                     .map(|n| Source {
                         id: n.to_string(),
-                        resource: format!("https://github.com/{repo}/issues/{n}"),
+                        resource: github::issue_url(repo, n),
                     })
                     .collect();
             }
@@ -151,8 +177,8 @@ impl Frontmatter {
         let id = issue_number.to_string();
         if !self.sources.iter().any(|s| s.id == id) {
             self.sources.push(Source {
-                id: id.clone(),
-                resource: format!("https://github.com/{repo}/issues/{issue_number}"),
+                id,
+                resource: github::issue_url(repo, issue_number),
             });
         }
     }
@@ -181,8 +207,7 @@ fn split_frontmatter_text(content: &str) -> Result<(&str, &str)> {
     loop {
         let line_end = content[offset..]
             .find('\n')
-            .map(|p| offset + p)
-            .unwrap_or(content.len());
+            .map_or(content.len(), |p| offset + p);
         let line = &content[offset..line_end];
         if line.trim() == "---" {
             let yaml_text = &content[yaml_start..offset];
@@ -235,7 +260,7 @@ fn sorted_md_files(cat_dir: &Path) -> Result<Vec<std::path::PathBuf>> {
         return Ok(Vec::new());
     }
     let mut files: Vec<_> = std::fs::read_dir(cat_dir)?
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|ext| ext == "md"))
         .collect();
@@ -251,9 +276,8 @@ fn slug_of(path: &Path) -> String {
 }
 
 pub fn list_all_topics(repo_root: &Path) -> Result<Vec<TopicFile>> {
-    let memory_dir = repo_root.join(".engram/memory");
     let mut topics = Vec::new();
-    for (category, cat_dir) in category_dirs(&memory_dir) {
+    for (category, cat_dir) in category_dirs(&memory_dir(repo_root)) {
         for path in sorted_md_files(&cat_dir)? {
             let content = std::fs::read_to_string(&path)?;
             topics.push(TopicFile {
@@ -266,98 +290,133 @@ pub fn list_all_topics(repo_root: &Path) -> Result<Vec<TopicFile>> {
     Ok(topics)
 }
 
+/// Applies `compact`'s verdicts: merges first, then deletions. A merge source
+/// is only deleted once its merge landed, so a missing or malformed target
+/// never loses content. Returns (deleted, merged).
 pub fn apply_compact_actions(
     repo_root: &Path,
     repo: &str,
-    actions: &[crate::claude::CompactAction],
+    actions: &[CompactAction],
     topics: &[TopicFile],
 ) -> Result<(usize, usize)> {
-    let memory_dir = repo_root.join(".engram/memory");
-    let mut deleted = 0;
-    let mut merged = 0;
+    let memory_dir = memory_dir(repo_root);
     let mut merged_sources = std::collections::HashSet::new();
-
-    // First pass: update merge targets before deleting sources
     for action in actions {
-        if action.action != "merge_into" {
-            continue;
+        if let CompactKind::MergeInto = action.action {
+            if merge_into_target(&memory_dir, repo, action, topics)? {
+                merged_sources.insert((action.category.as_str(), action.slug.as_str()));
+            }
         }
-        let (target_cat, target_slug) = match (&action.target_category, &action.target_slug) {
-            (Some(c), Some(s)) => (c, s),
+    }
+
+    let (mut deleted, mut merged) = (0, 0);
+    for action in actions {
+        let counter = match action.action {
+            CompactKind::Delete => &mut deleted,
+            CompactKind::MergeInto
+                if merged_sources.contains(&(action.category.as_str(), action.slug.as_str())) =>
+            {
+                &mut merged
+            }
             _ => continue,
         };
-
-        let source_entries: Vec<Source> = topics
-            .iter()
-            .find(|t| t.category == action.category && t.slug == action.slug)
-            .map(|f| match split_frontmatter(&f.content) {
-                Ok((mut fm, _)) => {
-                    fm.normalize(&action.category, repo);
-                    fm.sources
-                }
-                Err(_) => Vec::new(),
-            })
-            .unwrap_or_default();
-
-        let target_path = memory_dir
-            .join(target_cat)
-            .join(format!("{target_slug}.md"));
-        if !target_path.exists() {
-            continue;
-        }
-
-        let existing = std::fs::read_to_string(&target_path)?;
-        let (mut fm, existing_body) = match split_frontmatter(&existing) {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                eprintln!(
-                    "warning: not merging {}/{} — target {} is malformed: {e:#}",
-                    action.category,
-                    action.slug,
-                    target_path.display()
-                );
-                continue;
-            }
-        };
-        fm.normalize(target_cat, repo);
-        fm.merge_sources(source_entries);
-        fm.touch();
-        let body = action
-            .target_updated_body
-            .as_deref()
-            .unwrap_or(&existing_body);
-        let updated = render(&fm, body)?;
-        std::fs::write(&target_path, updated)?;
-        merged_sources.insert((action.category.as_str(), action.slug.as_str()));
-    }
-
-    // Second pass: delete files. A merge source is only deleted once its
-    // merge landed, so a missing or malformed target never loses content.
-    for action in actions {
-        let merge_landed = action.action == "merge_into"
-            && merged_sources.contains(&(action.category.as_str(), action.slug.as_str()));
-        if action.action == "delete" || merge_landed {
-            let path = memory_dir
-                .join(&action.category)
-                .join(format!("{}.md", action.slug));
-            if path.exists() {
-                std::fs::remove_file(&path)?;
-                if action.action == "delete" {
-                    deleted += 1;
-                } else {
-                    merged += 1;
-                }
-            }
+        let path = memory_dir
+            .join(&action.category)
+            .join(format!("{}.md", action.slug));
+        if path.exists() {
+            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+            *counter += 1;
         }
     }
-
     Ok((deleted, merged))
+}
+
+/// Folds a `merge_into` source's sources (and the merged body) into its
+/// target. Returns false, changing nothing, when the target is missing,
+/// malformed or not named.
+fn merge_into_target(
+    memory_dir: &Path,
+    repo: &str,
+    action: &CompactAction,
+    topics: &[TopicFile],
+) -> Result<bool> {
+    let (Some(target_cat), Some(target_slug)) = (&action.target_category, &action.target_slug)
+    else {
+        return Ok(false);
+    };
+    let target_path = memory_dir
+        .join(target_cat)
+        .join(format!("{target_slug}.md"));
+    if !target_path.exists() {
+        return Ok(false);
+    }
+
+    let existing = std::fs::read_to_string(&target_path)
+        .with_context(|| format!("reading {}", target_path.display()))?;
+    let (mut fm, existing_body) = match split_frontmatter(&existing) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!(
+                "warning: not merging {}/{} — target {} is malformed: {e:#}",
+                action.category,
+                action.slug,
+                target_path.display()
+            );
+            return Ok(false);
+        }
+    };
+    let source_entries: Vec<Source> = topics
+        .iter()
+        .find(|t| t.category == action.category && t.slug == action.slug)
+        .and_then(|f| split_frontmatter(&f.content).ok())
+        .map(|(mut source_fm, _)| {
+            source_fm.normalize(&action.category, repo);
+            source_fm.sources
+        })
+        .unwrap_or_default();
+    fm.normalize(target_cat, repo);
+    fm.merge_sources(source_entries);
+    fm.touch();
+    let body = action
+        .target_updated_body
+        .as_deref()
+        .unwrap_or(&existing_body);
+    std::fs::write(&target_path, render(&fm, body)?)
+        .with_context(|| format!("writing {}", target_path.display()))?;
+    Ok(true)
+}
+
+/// Topic files matching `permalink`: the file at that path under the memory
+/// directory if there is one, else every topic whose slug is the path's stem.
+/// Paths that would leave the memory directory never match.
+pub fn find_topics(repo_root: &Path, permalink: &str) -> Result<Vec<PathBuf>> {
+    let memory_dir = memory_dir(repo_root);
+    let requested = Path::new(permalink);
+    let inside = requested
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+    if inside && memory_dir.join(requested).is_file() {
+        return Ok(vec![memory_dir.join(requested)]);
+    }
+    let needle = requested.file_stem().map_or_else(
+        || permalink.to_string(),
+        |s| s.to_string_lossy().to_string(),
+    );
+    let mut matches = Vec::new();
+    for (_, cat_dir) in category_dirs(&memory_dir) {
+        for path in sorted_md_files(&cat_dir)? {
+            if slug_of(&path) == needle {
+                matches.push(path);
+            }
+        }
+    }
+    Ok(matches)
 }
 
 /// Read all memory files for injection into the synthesis prompt.
 /// Returns a compact summary of existing topics so Claude avoids duplicates.
 pub fn read_all(repo_root: &Path) -> Result<String> {
-    let memory_dir = repo_root.join(".engram/memory");
+    let memory_dir = memory_dir(repo_root);
     if !memory_dir.exists() {
         return Ok(String::new());
     }
@@ -377,14 +436,14 @@ pub fn read_all(repo_root: &Path) -> Result<String> {
 pub fn write_topic_file(
     repo_root: &Path,
     repo: &str,
-    item: &crate::claude::LearningItem,
+    item: &crate::integrations::claude::LearningItem,
     issue_number: u64,
 ) -> Result<()> {
     let category = &item.category;
     let slug = &item.slug;
     validate_category(category)?;
-    let cat_dir = repo_root.join(format!(".engram/memory/{category}"));
-    std::fs::create_dir_all(&cat_dir)?;
+    let cat_dir = memory_dir(repo_root).join(category);
+    std::fs::create_dir_all(&cat_dir).with_context(|| format!("creating {}", cat_dir.display()))?;
 
     let path = cat_dir.join(format!("{slug}.md"));
 
@@ -407,8 +466,8 @@ pub fn write_topic_file(
         Frontmatter::new(category, &item.title)
     };
 
-    fm.title = item.title.clone();
-    fm.read_when = item.read_when.clone();
+    fm.title.clone_from(&item.title);
+    fm.read_when.clone_from(&item.read_when);
     fm.tripwires = item
         .tripwires
         .iter()
@@ -423,19 +482,17 @@ pub fn write_topic_file(
     fm.touch();
 
     let content = render(&fm, &item.body)?;
-    std::fs::write(path, content)?;
-    Ok(())
+    std::fs::write(&path, content).with_context(|| format!("writing {}", path.display()))
 }
 
 /// Rewrites every topic file's frontmatter into OKF v0.2 shape, accepting
 /// legacy `last_updated`/`source_issues` fields. Files with malformed YAML
 /// are reported and left untouched. Returns (processed, skipped).
 pub fn migrate_all(repo_root: &Path, repo: &str) -> Result<(usize, usize)> {
-    let memory_dir = repo_root.join(".engram/memory");
     let mut processed = 0;
     let mut skipped = 0;
 
-    for (category, cat_dir) in category_dirs(&memory_dir) {
+    for (category, cat_dir) in category_dirs(&memory_dir(repo_root)) {
         for path in sorted_md_files(&cat_dir)? {
             let content = std::fs::read_to_string(&path)?;
             match split_frontmatter(&content) {
@@ -462,7 +519,7 @@ pub fn migrate_all(repo_root: &Path, repo: &str) -> Result<(usize, usize)> {
 /// Links are relative `./<category>/<slug>.md` paths — never `@`-prefixed —
 /// so the index itself stays eager-loadable without pulling in every topic file.
 pub fn rebuild_index(repo_root: &Path) -> Result<()> {
-    let memory_dir = repo_root.join(".engram/memory");
+    let memory_dir = memory_dir(repo_root);
     if !memory_dir.exists() {
         return Ok(());
     }
@@ -508,48 +565,47 @@ pub fn rebuild_index(repo_root: &Path) -> Result<()> {
 }
 
 pub fn write_claude_md_section(repo_root: &Path) -> Result<()> {
-    let claude_md_path = repo_root.join("CLAUDE.md");
-    let memory_dir = repo_root.join(".engram/memory");
-    let index_path = memory_dir.join("index.md");
-
+    let claude_md_path = repo_root.join(CLAUDE_MD);
     let existing = if claude_md_path.exists() {
-        std::fs::read_to_string(&claude_md_path)?
+        std::fs::read_to_string(&claude_md_path)
+            .with_context(|| format!("reading {}", claude_md_path.display()))?
     } else {
         String::new()
     };
+    let has_index = memory_dir(repo_root).join("index.md").exists();
+    std::fs::write(&claude_md_path, with_engram_section(&existing, has_index))
+        .with_context(|| format!("writing {}", claude_md_path.display()))
+}
 
-    let body = if index_path.exists() {
-        "@.engram/memory/index.md\n".to_string()
+/// `text` with engram's managed section replaced, or appended when it has none.
+fn with_engram_section(text: &str, has_index: bool) -> String {
+    let body = if has_index {
+        format!("@{MEMORY_DIR}/index.md\n")
     } else {
-        "_No learnings yet. Run `engram learn <issue>` after closing a plan._\n".to_string()
+        "_No learnings yet. Run `engram plan learn <issue>` after closing a plan._\n".to_string()
     };
-
     let section = format!("{ENGRAM_START}\n## Engram Memory\n\n{body}\n{ENGRAM_END}");
+    match engram_section_range(text) {
+        Some(range) => format!("{}{section}{}", &text[..range.start], &text[range.end..]),
+        None if text.is_empty() => section,
+        None => format!("{}\n\n{section}", text.trim_end()),
+    }
+}
 
-    let new_content = if let (Some(start), Some(end_idx)) =
-        (existing.find(ENGRAM_START), existing.rfind(ENGRAM_END))
-    {
-        let end = end_idx + ENGRAM_END.len();
-        format!("{}{}{}", &existing[..start], section, &existing[end..])
-    } else if existing.is_empty() {
-        section
-    } else {
-        format!("{}\n\n{}", existing.trim_end(), section)
-    };
-
-    std::fs::write(claude_md_path, new_content)?;
-    Ok(())
+/// Byte range of engram's managed section (`ENGRAM_START`..`ENGRAM_END`,
+/// markers included), when both markers are there in that order.
+fn engram_section_range(text: &str) -> Option<Range<usize>> {
+    let start = text.find(ENGRAM_START)?;
+    let end = text.rfind(ENGRAM_END).filter(|&end| end >= start)?;
+    Some(start..end + ENGRAM_END.len())
 }
 
 /// Removes engram's own managed section (`ENGRAM_START`..`ENGRAM_END`, markers
 /// included) so synthesis sees only the human-written instructions.
 pub fn strip_engram_section(text: &str) -> String {
-    match (text.find(ENGRAM_START), text.rfind(ENGRAM_END)) {
-        (Some(start), Some(end_idx)) if end_idx >= start => {
-            let end = end_idx + ENGRAM_END.len();
-            format!("{}{}", &text[..start], &text[end..])
-        }
-        _ => text.to_string(),
+    match engram_section_range(text) {
+        Some(range) => format!("{}{}", &text[..range.start], &text[range.end..]),
+        None => text.to_string(),
     }
 }
 
@@ -577,37 +633,10 @@ pub fn read_always_loaded_instructions(repo_root: &Path) -> Result<String> {
     Ok(sections.join("\n\n"))
 }
 
-// --- helpers ---
-
-pub fn today_iso() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let days = (secs / 86400) as i64;
-    // Days since epoch to Gregorian date
-    let (y, m, d) = days_to_ymd(days);
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
-fn days_to_ymd(z: i64) -> (i32, u32, u32) {
-    let z = z + 719468;
-    let era = z.div_euclid(146097);
-    let doe = (z - era * 146097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i32 + (era as i32) * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::claude::{CompactAction, LearningItem, Tripwire as ClaudeTripwire};
+    use crate::integrations::claude::{LearningItem, Tripwire as ClaudeTripwire};
 
     const REPO: &str = "acme/widgets";
     const LEGACY: &str = "---\ntitle: \"Legacy\"\nread_when: []\ntripwires: []\nlast_updated: \"2024-01-01\"\nsource_issues: [1]\n---\n\nOld body.\n";
@@ -625,13 +654,6 @@ mod tests {
 
     fn read_fm(path: &Path) -> (Frontmatter, String) {
         split_frontmatter(&std::fs::read_to_string(path).unwrap()).unwrap()
-    }
-
-    #[test]
-    fn today_iso_format() {
-        let s = today_iso();
-        assert_eq!(s.len(), 10);
-        assert!(s[..4].parse::<u32>().is_ok() && &s[4..5] == "-" && &s[7..8] == "-");
     }
 
     #[test]
@@ -732,7 +754,7 @@ mod tests {
             write_topic_file(root, REPO, &item(slug, slug), n).unwrap();
         }
         let merge = |slug: &str, target: &str| CompactAction {
-            action: "merge_into".into(),
+            action: CompactKind::MergeInto,
             category: "patterns".into(),
             slug: slug.into(),
             reason: None,
@@ -805,5 +827,39 @@ mod tests {
             read_always_loaded_instructions(root).unwrap(),
             "### AGENTS.md\nRun cargo test."
         );
+    }
+
+    #[test]
+    fn with_engram_section_replaces_or_appends_but_never_duplicates() {
+        let fresh = with_engram_section("", true);
+        assert!(fresh.starts_with(ENGRAM_START) && fresh.contains("@.engram/memory/index.md"));
+
+        let replaced = with_engram_section(&format!("# Repo\n\n{fresh}\n\nTail.\n"), false);
+        assert_eq!(replaced.matches(ENGRAM_START).count(), 1);
+        assert!(replaced.contains("engram plan learn <issue>"));
+        assert!(replaced.starts_with("# Repo\n\n") && replaced.ends_with("\n\nTail.\n"));
+
+        // Reversed markers are not a section: append one, keep the stray markers.
+        let reversed = "<!-- engram:end --> x <!-- engram:start -->";
+        let appended = with_engram_section(reversed, true);
+        assert!(appended.starts_with(reversed));
+        assert_eq!(appended.matches(ENGRAM_START).count(), 2);
+    }
+
+    #[test]
+    fn find_topics_by_path_or_slug_and_stays_inside_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_topic_file(root, REPO, &item("foo", "Foo"), 1).unwrap();
+        let mut tripwire = item("foo", "Foo too");
+        tripwire.category = "tripwires".into();
+        write_topic_file(root, REPO, &tripwire, 1).unwrap();
+        std::fs::write(root.join("secret.md"), "outside").unwrap();
+
+        let exact = find_topics(root, "patterns/foo.md").unwrap();
+        assert_eq!(exact, [memory_dir(root).join("patterns/foo.md")]);
+        assert_eq!(find_topics(root, "foo").unwrap().len(), 2);
+        assert!(find_topics(root, "nope").unwrap().is_empty());
+        assert!(find_topics(root, "../../secret.md").unwrap().is_empty());
     }
 }

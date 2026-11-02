@@ -1,9 +1,46 @@
-use crate::config;
+use crate::{config, process};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+/// Label on every plan issue engram creates.
+pub const PLAN_LABEL: &str = "engram-plan";
+/// Label on every objective issue engram creates.
+pub const OBJECTIVE_LABEL: &str = "engram-objective";
 /// Label marking a plan issue whose learnings have been synthesized (and the PRs that carry them).
 pub const LEARNED_LABEL: &str = "engram-learned";
+
+/// The labels `engram init` creates: (name, color, description).
+pub const ENGRAM_LABELS: &[(&str, &str, &str)] = &[
+    (PLAN_LABEL, "0075ca", "Plan issue created by engram"),
+    (LEARNED_LABEL, "e4e669", "Learning PR created by engram"),
+    (
+        OBJECTIVE_LABEL,
+        "5319e7",
+        "Objective issue created by engram",
+    ),
+];
+
+/// Most open plans or objectives listed.
+const OPEN_ISSUE_LIMIT: &str = "50";
+/// Most closed plans scanned for ones not yet learned.
+const CLOSED_PLAN_LIMIT: &str = "100";
+/// Most PRs listed when looking for one whose body closes an issue.
+const PR_SCAN_LIMIT: &str = "200";
+
+/// GitHub's closing keywords, lower-cased.
+const CLOSING_KEYWORDS: &[&str] = &[
+    "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
+];
+
+/// `https://github.com/<repo>/issues/`, the prefix of every issue URL in `repo`.
+pub fn issues_url_prefix(repo: &str) -> String {
+    format!("https://github.com/{repo}/issues/")
+}
+
+/// The URL of issue `number` in `repo`.
+pub fn issue_url(repo: &str, number: u64) -> String {
+    format!("{}{number}", issues_url_prefix(repo))
+}
 
 #[derive(Debug, Deserialize)]
 pub struct Issue {
@@ -30,11 +67,41 @@ impl Issue {
     pub fn is_pull_request(&self) -> bool {
         self.url.contains("/pull/")
     }
+
+    pub fn is_open(&self) -> bool {
+        self.state.eq_ignore_ascii_case("open")
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.state.eq_ignore_ascii_case("closed")
+    }
+
+    pub fn body_text(&self) -> &str {
+        self.body.as_deref().unwrap_or("")
+    }
 }
 
-/// An open (or merged) PR found for a plan, with its head and base.
+/// The PR states engram lists PRs by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrState {
+    Open,
+    Merged,
+}
+
+impl PrState {
+    fn as_arg(self) -> &'static str {
+        match self {
+            PrState::Open => "open",
+            PrState::Merged => "merged",
+        }
+    }
+}
+
+/// A PR found for a plan (open, or merged when looked up by state), with its head and base.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct OpenPr {
+    #[serde(default)]
+    pub number: u64,
     pub url: String,
     #[serde(rename = "baseRefName")]
     pub base: String,
@@ -47,7 +114,7 @@ pub struct OpenPr {
 }
 
 /// JSON fields `gh pr list/view` must return to fill an `OpenPr`.
-const OPEN_PR_FIELDS: &str = "url,baseRefName,headRefName,isDraft,title";
+const OPEN_PR_FIELDS: &str = "number,url,baseRefName,headRefName,isDraft,title";
 
 /// A PR with its body (and state, when `gh pr view` reports it).
 #[derive(Debug, Deserialize)]
@@ -61,6 +128,11 @@ pub struct PrWithBody {
     /// Opened from a fork: its head branch isn't on origin.
     #[serde(rename = "isCrossRepository", default)]
     pub cross_repo: bool,
+}
+
+/// JSON fields `gh pr list/view` must return to fill a `PrWithBody`.
+fn pr_with_body_fields() -> String {
+    format!("{OPEN_PR_FIELDS},body,isCrossRepository")
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -87,45 +159,64 @@ pub struct PlanIssue {
     pub created_at: String,
 }
 
+/// An issue `gh issue create` just opened.
+#[derive(Debug)]
+pub struct CreatedIssue {
+    pub number: u64,
+    pub url: String,
+}
+
 fn gh(args: &[&str]) -> Result<String> {
-    let output = config::gh_command()?
-        .args(args)
-        .output()
-        .context("running gh CLI (is it installed and authenticated?)")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("gh {} failed: {}", args.join(" "), stderr.trim());
-    }
-    Ok(String::from_utf8(output.stdout)?)
+    process::run_checked(config::gh_command()?.args(args))
+        .context("running gh CLI (is it installed and authenticated?)")
+}
+
+/// `owner` and `name` of an `owner/name` repo.
+fn split_repo(repo: &str) -> Result<(&str, &str)> {
+    repo.split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("repo must be owner/name, got: {repo}"))
+}
+
+/// The issue number at the end of an issue URL.
+fn issue_number_from_url(url: &str) -> Result<u64> {
+    url.trim()
+        .rsplit('/')
+        .next()
+        .and_then(|s| s.parse().ok())
+        .with_context(|| format!("could not parse issue number from URL: {url}"))
 }
 
 pub fn ensure_label(repo: &str, name: &str, color: &str, description: &str) -> Result<()> {
-    let output = config::gh_command()?
-        .args([
-            "label",
-            "create",
-            name,
-            "--repo",
-            repo,
-            "--color",
-            color,
-            "--description",
-            description,
-        ])
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.contains("already exists") {
-            anyhow::bail!("failed to create label {}: {}", name, stderr.trim());
-        }
-    }
-    Ok(())
+    let mut cmd = config::gh_command()?;
+    cmd.args([
+        "label",
+        "create",
+        name,
+        "--repo",
+        repo,
+        "--color",
+        color,
+        "--description",
+        description,
+    ]);
+    process::run_tolerating(&mut cmd, "already exists")
+        .with_context(|| format!("creating label {name}"))
 }
 
-pub fn create_issue(repo: &str, title: &str, body: &str, label: &str) -> Result<String> {
-    gh(&[
+pub fn create_issue(repo: &str, title: &str, body: &str, label: &str) -> Result<CreatedIssue> {
+    let out = gh(&[
         "issue", "create", "--repo", repo, "--title", title, "--body", body, "--label", label,
-    ])
+    ])?;
+    let url = out
+        .lines()
+        .last()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    Ok(CreatedIssue {
+        number: issue_number_from_url(&url)?,
+        url,
+    })
 }
 
 pub fn get_issue(repo: &str, number: u64) -> Result<Issue> {
@@ -148,11 +239,31 @@ pub fn get_issue(repo: &str, number: u64) -> Result<Issue> {
 /// falls back to the most recent merged PR in the same repo that references the
 /// issue, preferring ones whose body carries a closing keyword.
 pub fn find_linked_pr(repo: &str, issue_number: u64) -> Result<Option<PullRequest>> {
-    let (owner, name) = repo
-        .split_once('/')
-        .ok_or_else(|| anyhow::anyhow!("repo must be owner/name, got: {repo}"))?;
+    #[derive(Deserialize)]
+    struct Response {
+        data: Data,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        repository: Repo,
+    }
+    #[derive(Deserialize)]
+    struct Repo {
+        issue: GhIssue,
+    }
+    #[derive(Deserialize)]
+    struct GhIssue {
+        #[serde(rename = "timelineItems")]
+        timeline_items: TimelineItems,
+    }
+    #[derive(Deserialize)]
+    struct TimelineItems {
+        nodes: Vec<TimelineNode>,
+    }
 
-    let query = r#"
+    let (owner, name) = split_repo(repo)?;
+
+    let query = r"
         fragment Pr on PullRequest {
           number
           title
@@ -180,7 +291,7 @@ pub fn find_linked_pr(repo: &str, issue_number: u64) -> Result<Option<PullReques
             }
           }
         }
-    "#;
+    ";
 
     let out = gh(&[
         "api",
@@ -194,28 +305,6 @@ pub fn find_linked_pr(repo: &str, issue_number: u64) -> Result<Option<PullReques
         "-F",
         &format!("number={issue_number}"),
     ])?;
-
-    #[derive(Deserialize)]
-    struct Response {
-        data: Data,
-    }
-    #[derive(Deserialize)]
-    struct Data {
-        repository: Repo,
-    }
-    #[derive(Deserialize)]
-    struct Repo {
-        issue: GhIssue,
-    }
-    #[derive(Deserialize)]
-    struct GhIssue {
-        #[serde(rename = "timelineItems")]
-        timeline_items: TimelineItems,
-    }
-    #[derive(Deserialize)]
-    struct TimelineItems {
-        nodes: Vec<TimelineNode>,
-    }
 
     let resp: Response = serde_json::from_str(&out).context("parsing GraphQL response")?;
     Ok(pick_linked_pr(
@@ -292,23 +381,22 @@ fn pick_linked_pr(nodes: Vec<TimelineNode>, repo: &str) -> Option<PullRequest> {
         }
     }
 
-    let merged = |pr: &PrFields| pr.state == "MERGED";
+    let merged = |pr: &PrFields| pr.state.eq_ignore_ascii_case("merged");
     let same_repo = |pr: &PrFields| {
         pr.repository
             .as_ref()
             .is_some_and(|r| r.name_with_owner.eq_ignore_ascii_case(repo))
     };
 
-    let pr = match closer.filter(merged) {
-        Some(pr) => pr,
-        None => {
-            referencing.retain(|(_, pr)| merged(pr) && same_repo(pr));
-            // max_by_key keeps the last maximum, i.e. the most recent reference
-            referencing
-                .into_iter()
-                .max_by_key(|(will_close, _)| *will_close)
-                .map(|(_, pr)| pr)?
-        }
+    let pr = if let Some(pr) = closer.filter(merged) {
+        pr
+    } else {
+        referencing.retain(|(_, pr)| merged(pr) && same_repo(pr));
+        // max_by_key keeps the last maximum, i.e. the most recent reference
+        referencing
+            .into_iter()
+            .max_by_key(|(will_close, _)| *will_close)
+            .map(|(_, pr)| pr)?
     };
 
     Some(PullRequest {
@@ -324,41 +412,21 @@ pub fn get_pr_diff(repo: &str, pr_number: u64) -> Result<String> {
     gh(&["pr", "diff", &pr_number.to_string(), "--repo", repo])
 }
 
-pub fn find_pr_for_branch(repo: &str, branch: &str) -> Result<Option<PullRequest>> {
-    let out = gh(&[
-        "pr",
-        "list",
-        "--repo",
-        repo,
-        "--head",
-        branch,
-        "--json",
-        "number,title,body,state,headRefName",
-        "--limit",
-        "1",
-    ])?;
-    let mut prs: Vec<PullRequest> = serde_json::from_str(&out).context("parsing PR list JSON")?;
-    Ok(if prs.is_empty() {
-        None
-    } else {
-        Some(prs.remove(0))
-    })
-}
-
-pub fn list_open_plans(repo: &str) -> Result<Vec<PlanIssue>> {
+/// Open issues carrying `label`, newest first.
+pub fn list_open_issues(repo: &str, label: &str) -> Result<Vec<PlanIssue>> {
     let out = gh(&[
         "issue",
         "list",
         "--repo",
         repo,
         "--label",
-        "engram-plan",
+        label,
         "--state",
         "open",
         "--json",
         "number,title,createdAt",
         "--limit",
-        "50",
+        OPEN_ISSUE_LIMIT,
     ])?;
     serde_json::from_str(&out).context("parsing issue list JSON")
 }
@@ -369,8 +437,8 @@ pub fn create_pr(repo: &str, title: &str, body: &str, label: &str) -> Result<Str
     ])
 }
 
-/// The PR in `state` (`open`, `merged`) whose head is `branch`, if any.
-pub fn pr_for_branch(repo: &str, branch: &str, state: &str) -> Result<Option<OpenPr>> {
+/// The PR in `state` whose head is `branch`, if any.
+pub fn pr_for_branch(repo: &str, branch: &str, state: PrState) -> Result<Option<PrWithBody>> {
     let out = gh(&[
         "pr",
         "list",
@@ -379,13 +447,13 @@ pub fn pr_for_branch(repo: &str, branch: &str, state: &str) -> Result<Option<Ope
         "--head",
         branch,
         "--state",
-        state,
+        state.as_arg(),
         "--json",
-        OPEN_PR_FIELDS,
+        &pr_with_body_fields(),
         "--limit",
         "1",
     ])?;
-    let prs: Vec<OpenPr> = serde_json::from_str(&out).context("parsing PR list JSON")?;
+    let prs: Vec<PrWithBody> = serde_json::from_str(&out).context("parsing PR list JSON")?;
     Ok(prs.into_iter().next())
 }
 
@@ -438,37 +506,43 @@ pub fn open_closing_pr(repo: &str, number: u64) -> Result<Option<OpenPr>> {
         ])?;
         let view: PrWithBody =
             serde_json::from_str(&out).with_context(|| format!("parsing PR #{pr} JSON"))?;
-        if view.state.eq_ignore_ascii_case("open") {
+        if view.state.eq_ignore_ascii_case(PrState::Open.as_arg()) {
             return Ok(Some(view.pr));
         }
     }
     Ok(None)
 }
 
-/// GitHub's closing keywords, lower-cased.
-const CLOSING_KEYWORDS: &[&str] = &[
-    "close", "closes", "closed", "fix", "fixes", "fixed", "resolve", "resolves", "resolved",
-];
-
-/// Most PRs listed when looking for one whose body closes an issue.
-const PR_SCAN_LIMIT: &str = "200";
-
-/// Whether `body` says it closes issue `number` of `repo`: a closing keyword
-/// (any case, optional colon) followed by `#N` or the issue's URL.
-pub fn body_closes(body: &str, repo: &str, number: u64) -> bool {
-    let url_prefix = format!("https://github.com/{}/issues/", repo.to_ascii_lowercase());
+/// The issues of `repo` that `body` says it closes: a closing keyword (any
+/// case, optional colon) followed by `#N` or the issue's URL, in body order.
+pub fn closed_issues(body: &str, repo: &str) -> Vec<u64> {
+    let url_prefix = issues_url_prefix(&repo.to_ascii_lowercase());
     let words: Vec<String> = body
         .split_whitespace()
         .map(str::to_ascii_lowercase)
         .collect();
-    words.windows(2).any(|w| {
-        let target = w[1]
-            .strip_prefix('#')
-            .or_else(|| w[1].strip_prefix(&url_prefix));
-        let digits = target.map(|t| t.split(|c: char| !c.is_ascii_digit()).next().unwrap_or(""));
-        CLOSING_KEYWORDS.contains(&w[0].trim_end_matches(':'))
-            && digits.and_then(|d| d.parse::<u64>().ok()) == Some(number)
-    })
+    words
+        .windows(2)
+        .filter(|w| {
+            let keyword = w[0].trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+            CLOSING_KEYWORDS.contains(&keyword.trim_end_matches(':'))
+        })
+        .filter_map(|w| {
+            let target = w[1]
+                .strip_prefix('#')
+                .or_else(|| w[1].strip_prefix(&url_prefix))?;
+            target
+                .split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()
+        })
+        .collect()
+}
+
+/// Whether `body` says it closes issue `number` of `repo` (see [`closed_issues`]).
+pub fn body_closes(body: &str, repo: &str, number: u64) -> bool {
+    closed_issues(body, repo).contains(&number)
 }
 
 /// The PR among `prs` whose body closes issue `number` of `repo`, skipping
@@ -490,19 +564,18 @@ pub fn select_body_closing_pr<'a>(
     preferred.or(matching.first()).copied()
 }
 
-/// PRs in `state` (`open`, `merged`, ...) with their bodies, newest first, up
-/// to `PR_SCAN_LIMIT`: what `select_body_closing_pr` searches.
-pub fn list_prs_with_body(repo: &str, state: &str) -> Result<Vec<PrWithBody>> {
-    let fields = format!("{OPEN_PR_FIELDS},body,isCrossRepository");
+/// PRs in `state` with their bodies, newest first, up to `PR_SCAN_LIMIT`:
+/// what `select_body_closing_pr` searches.
+pub fn list_prs_with_body(repo: &str, state: PrState) -> Result<Vec<PrWithBody>> {
     let out = gh(&[
         "pr",
         "list",
         "--repo",
         repo,
         "--state",
-        state,
+        state.as_arg(),
         "--json",
-        &fields,
+        &pr_with_body_fields(),
         "--limit",
         PR_SCAN_LIMIT,
     ])?;
@@ -512,16 +585,13 @@ pub fn list_prs_with_body(repo: &str, state: &str) -> Result<Vec<PrWithBody>> {
 /// `gh stack <args>` for `repo`. gh-stack can't map an SSH host-alias remote
 /// (`git@github-personal:...`) to GitHub, so the repo is named via `GH_REPO`.
 pub fn gh_stack(repo_root: &std::path::Path, repo: &str, args: &[&str]) -> Result<()> {
-    let output = config::gh_command()?
-        .arg("stack")
+    let mut cmd = config::gh_command()?;
+    cmd.arg("stack")
         .args(args)
         .env("GH_REPO", repo)
-        .current_dir(repo_root)
-        .output()
+        .current_dir(repo_root);
+    process::run_checked(&mut cmd)
         .context("running gh stack (is the gh-stack extension installed?)")?;
-    if !output.status.success() {
-        anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
-    }
     Ok(())
 }
 
@@ -548,11 +618,10 @@ pub fn create_draft_pr(
 pub fn default_branch(repo: &str) -> Result<String> {
     let q = ".defaultBranchRef.name";
     let out = gh(&["repo", "view", repo, "--json", "defaultBranchRef", "-q", q])?;
-    let name = out.trim();
-    if name.is_empty() {
+    if out.is_empty() {
         anyhow::bail!("gh reported no default branch for {repo}");
     }
-    Ok(name.to_string())
+    Ok(out)
 }
 
 pub fn add_label_to_issue(repo: &str, issue_number: u64, label: &str) -> Result<()> {
@@ -569,16 +638,7 @@ pub fn add_label_to_issue(repo: &str, issue_number: u64, label: &str) -> Result<
 }
 
 pub fn update_issue_body(repo: &str, number: u64, body: &str) -> Result<()> {
-    gh(&[
-        "issue",
-        "edit",
-        &number.to_string(),
-        "--repo",
-        repo,
-        "--body",
-        body,
-    ])?;
-    Ok(())
+    update_issue(repo, number, None, Some(body))
 }
 
 /// Update an issue's title and/or body in a single `gh issue edit` call.
@@ -607,42 +667,41 @@ pub fn update_issue(
 }
 
 pub fn reopen_issue(repo: &str, number: u64) -> Result<()> {
-    let output = config::gh_command()?
-        .args(["issue", "reopen", &number.to_string(), "--repo", repo])
-        .output()
-        .context("running gh CLI")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("already open") {
-            return Ok(());
-        }
-        anyhow::bail!("gh issue reopen #{number} failed: {}", stderr.trim());
-    }
-    Ok(())
+    let mut cmd = config::gh_command()?;
+    cmd.args(["issue", "reopen", &number.to_string(), "--repo", repo]);
+    process::run_tolerating(&mut cmd, "already open")
+        .with_context(|| format!("reopening issue #{number}"))
 }
 
-pub fn list_open_objectives(repo: &str) -> Result<Vec<PlanIssue>> {
-    let out = gh(&[
-        "issue",
-        "list",
-        "--repo",
-        repo,
-        "--label",
-        "engram-objective",
-        "--state",
-        "open",
-        "--json",
-        "number,title,createdAt",
-        "--limit",
-        "50",
-    ])?;
-    serde_json::from_str(&out).context("parsing issue list JSON")
+pub fn close_issue(repo: &str, number: u64) -> Result<()> {
+    let mut cmd = config::gh_command()?;
+    cmd.args(["issue", "close", &number.to_string(), "--repo", repo]);
+    process::run_tolerating(&mut cmd, "already closed")
+        .with_context(|| format!("closing issue #{number}"))
 }
 
 pub fn add_sub_issue(repo: &str, parent_number: u64, child_number: u64) -> Result<()> {
-    let (owner, name) = repo
-        .split_once('/')
-        .ok_or_else(|| anyhow::anyhow!("repo must be owner/name, got: {repo}"))?;
+    #[derive(Deserialize)]
+    struct IdResponse {
+        data: IdData,
+    }
+    #[derive(Deserialize)]
+    struct IdData {
+        repository: IdRepo,
+    }
+    #[derive(Deserialize)]
+    struct IdRepo {
+        #[serde(rename = "parentIssue")]
+        parent_issue: IdNode,
+        #[serde(rename = "childIssue")]
+        child_issue: IdNode,
+    }
+    #[derive(Deserialize)]
+    struct IdNode {
+        id: String,
+    }
+
+    let (owner, name) = split_repo(repo)?;
 
     let id_query = "query($owner: String!, $repo: String!, $parent: Int!, $child: Int!) { \
         repository(owner: $owner, name: $repo) { \
@@ -665,26 +724,6 @@ pub fn add_sub_issue(repo: &str, parent_number: u64, child_number: u64) -> Resul
         "-F",
         &format!("child={child_number}"),
     ])?;
-
-    #[derive(Deserialize)]
-    struct IdResponse {
-        data: IdData,
-    }
-    #[derive(Deserialize)]
-    struct IdData {
-        repository: IdRepo,
-    }
-    #[derive(Deserialize)]
-    struct IdRepo {
-        #[serde(rename = "parentIssue")]
-        parent_issue: IdNode,
-        #[serde(rename = "childIssue")]
-        child_issue: IdNode,
-    }
-    #[derive(Deserialize)]
-    struct IdNode {
-        id: String,
-    }
 
     let resp: IdResponse = serde_json::from_str(&out).context("parsing issue node IDs")?;
     let parent_id = resp.data.repository.parent_issue.id;
@@ -724,6 +763,11 @@ pub fn add_issue_comment(repo: &str, number: u64, body: &str) -> Result<()> {
 }
 
 pub fn get_issue_comments(repo: &str, number: u64) -> Result<Vec<IssueComment>> {
+    #[derive(Deserialize)]
+    struct Response {
+        comments: Vec<IssueComment>,
+    }
+
     let out = gh(&[
         "issue",
         "view",
@@ -734,42 +778,18 @@ pub fn get_issue_comments(repo: &str, number: u64) -> Result<Vec<IssueComment>> 
         "comments",
     ])?;
 
-    #[derive(Deserialize)]
-    struct Response {
-        comments: Vec<IssueComment>,
-    }
-
     let resp: Response = serde_json::from_str(&out).context("parsing issue comments JSON")?;
     Ok(resp.comments)
 }
 
-pub fn close_issue(repo: &str, number: u64) -> Result<()> {
-    let output = config::gh_command()?
-        .args(["issue", "close", &number.to_string(), "--repo", repo])
-        .output()
-        .context("running gh CLI")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("already closed") {
-            return Ok(());
-        }
-        anyhow::bail!("gh issue close #{number} failed: {}", stderr.trim());
-    }
-    Ok(())
-}
-
 pub fn list_unlearned_plans(repo: &str) -> Result<Vec<PlanIssue>> {
-    #[derive(Deserialize)]
-    struct LabelEntry {
-        name: String,
-    }
     #[derive(Deserialize)]
     struct IssueWithLabels {
         number: u64,
         title: String,
         #[serde(rename = "createdAt")]
         created_at: String,
-        labels: Vec<LabelEntry>,
+        labels: Vec<Label>,
     }
 
     let out = gh(&[
@@ -778,13 +798,13 @@ pub fn list_unlearned_plans(repo: &str) -> Result<Vec<PlanIssue>> {
         "--repo",
         repo,
         "--label",
-        "engram-plan",
+        PLAN_LABEL,
         "--state",
         "closed",
         "--json",
         "number,title,createdAt,labels",
         "--limit",
-        "100",
+        CLOSED_PLAN_LIMIT,
     ])?;
     let all: Vec<IssueWithLabels> =
         serde_json::from_str(&out).context("parsing issue list JSON")?;
@@ -942,5 +962,35 @@ mod tests {
         .unwrap();
         let got = select_body_closing_pr(&prs, REPO, 145, head).map(|p| p.url.as_str());
         assert_eq!(got, Some(want));
+    }
+
+    #[rstest]
+    #[case::closes("closes #42", &[42])]
+    #[case::fixes_any_case("Fixes #7", &[7])]
+    #[case::resolves("Resolves #100", &[100])]
+    #[case::multiline("## Summary\nDoes some stuff.\n\nCloses #55\n", &[55])]
+    #[case::several("Fixes #1, closes #2", &[1, 2])]
+    #[case::none("no issue reference here", &[])]
+    #[case::keyword_inside_a_word("prefixes #12", &[])]
+    #[case::after_punctuation("Done (closes #12)", &[12])]
+    // Lower-casing changes this body's byte length; a byte offset taken from
+    // the lower-cased copy must never be used to slice the original.
+    #[case::non_ascii("İstanbul: closes #5", &[5])]
+    fn closed_issues_finds_closing_references(#[case] body: &str, #[case] want: &[u64]) {
+        assert_eq!(closed_issues(body, REPO), want);
+    }
+
+    #[rstest]
+    #[case::plain("https://github.com/o/r/issues/42", Ok(42))]
+    #[case::trailing_newline("https://github.com/o/r/issues/7\n", Ok(7))]
+    #[case::no_number("https://github.com/o/r/issues/", Err(()))]
+    fn issue_number_from_url_cases(#[case] url: &str, #[case] want: std::result::Result<u64, ()>) {
+        assert_eq!(issue_number_from_url(url).map_err(|_| ()), want);
+    }
+
+    #[test]
+    fn issue_urls_share_one_prefix() {
+        assert_eq!(issue_url(REPO, 9), "https://github.com/owner/repo/issues/9");
+        assert!(issue_url(REPO, 9).starts_with(&issues_url_prefix(REPO)));
     }
 }

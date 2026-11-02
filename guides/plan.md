@@ -35,9 +35,9 @@ After exploration, draft the complete body internally. Do not present it section
 
 Show the complete draft. Then explicitly flag any section that is thin or vague — this is the bumper. Examples:
 
-- *"Approach only has one bullet — I found the relevant function in `src/compact.rs` but there's no clear pattern to follow. Should we look at how `learn.rs` handles the similar case?"*
+- *"Approach only has one bullet — I found the relevant function in `src/memory/compact.rs` but there's no clear pattern to follow. Should we look at how `workflow/learn.rs` handles the similar case?"*
 - *"Edge cases section is empty — does concurrent invocation or an empty memory directory need handling here?"*
-- *"Key files names `src/github.rs` but the change actually happens in `cmd_plan()` in `src/plan.rs` — did you mean to list that instead?"*
+- *"Key files names `src/integrations/github.rs` but the change actually happens in `learn_all()` in `src/workflow/plan.rs` — did you mean to list that instead?"*
 
 Do not proceed until the developer has confirmed the draft or made corrections.
 
@@ -124,7 +124,7 @@ The title becomes the GitHub issue title **and** is fed to Claude as context dur
 - Bad: `"Dry run"` (too vague — Claude can't derive `read_when` conditions from this)
 - Bad: `"Investigate the compact issue"` (describes the work, not the change)
 
-The title is used by `synthesize_learnings` in `src/claude.rs` as part of the synthesis prompt. A precise title produces more specific `read_when` routing conditions in the memory files.
+The title is used by `synthesize_learnings` in `src/integrations/claude.rs` as part of the synthesis prompt. A precise title produces more specific `read_when` routing conditions in the memory files.
 
 ---
 

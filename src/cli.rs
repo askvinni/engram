@@ -1,6 +1,5 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputMode {
     Human,
@@ -24,7 +23,6 @@ pub struct Cli {
 }
 
 impl Cli {
-    #[allow(dead_code)]
     pub fn output_mode(&self) -> OutputMode {
         if self.json {
             OutputMode::Json
@@ -75,29 +73,7 @@ pub enum Commands {
         subcommand: KataCommands,
     },
     /// Write a memory file directly, without an issue, PR, or Claude synthesis
-    Capture {
-        /// Memory category: patterns, tripwires, architecture, or testing
-        #[arg(long)]
-        category: String,
-        /// Title for the memory file's frontmatter
-        #[arg(long)]
-        title: String,
-        /// Filename stem; derived from the title if omitted
-        #[arg(long)]
-        slug: Option<String>,
-        /// Condition under which an agent should load this file (repeatable)
-        #[arg(long = "read-when")]
-        read_when: Vec<String>,
-        /// Tripwire as `ACTION::WARNING` (repeatable)
-        #[arg(long = "tripwire", value_parser = crate::capture::parse_tripwire)]
-        tripwires: Vec<crate::memory::Tripwire>,
-        /// Markdown body; read from stdin if omitted
-        #[arg(long)]
-        body: Option<String>,
-        /// Mark as a mid-session observation (`origin: session`) for later consolidation by `compact`
-        #[arg(long)]
-        session: bool,
-    },
+    Capture(CaptureArgs),
     /// Start work on plan issues (or an objective's unblocked nodes): claim each
     /// kata mirror, push a branch, open a draft PR, create a kwt worktree and
     /// launch Claude in its tmux session
@@ -114,6 +90,31 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: MemoryCommands,
     },
+}
+
+#[derive(Args)]
+pub struct CaptureArgs {
+    /// Memory category: patterns, tripwires, architecture, or testing
+    #[arg(long)]
+    pub category: String,
+    /// Title for the memory file's frontmatter
+    #[arg(long)]
+    pub title: String,
+    /// Filename stem; derived from the title if omitted
+    #[arg(long)]
+    pub slug: Option<String>,
+    /// Condition under which an agent should load this file (repeatable)
+    #[arg(long = "read-when")]
+    pub read_when: Vec<String>,
+    /// Tripwire as `ACTION::WARNING` (repeatable)
+    #[arg(long = "tripwire", value_parser = crate::memory::capture::parse_tripwire)]
+    pub tripwires: Vec<crate::memory::Tripwire>,
+    /// Markdown body; read from stdin if omitted
+    #[arg(long)]
+    pub body: Option<String>,
+    /// Mark as a mid-session observation (`origin: session`) for later consolidation by `compact`
+    #[arg(long)]
+    pub session: bool,
 }
 
 #[derive(Subcommand)]
@@ -148,10 +149,10 @@ pub enum PlanCommands {
         #[arg(long)]
         conversation: Option<String>,
         /// Jira key for the kata mirror's `jira` metadata (e.g. ABC-123); otherwise read from a `Jira:` body line or the title
-        #[arg(long, value_parser = crate::kata::parse_jira_arg)]
+        #[arg(long, value_parser = crate::integrations::kata::parse_jira_arg)]
         jira: Option<String>,
         /// Change type for the kata mirror's `type` metadata (feat, fix, chore, ...); otherwise read from a `Type:` body line or a `feat:`-style title
-        #[arg(long = "type", value_parser = crate::kata::parse_type_arg)]
+        #[arg(long = "type", value_parser = crate::integrations::kata::parse_type_arg)]
         kind: Option<String>,
         /// Skip all kata calls for this invocation, even if kata is available
         #[arg(long)]
@@ -192,10 +193,10 @@ pub enum ObjectiveCommands {
         #[arg(long)]
         body: String,
         /// Jira key for the kata mirror's `jira` metadata (e.g. ABC-123); otherwise read from a `Jira:` body line or the title
-        #[arg(long, value_parser = crate::kata::parse_jira_arg)]
+        #[arg(long, value_parser = crate::integrations::kata::parse_jira_arg)]
         jira: Option<String>,
         /// Change type for the kata mirror's `type` metadata (feat, fix, chore, ...); otherwise read from a `Type:` body line or a `feat:`-style title
-        #[arg(long = "type", value_parser = crate::kata::parse_type_arg)]
+        #[arg(long = "type", value_parser = crate::integrations::kata::parse_type_arg)]
         kind: Option<String>,
         /// Skip all kata calls for this invocation, even if kata is available
         #[arg(long)]
@@ -226,10 +227,10 @@ pub enum ObjectiveCommands {
         #[arg(long)]
         body: Option<String>,
         /// Jira key for the kata mirror's `jira` metadata (e.g. ABC-123); otherwise read from a `Jira:` body line or the title
-        #[arg(long, value_parser = crate::kata::parse_jira_arg)]
+        #[arg(long, value_parser = crate::integrations::kata::parse_jira_arg)]
         jira: Option<String>,
         /// Change type for the kata mirror's `type` metadata (feat, fix, chore, ...); otherwise read from a `Type:` body line or a `feat:`-style title
-        #[arg(long = "type", value_parser = crate::kata::parse_type_arg)]
+        #[arg(long = "type", value_parser = crate::integrations::kata::parse_type_arg)]
         kind: Option<String>,
         /// Skip all kata calls for this invocation, even if kata is available
         #[arg(long)]

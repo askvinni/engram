@@ -32,7 +32,7 @@ When a learning could fit two categories, prefer `tripwires/` if it records a pa
 
 ## Frontmatter fields
 
-Every memory file has typed, OKF v0.2-compatible YAML frontmatter (`src/memory.rs:Frontmatter`):
+Every memory file has typed, OKF v0.2-compatible YAML frontmatter (`src/memory/mod.rs:Frontmatter`):
 
 ```yaml
 ---
@@ -129,7 +129,7 @@ CLAUDE.md contains an auto-managed section:
 <!-- engram:end -->
 ```
 
-This section holds **only** the `@path` reference to `index.md` itself — never inline memory content directly, and never `@`-reference individual topic files from here. If any memory file's body contains the string `<!-- engram:end -->` literally, the boundary detection in `src/memory.rs:write_claude_md_section` will break and truncate the section.
+This section holds **only** the `@path` reference to `index.md` itself — never inline memory content directly, and never `@`-reference individual topic files from here. If any memory file's body contains the string `<!-- engram:end -->` literally, the boundary detection in `src/memory/mod.rs:write_claude_md_section` will break and truncate the section.
 
 `index.md`'s own entries link to topic files with plain `./category/slug.md` markdown links, not `@` imports — an `@`-prefixed link there would eager-load every memory file into every session, silently defeating `read_when` routing. Only the one `@.engram/memory/index.md` line in CLAUDE.md is eager-loaded.
 
